@@ -520,7 +520,8 @@ func requestUsageLimits(ctx context.Context, client httpDoer, token *kiroauth.Ki
 	}
 	request.Header.Set("Authorization", "Bearer "+token.AccessToken)
 	request.Header.Set("Accept", "application/json")
-	request.Header.Set("User-Agent", "KiroIDE")
+	request.Header.Set("User-Agent", kiroauth.ClientUserAgent())
+	request.Header.Set("X-Amz-User-Agent", kiroauth.ClientAWSUserAgent("codewhisperer"))
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, fmt.Errorf("request Kiro usage: %w", err)

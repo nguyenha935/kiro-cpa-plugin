@@ -1,6 +1,6 @@
 # Kiro plugin for CLIProxyAPI
 
-Native Windows plugin that connects CLIProxyAPI 7.2.x to a Kiro subscription through AWS IAM Identity Center.
+Native cross-platform plugin that connects CLIProxyAPI 7.2.143 to a Kiro subscription through AWS IAM Identity Center.
 
 The plugin:
 
@@ -19,8 +19,8 @@ The plugin:
 
 ## Requirements
 
-- CLIProxyAPI 7.2.138
-- Windows amd64
+- CLIProxyAPI 7.2.143
+- Windows amd64, Linux amd64, or Linux arm64
 - Go 1.26
 - A C compiler available to CGO
 - A Kiro account connected through AWS IAM Identity Center
@@ -36,11 +36,11 @@ $hash = (Get-FileHash dist/kiro.dll -Algorithm SHA256).Hash.ToLowerInvariant()
 "$hash  kiro.dll" | Set-Content -NoNewline -Encoding ascii dist/kiro.dll.sha256
 ```
 
-The GitHub Actions workflow runs the same tests and publishes `kiro.dll`, `kiro.h`, and `kiro.dll.sha256`. Tagged builds are attached to the matching GitHub release.
+The GitHub Actions workflow tests Windows and Linux, then publishes archives for Windows amd64, Linux amd64, and Linux arm64. Each archive and plugin binary has a SHA-256 checksum. Linux packages contain `kiro.so`; Windows packages contain `kiro.dll`.
 
 ## Install
 
-Stop CLIProxyAPI before replacing the DLL. Back up the existing DLL and configuration, then copy `dist/kiro.dll` to the configured plugin directory.
+Stop CLIProxyAPI before replacing the plugin. Back up the existing binary and configuration, then copy `kiro.dll` on Windows or `kiro.so` on Linux to the configured plugin directory.
 
 ```yaml
 plugins:
@@ -54,6 +54,8 @@ plugins:
 ```
 
 Restart CLIProxyAPI and open the Kiro login action in the Management Center. Enter the AWS IAM Identity Center Start URL and region for that account. The form does not provide default values.
+
+The login uses Kiro CLI's remote device flow, so it also works in containers and on hosts without a browser. Complete the displayed verification URL and code in a trusted browser. The plugin identifies itself as the pinned Kiro CLI version and reports the real operating system and architecture; it does not fabricate a machine identifier or depend on Windows `MachineGuid`.
 
 The plugin stores the resulting Identity Center session through the CLIProxyAPI authentication mechanism. Do not put passwords, management keys, access tokens, refresh tokens, or client secrets in the configuration or repository.
 

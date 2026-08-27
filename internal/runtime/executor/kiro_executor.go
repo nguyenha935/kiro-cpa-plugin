@@ -50,15 +50,7 @@ const (
 	ErrStreamFatal     = "fatal"     // Connection/authentication errors, not recoverable
 	ErrStreamMalformed = "malformed" // Format errors, data cannot be parsed
 
-	// kiroUserAgent matches Amazon Q CLI style for User-Agent header
-	kiroUserAgent = "aws-sdk-rust/1.3.9 os/macos lang/rust/1.87.0"
-	// kiroFullUserAgent is the complete x-amz-user-agent header (Amazon Q CLI style)
-	kiroFullUserAgent = "aws-sdk-rust/1.3.9 ua/2.1 api/ssooidc/1.88.0 os/macos lang/rust/1.87.0 m/E app/AmazonQ-For-CLI"
-
-	// Kiro IDE style headers for IDC auth
-	kiroIDEUserAgent     = "aws-sdk-js/1.0.27 ua/2.1 os/win32#10.0.19044 lang/js md/nodejs#22.21.1 api/codewhispererstreaming#1.0.27 m/E"
-	kiroIDEAmzUserAgent  = "aws-sdk-js/1.0.27"
-	kiroIDEAgentModeVibe = "vibe"
+	kiroAgentModeVibe = "vibe"
 
 	// Socket retry configuration constants
 	// Maximum number of retry attempts for socket/network errors
@@ -582,14 +574,13 @@ func (e *KiroExecutor) Identifier() string { return "kiro" }
 // applyKiroClientHeaders identifies requests using the stable client family that
 // corresponds to the selected Kiro authentication flow.
 func applyKiroClientHeaders(req *http.Request, auth *cliproxyauth.Auth) {
+	if req == nil {
+		return
+	}
+	req.Header.Set("User-Agent", kiroauth.ClientUserAgent())
+	req.Header.Set("X-Amz-User-Agent", kiroauth.ClientAWSUserAgent("codewhispererstreaming"))
 	if isIDCAuth(auth) {
-		clientProduct := kiroauth.ClientUserAgentProduct()
-		req.Header.Set("User-Agent", kiroIDEUserAgent+" "+clientProduct)
-		req.Header.Set("X-Amz-User-Agent", kiroIDEAmzUserAgent+" "+clientProduct)
-		req.Header.Set("x-amzn-kiro-agent-mode", kiroIDEAgentModeVibe)
-	} else {
-		req.Header.Set("User-Agent", kiroUserAgent)
-		req.Header.Set("X-Amz-User-Agent", kiroFullUserAgent)
+		req.Header.Set("x-amzn-kiro-agent-mode", kiroAgentModeVibe)
 	}
 }
 
@@ -768,7 +759,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				httpReq.Header.Set("X-Amz-Target", endpointConfig.AmzTarget)
 			}
 			// Kiro-specific headers
-			httpReq.Header.Set("x-amzn-kiro-agent-mode", kiroIDEAgentModeVibe)
+			httpReq.Header.Set("x-amzn-kiro-agent-mode", kiroAgentModeVibe)
 			httpReq.Header.Set("x-amzn-codewhisperer-optout", "true")
 
 			applyKiroClientHeaders(httpReq, auth)
@@ -1167,7 +1158,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 				httpReq.Header.Set("X-Amz-Target", endpointConfig.AmzTarget)
 			}
 			// Kiro-specific headers
-			httpReq.Header.Set("x-amzn-kiro-agent-mode", kiroIDEAgentModeVibe)
+			httpReq.Header.Set("x-amzn-kiro-agent-mode", kiroAgentModeVibe)
 			httpReq.Header.Set("x-amzn-codewhisperer-optout", "true")
 
 			applyKiroClientHeaders(httpReq, auth)

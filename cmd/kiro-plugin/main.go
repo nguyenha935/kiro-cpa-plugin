@@ -73,7 +73,7 @@ import (
 const (
 	providerName      = "kiro"
 	pluginDisplayName = "Kiro"
-	pluginVersion     = "0.5.9"
+	pluginVersion     = "0.6.0"
 	maxPages          = 10
 )
 
@@ -590,7 +590,8 @@ func listAvailableModels(ctx context.Context, token *kiroauth.KiroTokenData) ([]
 		}
 		req.Header.Set("Authorization", "Bearer "+token.AccessToken)
 		req.Header.Set("Accept", "application/json")
-		req.Header.Set("User-Agent", "KiroIDE")
+		req.Header.Set("User-Agent", kiroauth.ClientUserAgent())
+		req.Header.Set("X-Amz-User-Agent", kiroauth.ClientAWSUserAgent("codewhisperer"))
 		resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("list Kiro models: %w", err)
@@ -698,7 +699,8 @@ func listAvailableProfiles(ctx context.Context, client *http.Client, endpoint, a
 		req.Header.Set("Authorization", "Bearer "+accessToken)
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("User-Agent", "KiroIDE")
+		req.Header.Set("User-Agent", kiroauth.ClientUserAgent())
+		req.Header.Set("X-Amz-User-Agent", kiroauth.ClientAWSUserAgent("codewhisperer"))
 		resp, err := client.Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("list Kiro profiles: %w", err)

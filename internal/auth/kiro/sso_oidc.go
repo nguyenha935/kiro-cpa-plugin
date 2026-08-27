@@ -16,8 +16,6 @@ import (
 
 const (
 	defaultIDCRegion = "us-east-1"
-	kiroUserAgent    = "KiroIDE"
-	idcAmzUserAgent  = "aws-sdk-js/3.738.0 ua/2.1 os/other lang/js md/browser#unknown_unknown api/sso-oidc#3.738.0 m/E KiroIDE"
 )
 
 var (
@@ -71,7 +69,7 @@ func getOIDCEndpoint(region string) string {
 
 func (c *SSOOIDCClient) RegisterClientWithRegion(ctx context.Context, region string) (*RegisterClientResponse, error) {
 	payload := map[string]any{
-		"clientName": "Kiro IDE",
+		"clientName": "Kiro CLI",
 		"clientType": "public",
 		"scopes": []string{
 			"codewhisperer:completions",
@@ -115,9 +113,9 @@ func (c *SSOOIDCClient) RefreshTokenWithRegion(ctx context.Context, clientID, cl
 		"clientId": clientID, "clientSecret": clientSecret, "refreshToken": refreshToken, "grantType": "refresh_token",
 	}
 	headers := http.Header{
-		"x-amz-user-agent": []string{idcAmzUserAgent},
+		"x-amz-user-agent": []string{ClientAWSUserAgent("ssooidc")},
 		"Accept":           []string{"*/*"},
-		"User-Agent":       []string{"node"},
+		"User-Agent":       []string{ClientUserAgent()},
 	}
 	var response CreateTokenResponse
 	if err := c.postJSON(ctx, getOIDCEndpoint(region)+"/token", payload, headers, &response); err != nil {
@@ -144,7 +142,8 @@ func (c *SSOOIDCClient) postJSON(ctx context.Context, endpoint string, payload a
 		return err
 	}
 	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("User-Agent", kiroUserAgent)
+	request.Header.Set("User-Agent", ClientUserAgent())
+	request.Header.Set("X-Amz-User-Agent", ClientAWSUserAgent("ssooidc"))
 	for name, values := range headers {
 		for _, value := range values {
 			request.Header.Add(name, value)
