@@ -3,7 +3,9 @@ package executor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"html"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -35,6 +37,23 @@ func (e upstreamTransportErr) Error() string {
 }
 func (e upstreamTransportErr) Unwrap() error   { return e.cause }
 func (e upstreamTransportErr) StatusCode() int { return http.StatusBadGateway }
+
+func normalizeTransportError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) {
+		return statusErr{code: 499, msg: "client canceled request"}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return statusErr{code: http.StatusGatewayTimeout, msg: "upstream request timed out"}
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return statusErr{code: http.StatusGatewayTimeout, msg: "upstream request timed out"}
+	}
+	return upstreamTransportErr{cause: err}
+}
 
 type upstreamRequestLog struct {
 	URL, Method, Provider, AuthID, AuthLabel, AuthType, AuthValue string

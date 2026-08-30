@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"regexp"
 	"strings"
 	"sync"
@@ -142,6 +143,37 @@ func TestBuilderIDUsageUsesProfilelessAmazonQContract(t *testing.T) {
 	}
 	if usage.SubscriptionInfo.SubscriptionTitle != "KIRO FREE" || len(usage.UsageBreakdownList) != 1 {
 		t.Fatalf("unexpected Builder ID usage: %+v", usage)
+	}
+}
+
+func TestRefreshExternalIDPSendsConfidentialClientSecret(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if err := request.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		for key, want := range map[string]string{
+			"grant_type": "refresh_token", "client_id": "client", "client_secret": "secret",
+			"refresh_token": "refresh", "scope": "offline_access",
+		} {
+			if got := request.Form.Get(key); got != want {
+				t.Fatalf("external_idp refresh %s = %q, want %q", key, got, want)
+			}
+		}
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte("{\"access_token\":\"new-access\",\"expires_in\":3600}"))
+	}))
+	defer server.Close()
+	token := &kiroauth.KiroTokenData{
+		AccessToken: "old-access", RefreshToken: "refresh", AuthMethod: "external_idp",
+		ClientID: "client", ClientSecret: "secret", TokenEndpoint: server.URL,
+		Scopes: "offline_access", Region: "us-east-1", ProfileArn: "profile",
+	}
+	refreshed, err := refreshExternalIDP(context.Background(), token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.AccessToken != "new-access" || refreshed.RefreshToken != "refresh" {
+		t.Fatalf("unexpected refreshed external_idp token: %+v", refreshed)
 	}
 }
 

@@ -58,7 +58,18 @@ func TestPrepareModelCapabilityRejectsUnsupportedEffort(t *testing.T) {
 func TestIdentityCenterProfileIsSentUpstream(t *testing.T) {
 	const profile = "arn:aws:codewhisperer:us-east-1:123456789012:profile/test"
 	auth := &cliproxyauth.Auth{Metadata: map[string]any{"auth_method": "idc"}}
-	if got := getEffectiveProfileArnWithWarning(auth, profile); got != profile {
+	if got := effectiveGenerateProfileARN(auth, profile); got != profile {
 		t.Fatalf("profile ARN = %q, want %q", got, profile)
+	}
+}
+
+func TestBuilderIDUsesPublicProfileOnlyForGenerate(t *testing.T) {
+	auth := &cliproxyauth.Auth{Metadata: map[string]any{"auth_method": "builder-id"}}
+	if got := effectiveGenerateProfileARN(auth, ""); got != kiroBuilderIDProfileARN {
+		t.Fatalf("Builder ID generate profile = %q", got)
+	}
+	apiKey := &cliproxyauth.Auth{Metadata: map[string]any{"auth_method": "api_key"}}
+	if got := effectiveGenerateProfileARN(apiKey, ""); got != "" {
+		t.Fatalf("API key inherited Builder ID profile %q", got)
 	}
 }

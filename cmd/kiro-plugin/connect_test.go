@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"testing"
 	"time"
 
+	kiroauth "github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
@@ -82,12 +85,39 @@ func TestImportExternalIDPAcceptsCPAAnd9RouterAliases(t *testing.T) {
 		`{"type":"kiro","auth_method":"external_idp","access_token":"access","refresh_token":"refresh","client_id":"client","token_endpoint":"https://login.microsoftonline.com/tenant/oauth2/v2.0/token","profile_arn":"arn:aws:codewhisperer:us-east-1:1:profile/test","scopes":"offline_access","expired":"2030-01-01T00:00:00Z"}`,
 		`{"authMethod":"external_idp","accessToken":"access","refreshToken":"refresh","clientId":"client","tokenEndpoint":"https://login.microsoft.com/tenant/oauth2/token","profileArn":"arn:aws:codewhisperer:us-east-1:1:profile/test","scope":"offline_access","expiresAt":"2030-01-01T00:00:00Z"}`,
 	} {
-		if _, err := importExternalIDP([]byte(payload)); err != nil {
+		if _, err := decodeExternalIDP([]byte(payload)); err != nil {
 			t.Errorf("compatible external_idp JSON rejected: %v", err)
 		}
 	}
-	if _, err := importExternalIDP([]byte(`{"auth_method":"external_idp","unknown":true}`)); err == nil {
+	if _, err := decodeExternalIDP([]byte(`{"auth_method":"external_idp","unknown":true}`)); err == nil {
 		t.Fatal("unknown external_idp fields were accepted")
+	}
+}
+
+func TestImportExternalIDPValidatesModelCatalogBeforePersisting(t *testing.T) {
+	originalCatalog := externalIDPModelCatalog
+	t.Cleanup(func() { externalIDPModelCatalog = originalCatalog })
+	payload := []byte("{\"auth_method\":\"external_idp\",\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"client_id\":\"client\",\"token_endpoint\":\"https://login.microsoftonline.com/tenant/oauth2/v2.0/token\",\"profile_arn\":\"arn:aws:codewhisperer:us-east-1:1:profile/test\",\"scopes\":\"offline_access\",\"expires_at\":\"2030-01-01T00:00:00Z\"}")
+	calls := 0
+	externalIDPModelCatalog = func(_ context.Context, token *kiroauth.KiroTokenData) ([]controlPlaneModel, error) {
+		calls++
+		if token.AuthMethod != "external_idp" || token.ProfileArn == "" {
+			t.Fatalf("invalid token passed to external_idp validation: %+v", token)
+		}
+		return []controlPlaneModel{{ModelID: "claude-haiku-4.5"}}, nil
+	}
+	if _, err := importExternalIDP(context.Background(), payload); err != nil {
+		t.Fatalf("valid external_idp import failed: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("external_idp validation calls = %d, want 1", calls)
+	}
+
+	externalIDPModelCatalog = func(context.Context, *kiroauth.KiroTokenData) ([]controlPlaneModel, error) {
+		return nil, errors.New("rejected")
+	}
+	if _, err := importExternalIDP(context.Background(), payload); err == nil {
+		t.Fatal("external_idp import persisted a credential rejected by Kiro")
 	}
 }
 

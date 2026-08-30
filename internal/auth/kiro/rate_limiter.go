@@ -128,7 +128,10 @@ func (rl *RateLimiter) resetDailyIfNeeded(state *TokenState) {
 
 // calculateInterval 计算带抖动的随机间隔
 func (rl *RateLimiter) calculateInterval() time.Duration {
-	baseInterval := rl.minTokenInterval + time.Duration(rl.rng.Int63n(int64(rl.maxTokenInterval-rl.minTokenInterval)))
+	baseInterval := rl.minTokenInterval
+	if spread := rl.maxTokenInterval - rl.minTokenInterval; spread > 0 {
+		baseInterval += time.Duration(rl.rng.Int63n(int64(spread)))
+	}
 	jitter := time.Duration(float64(baseInterval) * rl.jitterPercent * (rl.rng.Float64()*2 - 1))
 	return baseInterval + jitter
 }

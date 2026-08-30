@@ -61,3 +61,10 @@ func TestCreateTokenWithRegionReportsPendingAuthorization(t *testing.T) {
 		t.Fatalf("error = %v, want %v", err, ErrAuthorizationPending)
 	}
 }
+
+func TestOIDCStatusErrorPreservesHTTPStatus(t *testing.T) {
+	err := OIDCStatusError{Status: http.StatusUnauthorized, Message: "rejected"}
+	if err.StatusCode() != http.StatusUnauthorized || err.Error() != "rejected" {
+		t.Fatalf("unexpected OIDC status error: %+v", err)
+	}
+}

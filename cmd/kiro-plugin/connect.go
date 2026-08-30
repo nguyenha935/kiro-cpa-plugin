@@ -29,6 +29,8 @@ var supportedAuthMethods = map[string]struct{}{
 	"builder-id": {}, "idc": {}, "social": {}, "api_key": {}, "external_idp": {}, "imported": {},
 }
 
+var externalIDPModelCatalog = listAvailableModels
+
 func cleanupLoginFlowsLocked(now time.Time) {
 	for state, flow := range loginFlows {
 		if now.After(flow.ExpiresAt) {
@@ -122,7 +124,7 @@ func handleConnectAPI(req pluginapi.ManagementRequest) ([]byte, error) {
 		}
 		token, err = importRefreshToken(context.Background(), values)
 	case "external_idp":
-		token, err = importExternalIDP([]byte(input.CredentialJSON))
+		token, err = importExternalIDP(context.Background(), []byte(input.CredentialJSON))
 	default:
 		err = errors.New("select a supported Kiro authentication method")
 	}
@@ -267,7 +269,9 @@ func importRefreshToken(ctx context.Context, values url.Values) (*kiroauth.KiroT
 	token.AuthMethod, token.Provider = method, authProviderLabel(method)
 	hash := sha256.Sum256([]byte(clientID))
 	token.ClientIDHash = hex.EncodeToString(hash[:])
-	reconcileProfileBestEffort(ctx, token, "after refresh-token import")
+	if !isBuilderIDCredential(token) {
+		reconcileProfileBestEffort(ctx, token, "after refresh-token import")
+	}
 	return token, nil
 }
 
@@ -323,7 +327,7 @@ type deviceLoginResult struct {
 	UserCode string
 }
 
-func importExternalIDP(raw []byte) (*kiroauth.KiroTokenData, error) {
+func decodeExternalIDP(raw []byte) (*kiroauth.KiroTokenData, error) {
 	if len(raw) == 0 || len(raw) > maxConnectBody {
 		return nil, errors.New("external_idp JSON is required and must not exceed 64 KiB")
 	}
@@ -377,6 +381,27 @@ func importExternalIDP(raw []byte) (*kiroauth.KiroTokenData, error) {
 		ClientSecret: strings.TrimSpace(input.ClientSecret), Email: strings.TrimSpace(input.Email), Region: region,
 		TokenEndpoint: endpoint, Scopes: scopes,
 	}, nil
+}
+
+func importExternalIDP(ctx context.Context, raw []byte) (*kiroauth.KiroTokenData, error) {
+	token, err := decodeExternalIDP(raw)
+	if err != nil {
+		return nil, err
+	}
+	if credentialNeedsRefresh(token, time.Now().UTC()) {
+		token, err = refreshExternalIDP(ctx, token)
+		if err != nil {
+			return nil, fmt.Errorf("external_idp token refresh failed: %w", err)
+		}
+	}
+	models, err := externalIDPModelCatalog(ctx, token)
+	if err != nil {
+		return nil, fmt.Errorf("external_idp validation failed: %w", err)
+	}
+	if len(models) == 0 {
+		return nil, errors.New("external_idp validation failed: Kiro returned no available models")
+	}
+	return token, nil
 }
 
 func firstNonEmpty(values ...string) string {

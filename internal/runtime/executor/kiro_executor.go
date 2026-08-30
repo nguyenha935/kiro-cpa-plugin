@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -53,6 +54,9 @@ const (
 
 	kiroAgentModeVibe = "vibe"
 
+	kiroBuilderIDProfileARN = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
+	kiroSocialProfileARN    = "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
+
 	// Socket retry configuration constants
 	// Maximum number of retry attempts for socket/network errors
 	kiroSocketMaxRetries = 3
@@ -73,6 +77,8 @@ var retryableHTTPStatusCodes = map[int]bool{
 	503: true, // Service Unavailable - server temporarily overloaded
 	504: true, // Gateway Timeout - upstream server timeout
 }
+
+var awsRegionPattern = regexp.MustCompile("^[a-z]{2}(?:-gov)?-[a-z]+-\\d$")
 
 // retryConfig holds configuration for socket retry logic.
 // Based on kiro2Api Python implementation patterns.
@@ -293,6 +299,8 @@ func newKiroHTTPClientWithPooling(ctx context.Context, cfg *config.Config, auth 
 	return pooledClient
 }
 
+var kiroHTTPClientFor = newKiroHTTPClientWithPooling
+
 // kiroEndpointConfig bundles endpoint URL with its compatible Origin and AmzTarget values.
 // This solves the "triple mismatch" problem where different endpoints require matching
 // Origin and X-Amz-Target header values.
@@ -386,6 +394,12 @@ func resolveKiroAPIRegion(auth *cliproxyauth.Auth) string {
 			return arnRegion
 		}
 	}
+	method, _ := auth.Metadata["auth_method"].(string)
+	if strings.EqualFold(strings.TrimSpace(method), "api_key") {
+		if region, ok := auth.Metadata["region"].(string); ok && awsRegionPattern.MatchString(strings.TrimSpace(region)) {
+			return strings.TrimSpace(region)
+		}
+	}
 	// Note: OIDC "region" field is NOT used for API endpoint
 	// Kiro API only exists in us-east-1, while OIDC region can vary (e.g., ap-northeast-2)
 	// Using OIDC region for API calls causes DNS failures
@@ -423,11 +437,11 @@ func getKiroEndpointConfigs(auth *cliproxyauth.Auth) []kiroEndpointConfig {
 		authMethod, _ := auth.Metadata["auth_method"].(string)
 		switch strings.ToLower(strings.TrimSpace(authMethod)) {
 		case "builder-id", "social", "imported":
-			return orderKiroEndpoints(endpointConfigs, "KiroRuntime", "CodeWhisperer", "AmazonQ")
+			return orderKiroEndpoints(endpointConfigs, "KiroRuntime")
 		case "idc", "external_idp":
-			return orderKiroEndpoints(endpointConfigs, "CodeWhisperer", "AmazonQ", "KiroRuntime")
+			return orderKiroEndpoints(endpointConfigs, "CodeWhisperer")
 		case "api_key":
-			return orderKiroEndpoints(endpointConfigs, "AmazonQ", "CodeWhisperer", "KiroRuntime")
+			return orderKiroEndpoints(endpointConfigs, "AmazonQ")
 		}
 	}
 
@@ -659,7 +673,7 @@ func (e *KiroExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth,
 	if errPrepare := e.PrepareRequest(httpReq, auth); errPrepare != nil {
 		return nil, errPrepare
 	}
-	httpClient := newKiroHTTPClientWithPooling(ctx, e.cfg, auth, 0)
+	httpClient := kiroHTTPClientFor(ctx, e.cfg, auth, 0)
 	return httpClient.Do(httpReq)
 }
 
@@ -754,7 +768,7 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	}
 
 	// Determine the effective profile ARN for the selected credential.
-	effectiveProfileArn := getEffectiveProfileArnWithWarning(auth, profileArn)
+	effectiveProfileArn := effectiveGenerateProfileARN(auth, profileArn)
 
 	// Execute with retry on 401/403 and 429 (quota exhausted)
 	// Note: currentOrigin and kiroPayload are built inside executeWithRetry for each endpoint
@@ -836,7 +850,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				AuthValue: authValue,
 			})
 
-			httpClient := newKiroHTTPClientWithPooling(ctx, e.cfg, auth, 120*time.Second)
+			httpClient := kiroHTTPClientFor(ctx, e.cfg, auth, 120*time.Second)
 			httpResp, err := httpClient.Do(httpReq)
 			if err != nil {
 				// Check for context cancellation first - client disconnected, not a server error
@@ -864,7 +878,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 					continue
 				}
 
-				return resp, err
+				return resp, normalizeTransportError(err)
 			}
 			recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 
@@ -884,11 +898,10 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				// Preserve last 429 so callers can correctly backoff when all endpoints are exhausted
 				last429Err = statusErr{code: httpResp.StatusCode, msg: string(respBody)}
 
-				log.Warnf("kiro: %s endpoint quota exhausted (429), will try next endpoint, body: %s",
+				log.Warnf("kiro: %s endpoint quota exhausted (429), returning credential cooldown to CPA, body: %s",
 					endpointConfig.Name, summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
 
-				// Break inner retry loop to try next endpoint (which has different quota)
-				break
+				return resp, last429Err
 			}
 
 			// Handle 5xx server errors with exponential backoff retry
@@ -954,7 +967,8 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				return resp, statusErr{code: httpResp.StatusCode, msg: string(respBody)}
 			}
 
-			// Handle 402 errors - Monthly Limit Reached
+			// Handle 402 errors - Monthly Limit Reached. CPA needs a 429 to
+			// rotate away from this credential.
 			if httpResp.StatusCode == 402 {
 				respBody, _ := io.ReadAll(httpResp.Body)
 				_ = httpResp.Body.Close()
@@ -963,7 +977,9 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				log.Warnf("kiro: received 402 (monthly limit). Upstream body: %s", string(respBody))
 
 				// Return upstream error body directly
-				return resp, statusErr{code: httpResp.StatusCode, msg: string(respBody)}
+				remaining := kiroauth.CalculateCooldownUntilNextDay()
+				cooldownMgr.SetCooldown(tokenKey, remaining, kiroauth.CooldownReasonQuotaExhausted)
+				return resp, statusErr{code: http.StatusTooManyRequests, msg: string(respBody), retryAfter: &remaining}
 			}
 
 			// Handle 403 errors - Access Denied / Token Expired
@@ -1041,7 +1057,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 			content, reasoning, toolUses, usageInfo, stopReason, err := e.parseEventStream(httpResp.Body)
 			if err != nil {
 				recordAPIResponseError(ctx, e.cfg, err)
-				return resp, err
+				return resp, normalizeTransportError(err)
 			}
 
 			if usageInfo.TotalTokens == 0 {
@@ -1153,7 +1169,7 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	}
 
 	// Determine the effective profile ARN for the selected credential.
-	effectiveProfileArn := getEffectiveProfileArnWithWarning(auth, profileArn)
+	effectiveProfileArn := effectiveGenerateProfileARN(auth, profileArn)
 
 	// Execute stream with retry on 401/403 and 429 (quota exhausted)
 	// Note: currentOrigin and kiroPayload are built inside executeStreamWithRetry for each endpoint
@@ -1238,7 +1254,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 				AuthValue: authValue,
 			})
 
-			httpClient := newKiroHTTPClientWithPooling(ctx, e.cfg, auth, 0)
+			httpClient := kiroHTTPClientFor(ctx, e.cfg, auth, 0)
 			httpResp, err := httpClient.Do(httpReq)
 			if err != nil {
 				recordAPIResponseError(ctx, e.cfg, err)
@@ -1252,7 +1268,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 					continue
 				}
 
-				return nil, err
+				return nil, normalizeTransportError(err)
 			}
 			recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 
@@ -1272,11 +1288,10 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 				// Preserve last 429 so callers can correctly backoff when all endpoints are exhausted
 				last429Err = statusErr{code: httpResp.StatusCode, msg: string(respBody)}
 
-				log.Warnf("kiro: stream %s endpoint quota exhausted (429), will try next endpoint, body: %s",
+				log.Warnf("kiro: stream %s endpoint quota exhausted (429), returning credential cooldown to CPA, body: %s",
 					endpointConfig.Name, summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
 
-				// Break inner retry loop to try next endpoint (which has different quota)
-				break
+				return nil, last429Err
 			}
 
 			// Handle 5xx server errors with exponential backoff retry
@@ -1355,7 +1370,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 				return nil, statusErr{code: httpResp.StatusCode, msg: string(respBody)}
 			}
 
-			// Handle 402 errors - Monthly Limit Reached
+			// Handle 402 errors - Monthly Limit Reached.
 			if httpResp.StatusCode == 402 {
 				respBody, _ := io.ReadAll(httpResp.Body)
 				_ = httpResp.Body.Close()
@@ -1364,7 +1379,9 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 				log.Warnf("kiro: stream received 402 (monthly limit). Upstream body: %s", string(respBody))
 
 				// Return upstream error body directly
-				return nil, statusErr{code: httpResp.StatusCode, msg: string(respBody)}
+				remaining := kiroauth.CalculateCooldownUntilNextDay()
+				cooldownMgr.SetCooldown(tokenKey, remaining, kiroauth.CooldownReasonQuotaExhausted)
+				return nil, statusErr{code: http.StatusTooManyRequests, msg: string(respBody), retryAfter: &remaining}
 			}
 
 			// Handle 403 errors - Access Denied / Token Expired
@@ -1505,15 +1522,26 @@ func kiroCredentials(auth *cliproxyauth.Auth) (accessToken, profileArn string) {
 	return accessToken, profileArn
 }
 
-// getEffectiveProfileArnWithWarning preserves the profile discovered with the
-// selected credential. Kiro uses it to select the subscription and model
-// entitlements, including for AWS IAM Identity Center sessions.
-func getEffectiveProfileArnWithWarning(_ *cliproxyauth.Auth, profileArn string) string {
+// effectiveGenerateProfileARN applies only the profile contract used by
+// generateAssistantResponse. Builder ID's control-plane APIs are profileless,
+// but its runtime payload still requires the public Builder ID profile.
+func effectiveGenerateProfileARN(auth *cliproxyauth.Auth, profileArn string) string {
 	profileArn = strings.TrimSpace(profileArn)
-	if profileArn == "" {
-		log.Warnf("kiro: profile ARN not found in auth, API calls may fail")
+	if profileArn != "" {
+		return profileArn
 	}
-	return profileArn
+	method := ""
+	if auth != nil && auth.Metadata != nil {
+		method, _ = auth.Metadata["auth_method"].(string)
+	}
+	switch strings.ToLower(strings.TrimSpace(method)) {
+	case "builder-id":
+		return kiroBuilderIDProfileARN
+	case "social":
+		return kiroSocialProfileARN
+	default:
+		return ""
+	}
 }
 
 // mapModelToKiro returns the exact model advertised by Kiro. The CLIProxyAPI
@@ -3220,6 +3248,9 @@ func (e *KiroExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
 			return nil, fmt.Errorf("kiro executor: external_idp refresh material is incomplete")
 		}
 		form := url.Values{"grant_type": {"refresh_token"}, "client_id": {clientID}, "refresh_token": {refreshToken}}
+		if clientSecret != "" {
+			form.Set("client_secret", clientSecret)
+		}
 		if scopes != "" {
 			form.Set("scope", scopes)
 		}

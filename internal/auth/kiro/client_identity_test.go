@@ -1,10 +1,23 @@
 package kiro
 
 import (
+	"math/rand"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestRateLimiterAllowsEqualTokenIntervals(t *testing.T) {
+	limiter := NewRateLimiterWithConfig(RateLimiterConfig{
+		MinTokenInterval: time.Second,
+		MaxTokenInterval: time.Second,
+	})
+	limiter.rng = rand.New(rand.NewSource(1))
+	if got := limiter.calculateInterval(); got <= 0 {
+		t.Fatalf("equal token interval produced %v", got)
+	}
+}
 
 func TestClientIdentityUsesBuildPlatformWithoutMachineIdentifier(t *testing.T) {
 	userAgent := ClientUserAgent()
