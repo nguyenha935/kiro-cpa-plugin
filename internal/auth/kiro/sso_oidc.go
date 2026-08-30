@@ -31,6 +31,14 @@ var (
 	ErrSlowDown             = errors.New("slow_down")
 )
 
+type OIDCStatusError struct {
+	Status  int
+	Message string
+}
+
+func (e OIDCStatusError) Error() string   { return e.Message }
+func (e OIDCStatusError) StatusCode() int { return e.Status }
+
 type SSOOIDCClient struct {
 	httpClient *http.Client
 }
@@ -177,7 +185,7 @@ func (c *SSOOIDCClient) postJSON(ctx context.Context, endpoint string, payload a
 		case ErrSlowDown.Error():
 			return ErrSlowDown
 		}
-		return fmt.Errorf("OIDC endpoint returned HTTP %d", response.StatusCode)
+		return OIDCStatusError{Status: response.StatusCode, Message: fmt.Sprintf("OIDC endpoint returned HTTP %d", response.StatusCode)}
 	}
 	if err := json.Unmarshal(responseBody, target); err != nil {
 		return fmt.Errorf("decode OIDC response: %w", err)

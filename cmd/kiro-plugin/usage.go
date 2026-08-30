@@ -216,7 +216,15 @@ func refreshKiroCredential(ctx context.Context, token *kiroauth.KiroTokenData) (
 	client := kiroauth.NewSSOOIDCClient(pluginConfig)
 	refreshed, err := client.RefreshTokenWithRegion(ctx, token.ClientID, token.ClientSecret, token.RefreshToken, token.Region, token.StartURL)
 	if err != nil {
-		return nil, fmt.Errorf("refresh Kiro IDC token: %w", err)
+		status := http.StatusBadGateway
+		var statusError interface{ StatusCode() int }
+		if errors.As(err, &statusError) {
+			status = statusError.StatusCode()
+			if status == http.StatusBadRequest || status == http.StatusForbidden {
+				status = http.StatusUnauthorized
+			}
+		}
+		return nil, pluginStatusError{status: status, message: "refresh Kiro IDC token: " + err.Error()}
 	}
 	if refreshed.ClientID == "" {
 		refreshed.ClientID = token.ClientID
@@ -248,6 +256,9 @@ func refreshExternalIDP(ctx context.Context, token *kiroauth.KiroTokenData) (*ki
 		return nil, errors.New("Kiro external_idp refresh material is incomplete")
 	}
 	form := url.Values{"grant_type": {"refresh_token"}, "client_id": {token.ClientID}, "refresh_token": {token.RefreshToken}}
+	if token.ClientSecret != "" {
+		form.Set("client_secret", token.ClientSecret)
+	}
 	if token.Scopes != "" {
 		form.Set("scope", token.Scopes)
 	}
@@ -258,7 +269,7 @@ func refreshExternalIDP(ctx context.Context, token *kiroauth.KiroTokenData) (*ki
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
 	if err != nil {
-		return nil, err
+		return nil, pluginStatusError{status: http.StatusBadGateway, message: "refresh external_idp token: " + err.Error()}
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -266,7 +277,11 @@ func refreshExternalIDP(ctx context.Context, token *kiroauth.KiroTokenData) (*ki
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("external_idp refresh returned HTTP %d", resp.StatusCode)
+		status := resp.StatusCode
+		if status == http.StatusBadRequest || status == http.StatusForbidden {
+			status = http.StatusUnauthorized
+		}
+		return nil, pluginStatusError{status: status, message: fmt.Sprintf("external_idp refresh returned HTTP %d", resp.StatusCode)}
 	}
 	var payload struct {
 		AccessToken  string `json:"access_token"`
@@ -274,7 +289,7 @@ func refreshExternalIDP(ctx context.Context, token *kiroauth.KiroTokenData) (*ki
 		ExpiresIn    int    `json:"expires_in"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil || payload.AccessToken == "" {
-		return nil, errors.New("external_idp refresh returned invalid token")
+		return nil, pluginStatusError{status: http.StatusBadGateway, message: "external_idp refresh returned invalid token"}
 	}
 	if payload.RefreshToken == "" {
 		payload.RefreshToken = token.RefreshToken
@@ -590,6 +605,8 @@ func requestUsageLimits(ctx context.Context, client httpDoer, token *kiroauth.Ki
 	request.Header.Set("X-Amz-User-Agent", kiroauth.ClientAWSUserAgent("codewhisperer"))
 	if isAPIKeyCredential(token) {
 		request.Header.Set("TokenType", "API_KEY")
+	} else if strings.EqualFold(strings.TrimSpace(token.AuthMethod), "external_idp") {
+		request.Header.Set("TokenType", "EXTERNAL_IDP")
 	}
 	response, err := client.Do(request)
 	if err != nil {

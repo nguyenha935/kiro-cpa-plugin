@@ -98,8 +98,17 @@ type loginFlow struct {
 	Message      string
 	Attempts     int
 	Used         bool
+	Polling      bool
 	ExpiresAt    time.Time
 }
+
+type pluginStatusError struct {
+	status  int
+	message string
+}
+
+func (e pluginStatusError) Error() string   { return e.message }
+func (e pluginStatusError) StatusCode() int { return e.status }
 
 type lifecycleRequest struct {
 	ConfigYAML []byte `json:"config_yaml"`
@@ -298,15 +307,24 @@ func handleLoginPoll(raw []byte) ([]byte, error) {
 		clearUsageCache()
 		return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusSuccess, Message: defaultString(flow.Message, "Kiro credential connected"), Auth: authData(flow.Completed, "")})
 	}
-	loginFlowsMu.Unlock()
 	if flow.DeviceCode == "" {
+		loginFlowsMu.Unlock()
 		return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending, Message: "Waiting for a Kiro authentication method"})
 	}
+	if flow.Polling {
+		loginFlowsMu.Unlock()
+		return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending, Message: "Waiting for AWS authorization"})
+	}
+	flow.Polling = true
+	loginFlows[req.State] = flow
+	loginFlowsMu.Unlock()
 	created, err := kiroauth.NewSSOOIDCClient(pluginConfig).CreateTokenWithRegion(context.Background(), flow.ClientID, flow.ClientSecret, flow.DeviceCode, flow.Region)
 	if errors.Is(err, kiroauth.ErrAuthorizationPending) || errors.Is(err, kiroauth.ErrSlowDown) {
+		_ = updateLoginFlow(req.State, func(flow *loginFlow) { flow.Polling = false })
 		return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending, Message: "Waiting for AWS IAM Identity Center authorization"})
 	}
 	if err != nil {
+		_ = updateLoginFlow(req.State, func(flow *loginFlow) { flow.Polling = false })
 		return nil, fmt.Errorf("poll Kiro IDC login: %w", err)
 	}
 	loginFlowsMu.Lock()
@@ -314,7 +332,9 @@ func handleLoginPoll(raw []byte) ([]byte, error) {
 	loginFlowsMu.Unlock()
 	hash := sha256.Sum256([]byte(flow.ClientID))
 	token := &kiroauth.KiroTokenData{AccessToken: created.AccessToken, RefreshToken: created.RefreshToken, ProfileArn: created.ProfileArn, ExpiresAt: time.Now().UTC().Add(time.Duration(created.ExpiresIn) * time.Second).Format(time.RFC3339), AuthMethod: flow.AuthMethod, Provider: authProviderLabel(flow.AuthMethod), ClientID: flow.ClientID, ClientSecret: flow.ClientSecret, ClientIDHash: hex.EncodeToString(hash[:]), StartURL: flow.StartURL, Region: flow.Region}
-	reconcileProfileBestEffort(context.Background(), token, "after login")
+	if !isBuilderIDCredential(token) {
+		reconcileProfileBestEffort(context.Background(), token, "after login")
+	}
 	clearUsageCache()
 	return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusSuccess, Message: "Kiro device login completed", Auth: authData(token, "")})
 }
@@ -354,12 +374,17 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 	}
 	var token *kiroauth.KiroTokenData
 	var err error
-	if strings.TrimSpace(req.Path) != "" {
+	if len(bytes.TrimSpace(req.RawJSON)) != 0 {
+		token, err = decodeKiroCredential(req.RawJSON)
+	} else if strings.TrimSpace(req.Path) != "" {
 		token, err = kiroauth.LoadKiroTokenFromPath(req.Path)
 	} else {
-		token, err = decodeKiroCredential(req.RawJSON)
+		err = errors.New("Kiro credential JSON is missing")
 	}
 	if err != nil {
+		return nil, fmt.Errorf("parse Kiro credential: %w", err)
+	}
+	if err = normalizeAndValidateKiroToken(token); err != nil {
 		return nil, fmt.Errorf("parse Kiro credential: %w", err)
 	}
 	if !isAPIKeyCredential(token) && !isBuilderIDCredential(token) {
@@ -405,17 +430,45 @@ func decodeKiroCredential(raw []byte) (*kiroauth.KiroTokenData, error) {
 	return &token, nil
 }
 
+func normalizeAndValidateKiroToken(token *kiroauth.KiroTokenData) error {
+	if token == nil || strings.TrimSpace(token.AccessToken) == "" {
+		return errors.New("Kiro access token is missing")
+	}
+	token.AuthMethod = strings.ToLower(strings.TrimSpace(token.AuthMethod))
+	if token.AuthMethod == "" {
+		token.AuthMethod = "imported"
+	}
+	if _, supported := supportedAuthMethods[token.AuthMethod]; !supported {
+		return fmt.Errorf("unsupported Kiro auth method %q", token.AuthMethod)
+	}
+	if token.AuthMethod == "imported" && strings.TrimSpace(token.ProfileArn) == "" {
+		return errors.New("imported Kiro credential requires profileArn")
+	}
+	if strings.TrimSpace(token.Region) == "" {
+		token.Region = "us-east-1"
+	}
+	if err := validateRegion(token.Region); err != nil {
+		return err
+	}
+	if token.AuthMethod == "external_idp" {
+		if strings.TrimSpace(token.RefreshToken) == "" || strings.TrimSpace(token.ClientID) == "" || strings.TrimSpace(token.ProfileArn) == "" || strings.TrimSpace(token.Scopes) == "" {
+			return errors.New("external_idp credential is incomplete")
+		}
+		endpoint, err := validateMicrosoftTokenEndpoint(token.TokenEndpoint)
+		if err != nil {
+			return err
+		}
+		token.TokenEndpoint = endpoint
+	}
+	return nil
+}
+
 func looksLikeKiroToken(raw []byte) bool {
-	var shape map[string]json.RawMessage
-	if json.Unmarshal(raw, &shape) != nil {
+	token, err := decodeKiroCredential(raw)
+	if err != nil || normalizeAndValidateKiroToken(token) != nil {
 		return false
 	}
-	_, access := shape["accessToken"]
-	if access {
-		return true
-	}
-	_, access = shape["access_token"]
-	return access
+	return true
 }
 
 func authData(token *kiroauth.KiroTokenData, fileName string) pluginapi.AuthData {
@@ -571,7 +624,7 @@ func decodeToken(raw []byte) (*kiroauth.KiroTokenData, error) {
 		return nil, err
 	}
 	if token.AccessToken == "" {
-		return nil, errors.New("Kiro access token is missing")
+		return nil, pluginStatusError{status: http.StatusUnauthorized, message: "Kiro access token is missing"}
 	}
 	return &token, nil
 }
@@ -695,7 +748,7 @@ func listAvailableModels(ctx context.Context, token *kiroauth.KiroTokenData) ([]
 	models := make([]controlPlaneModel, 0, 24)
 	nextToken := ""
 	if err := validateRegion(token.Region); err != nil {
-		return nil, err
+		return nil, pluginStatusError{status: http.StatusBadRequest, message: err.Error()}
 	}
 	for page := 0; page < maxPages; page++ {
 		req, err := newModelCatalogRequest(ctx, token, nextToken)
@@ -704,22 +757,22 @@ func listAvailableModels(ctx context.Context, token *kiroauth.KiroTokenData) ([]
 		}
 		resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
 		if err != nil {
-			return nil, fmt.Errorf("list Kiro models: %w", err)
+			return nil, pluginStatusError{status: http.StatusBadGateway, message: "list Kiro models: " + err.Error()}
 		}
 		body, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if readErr != nil {
-			return nil, readErr
+			return nil, pluginStatusError{status: http.StatusBadGateway, message: "read Kiro models: " + readErr.Error()}
 		}
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("list Kiro models returned HTTP %d", resp.StatusCode)
+			return nil, pluginStatusError{status: resp.StatusCode, message: fmt.Sprintf("list Kiro models returned HTTP %d", resp.StatusCode)}
 		}
 		var result struct {
 			Models    []controlPlaneModel `json:"models"`
 			NextToken string              `json:"nextToken"`
 		}
 		if err := json.Unmarshal(body, &result); err != nil {
-			return nil, err
+			return nil, pluginStatusError{status: http.StatusBadGateway, message: "decode Kiro models: " + err.Error()}
 		}
 		models = append(models, result.Models...)
 		nextToken = result.NextToken
@@ -727,15 +780,17 @@ func listAvailableModels(ctx context.Context, token *kiroauth.KiroTokenData) ([]
 			return models, nil
 		}
 	}
-	return models, errors.New("Kiro model pagination exceeded 10 pages")
+	return models, pluginStatusError{status: http.StatusServiceUnavailable, message: "Kiro model pagination exceeded 10 pages"}
 }
 
 func newModelCatalogRequest(ctx context.Context, token *kiroauth.KiroTokenData, nextToken string) (*http.Request, error) {
 	query := url.Values{"origin": {"AI_EDITOR"}}
-	endpoint := managementEndpoint(token.Region, "List-Available-Models")
-	if isAPIKeyCredential(token) || isBuilderIDCredential(token) {
-		endpoint = "https://q." + token.Region + ".amazonaws.com/ListAvailableModels"
-	} else if profileARN := strings.TrimSpace(token.ProfileArn); profileARN != "" {
+	endpoint := "https://q." + token.Region + ".amazonaws.com/ListAvailableModels"
+	if !isAPIKeyCredential(token) && !isBuilderIDCredential(token) {
+		profileARN := strings.TrimSpace(token.ProfileArn)
+		if profileARN == "" {
+			return nil, pluginStatusError{status: http.StatusUnauthorized, message: "Kiro profile ARN is required for this credential type"}
+		}
 		query.Set("profileArn", profileARN)
 	}
 	if nextToken != "" {
@@ -751,6 +806,8 @@ func newModelCatalogRequest(ctx context.Context, token *kiroauth.KiroTokenData, 
 	req.Header.Set("X-Amz-User-Agent", kiroauth.ClientAWSUserAgent("codewhisperer"))
 	if isAPIKeyCredential(token) {
 		req.Header.Set("TokenType", "API_KEY")
+	} else if strings.EqualFold(strings.TrimSpace(token.AuthMethod), "external_idp") {
+		req.Header.Set("TokenType", "EXTERNAL_IDP")
 	}
 	return req, nil
 }
@@ -903,7 +960,7 @@ func profileDiscoveryHTTPError(resp *http.Response, body []byte) error {
 	if requestID != "" {
 		message += " (request_id=" + requestID + ")"
 	}
-	return errors.New(message)
+	return pluginStatusError{status: resp.StatusCode, message: message}
 }
 
 func buildCoreAuth(req pluginapi.ExecutorRequest) (*coreauth.Auth, error) {

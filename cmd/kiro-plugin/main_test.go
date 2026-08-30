@@ -320,6 +320,35 @@ func TestOIDCModelCatalogRequestKeepsProfileContract(t *testing.T) {
 	}
 }
 
+func TestExternalIDPModelCatalogUsesQContractAndTokenType(t *testing.T) {
+	token := &kiroauth.KiroTokenData{
+		AccessToken: "external-token", AuthMethod: "external_idp", Region: "us-east-1",
+		ProfileArn: "arn:aws:codewhisperer:us-east-1:1:profile/test",
+	}
+	req, err := newModelCatalogRequest(context.Background(), token, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.URL.Host != "q.us-east-1.amazonaws.com" || req.Header.Get("TokenType") != "EXTERNAL_IDP" {
+		t.Fatalf("external_idp model contract = %s TokenType=%q", req.URL, req.Header.Get("TokenType"))
+	}
+}
+
+func TestLooksLikeKiroTokenRejectsOtherAuthMethods(t *testing.T) {
+	if looksLikeKiroToken([]byte("{\"accessToken\":\"secret\",\"authMethod\":\"codex\",\"region\":\"us-east-1\"}")) {
+		t.Fatal("non-Kiro auth method was claimed by the Kiro parser")
+	}
+	if !looksLikeKiroToken([]byte("{\"accessToken\":\"secret\",\"authMethod\":\"builder-id\",\"region\":\"us-east-1\"}")) {
+		t.Fatal("valid Builder ID credential was not recognized")
+	}
+	if looksLikeKiroToken([]byte("{\"accessToken\":\"secret\"}")) {
+		t.Fatal("unidentified access token without a Kiro profile was claimed")
+	}
+	if !looksLikeKiroToken([]byte("{\"accessToken\":\"secret\",\"profileArn\":\"arn:aws:codewhisperer:us-east-1:1:profile/test\"}")) {
+		t.Fatal("compatible profile-based Kiro import was not recognized")
+	}
+}
+
 func TestAPIKeyCredentialIdentityDoesNotCollapseAccounts(t *testing.T) {
 	one := &kiroauth.KiroTokenData{AccessToken: "first-key", AuthMethod: "api_key", Region: "us-east-1"}
 	two := &kiroauth.KiroTokenData{AccessToken: "second-key", AuthMethod: "api_key", Region: "us-east-1"}
