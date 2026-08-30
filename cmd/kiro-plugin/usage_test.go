@@ -122,6 +122,29 @@ func TestRequestUsageLimitsUsesKiroContract(t *testing.T) {
 	}
 }
 
+func TestBuilderIDUsageUsesProfilelessAmazonQContract(t *testing.T) {
+	token := &kiroauth.KiroTokenData{AccessToken: "builder-token", AuthMethod: "builder-id", Region: "us-east-1"}
+	client := httpDoerFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Host != "q.us-east-1.amazonaws.com" || request.URL.Path != "/getUsageLimits" {
+			t.Fatalf("Builder ID usage target = %s", request.URL)
+		}
+		if request.URL.Query().Has("profileArn") {
+			t.Fatalf("Builder ID usage included profileArn: %v", request.URL.Query())
+		}
+		if request.Header.Get("TokenType") != "" {
+			t.Fatalf("Builder ID usage used TokenType %q", request.Header.Get("TokenType"))
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"subscriptionInfo":{"subscriptionTitle":"KIRO FREE"},"usageBreakdownList":[{"resourceType":"AGENTIC_REQUEST","currentUsageWithPrecision":1,"usageLimitWithPrecision":50}]}`)), Header: make(http.Header)}, nil
+	})
+	usage, err := requestUsageLimits(context.Background(), client, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.SubscriptionInfo.SubscriptionTitle != "KIRO FREE" || len(usage.UsageBreakdownList) != 1 {
+		t.Fatalf("unexpected Builder ID usage: %+v", usage)
+	}
+}
+
 func TestMergeRefreshedTokenPreservesHostMetadata(t *testing.T) {
 	original := []byte(`{"type":"kiro","priority":4,"disabled":true,"note":"keep","accessToken":"old","custom":{"value":1}}`)
 	refreshed := &kiroauth.KiroTokenData{

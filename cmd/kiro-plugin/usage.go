@@ -237,7 +237,9 @@ func refreshKiroCredential(ctx context.Context, token *kiroauth.KiroTokenData) (
 	if strings.TrimSpace(refreshed.ProfileArn) == "" {
 		refreshed.ProfileArn = token.ProfileArn
 	}
-	reconcileProfileBestEffort(ctx, refreshed, "after refresh")
+	if !isBuilderIDCredential(refreshed) {
+		reconcileProfileBestEffort(ctx, refreshed, "after refresh")
+	}
 	return refreshed, nil
 }
 
@@ -562,17 +564,22 @@ func requestUsageLimits(ctx context.Context, client httpDoer, token *kiroauth.Ki
 	if token == nil || token.AccessToken == "" {
 		return nil, errors.New("Kiro credential is incomplete")
 	}
-	if strings.EqualFold(token.AuthMethod, "api_key") || strings.EqualFold(token.AuthMethod, "external_idp") && token.ProfileArn == "" {
+	if strings.EqualFold(token.AuthMethod, "external_idp") && token.ProfileArn == "" {
 		return nil, errors.New("usage is not available for this Kiro credential type")
 	}
 	if err := validateRegion(token.Region); err != nil {
 		return nil, err
 	}
 	query := url.Values{}
-	query.Set("profileArn", token.ProfileArn)
 	query.Set("origin", "AI_EDITOR")
 	query.Set("resourceType", "AGENTIC_REQUEST")
-	endpoint := managementEndpoint(token.Region, "getUsageLimits") + "?" + query.Encode()
+	endpoint := managementEndpoint(token.Region, "getUsageLimits")
+	if isBuilderIDCredential(token) || isAPIKeyCredential(token) {
+		endpoint = "https://q." + token.Region + ".amazonaws.com/getUsageLimits"
+	} else if profileARN := strings.TrimSpace(token.ProfileArn); profileARN != "" {
+		query.Set("profileArn", profileARN)
+	}
+	endpoint += "?" + query.Encode()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -581,6 +588,9 @@ func requestUsageLimits(ctx context.Context, client httpDoer, token *kiroauth.Ki
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("User-Agent", kiroauth.ClientUserAgent())
 	request.Header.Set("X-Amz-User-Agent", kiroauth.ClientAWSUserAgent("codewhisperer"))
+	if isAPIKeyCredential(token) {
+		request.Header.Set("TokenType", "API_KEY")
+	}
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, fmt.Errorf("request Kiro usage: %w", err)
