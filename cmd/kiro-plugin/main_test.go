@@ -7,12 +7,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	kiroauth "github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
 func TestNormalizeFormat(t *testing.T) {
@@ -127,6 +129,52 @@ func TestBuilderIDCatalogAndUsageIntegration(t *testing.T) {
 	}
 	if strings.TrimSpace(usage.SubscriptionInfo.SubscriptionTitle) == "" || len(usage.UsageBreakdownList) == 0 {
 		t.Fatalf("Builder ID returned incomplete usage: %+v", usage)
+	}
+}
+
+func TestBuilderIDHostParseAndModelIntegration(t *testing.T) {
+	path := os.Getenv("KIRO_BUILDER_ID_INTEGRATION_TOKEN_PATH")
+	if path == "" {
+		t.Skip("KIRO_BUILDER_ID_INTEGRATION_TOKEN_PATH is not set")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, _ := json.Marshal(pluginapi.AuthParseRequest{
+		Provider: providerName, Path: path, FileName: filepath.Base(path), RawJSON: raw,
+	})
+	parsedRaw, err := handleParseAuth(request)
+	if err != nil {
+		t.Fatalf("parse Builder ID host request: %v", err)
+	}
+	var parsedEnvelope envelope
+	if err := json.Unmarshal(parsedRaw, &parsedEnvelope); err != nil {
+		t.Fatal(err)
+	}
+	var parsed pluginapi.AuthParseResponse
+	if err := json.Unmarshal(parsedEnvelope.Result, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if !parsed.Handled || parsed.Auth.Provider != providerName {
+		t.Fatalf("Builder ID was not handled: %+v", parsed)
+	}
+	modelRequest, _ := json.Marshal(pluginapi.AuthModelRequest{
+		AuthID: parsed.Auth.ID, StorageJSON: parsed.Auth.StorageJSON,
+	})
+	modelsRaw, err := handleModelsForAuth(modelRequest)
+	if err != nil {
+		t.Fatalf("load Builder ID models through host contract: %v", err)
+	}
+	if err := json.Unmarshal(modelsRaw, &parsedEnvelope); err != nil {
+		t.Fatal(err)
+	}
+	var models pluginapi.ModelResponse
+	if err := json.Unmarshal(parsedEnvelope.Result, &models); err != nil {
+		t.Fatal(err)
+	}
+	if len(models.Models) == 0 {
+		t.Fatal("Builder ID host contract returned no models")
 	}
 }
 
