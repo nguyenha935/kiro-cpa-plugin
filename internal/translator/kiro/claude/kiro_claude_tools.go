@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	kirocommon "github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/translator/kiro/common"
+	kirocommon "github.com/nguyenha935/kiro-cpa-plugin/internal/translator/kiro/common"
 	log "github.com/sirupsen/logrus"
 )
 

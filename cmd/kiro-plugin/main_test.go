@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	kiroauth "github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/auth/kiro"
+	kiroauth "github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro"
 )
 
 func TestNormalizeFormat(t *testing.T) {

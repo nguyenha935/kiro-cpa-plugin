@@ -3,7 +3,7 @@ package executor
 import (
 	"testing"
 
-	"github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/modelcapabilities"
+	"github.com/nguyenha935/kiro-cpa-plugin/internal/modelcapabilities"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"

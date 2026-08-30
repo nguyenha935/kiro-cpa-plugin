@@ -1,4 +1,4 @@
-module github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin
+module github.com/nguyenha935/kiro-cpa-plugin
 
 go 1.26.0
 

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/modelcapabilities"
+	"github.com/nguyenha935/kiro-cpa-plugin/internal/modelcapabilities"
 )
 
 func TestBuildKiroPayloadPreservesInstructionsAndCompleteHistory(t *testing.T) {
