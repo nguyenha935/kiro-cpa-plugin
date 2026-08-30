@@ -329,7 +329,7 @@ func pluginRegistration() registration {
 			Name:             pluginDisplayName,
 			Version:          pluginVersion,
 			Author:           "JPSAU501, nguyenha935",
-			GitHubRepository: "https://github.com/nguyenha935/CLIProxyAPI-Kiro-Plugin",
+			GitHubRepository: "https://github.com/nguyenha935/kiro-cpa-plugin",
 			ConfigFields:     pluginConfigFields(),
 		},
 		Capabilities: registrationCapabilities{

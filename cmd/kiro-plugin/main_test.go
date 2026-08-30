@@ -142,6 +142,12 @@ func TestPluginUsesKiroDisplayNameAndStableProviderID(t *testing.T) {
 	if registration.Metadata.Name != "Kiro" {
 		t.Fatalf("plugin display name = %q, want Kiro", registration.Metadata.Name)
 	}
+	if registration.Metadata.GitHubRepository != "https://github.com/nguyenha935/kiro-cpa-plugin" {
+		t.Fatalf("plugin repository = %q, want standalone repository", registration.Metadata.GitHubRepository)
+	}
+	if !registration.Capabilities.AuthProvider {
+		t.Fatal("plugin must advertise OAuth/auth-provider support to the CPA panel")
+	}
 	if providerName != "kiro" {
 		t.Fatalf("provider ID = %q, want kiro", providerName)
 	}
