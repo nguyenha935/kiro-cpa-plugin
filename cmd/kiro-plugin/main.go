@@ -777,7 +777,7 @@ func reconcileProfile(ctx context.Context, token *kiroauth.KiroTokenData) error 
 	if err := validateRegion(token.Region); err != nil {
 		return err
 	}
-	profiles, err := listAvailableProfiles(ctx, &http.Client{Timeout: 30 * time.Second}, managementEndpoint(token.Region, "ListAvailableProfiles"), token.AccessToken)
+	profiles, err := listAvailableProfiles(ctx, &http.Client{Timeout: 30 * time.Second}, codeWhispererEndpoint(token.Region), token.AccessToken)
 	if err != nil {
 		return err
 	}
@@ -813,7 +813,7 @@ func listAvailableProfiles(ctx context.Context, client *http.Client, endpoint, a
 	profiles := make([]availableProfile, 0, 1)
 	nextToken := ""
 	for page := 0; page < maxPages; page++ {
-		payload := map[string]string{}
+		payload := map[string]any{"maxResults": 10}
 		if nextToken != "" {
 			payload["nextToken"] = nextToken
 		}
@@ -827,7 +827,8 @@ func listAvailableProfiles(ctx context.Context, client *http.Client, endpoint, a
 		}
 		req.Header.Set("Authorization", "Bearer "+accessToken)
 		req.Header.Set("Accept", "application/json")
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+		req.Header.Set("X-Amz-Target", "AmazonCodeWhispererService.ListAvailableProfiles")
 		req.Header.Set("User-Agent", kiroauth.ClientUserAgent())
 		req.Header.Set("X-Amz-User-Agent", kiroauth.ClientAWSUserAgent("codewhisperer"))
 		resp, err := client.Do(req)
@@ -860,6 +861,10 @@ func listAvailableProfiles(ctx context.Context, client *http.Client, endpoint, a
 
 func managementEndpoint(region, operation string) string {
 	return "https://management." + region + ".kiro.dev/" + operation
+}
+
+func codeWhispererEndpoint(region string) string {
+	return "https://codewhisperer." + region + ".amazonaws.com"
 }
 
 func buildCoreAuth(req pluginapi.ExecutorRequest) (*coreauth.Auth, error) {

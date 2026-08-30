@@ -293,20 +293,33 @@ func TestListAvailableProfilesPaginatesAndKeepsAccountsIsolated(t *testing.T) {
 	var mu sync.Mutex
 	requests := make(map[string][]string)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("profile request method = %s, want POST", r.Method)
+		}
+		if r.Header.Get("Content-Type") != "application/x-amz-json-1.0" {
+			t.Fatalf("profile content type = %q", r.Header.Get("Content-Type"))
+		}
+		if r.Header.Get("X-Amz-Target") != "AmazonCodeWhispererService.ListAvailableProfiles" {
+			t.Fatalf("profile target = %q", r.Header.Get("X-Amz-Target"))
+		}
 		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Fatalf("read request: %v", err)
 		}
-		var payload map[string]string
+		var payload map[string]any
 		if err := json.Unmarshal(body, &payload); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
+		if payload["maxResults"] != float64(10) {
+			t.Fatalf("profile maxResults = %#v", payload["maxResults"])
+		}
+		nextToken, _ := payload["nextToken"].(string)
 		mu.Lock()
-		requests[token] = append(requests[token], payload["nextToken"])
+		requests[token] = append(requests[token], nextToken)
 		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		if token == "account-a" && payload["nextToken"] == "" {
+		if token == "account-a" && nextToken == "" {
 			_, _ = w.Write([]byte(`{"profiles":[{"arn":"arn:account-a:first","startUrl":"https://a.awsapps.com/start"}],"nextToken":"page-2"}`))
 			return
 		}
