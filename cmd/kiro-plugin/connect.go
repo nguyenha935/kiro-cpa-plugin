@@ -276,7 +276,6 @@ func importExternalIDP(raw []byte) (*kiroauth.KiroTokenData, error) {
 	}
 	var input externalIDPJSON
 	decoder := json.NewDecoder(strings.NewReader(string(raw)))
-	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&input); err != nil {
 		return nil, fmt.Errorf("invalid external_idp JSON: %w", err)
 	}
