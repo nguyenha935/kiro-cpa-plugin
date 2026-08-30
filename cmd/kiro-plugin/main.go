@@ -45,7 +45,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html"
 	"io"
 	"log"
 	"net/http"
@@ -229,10 +228,11 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return handleCountTokens(request)
 	case pluginabi.MethodManagementRegister:
 		return okEnvelope(managementRegistrationResponse{
-			Routes: []pluginapi.ManagementRoute{{Method: http.MethodGet, Path: "/status"}},
+			Routes: []pluginapi.ManagementRoute{
+				{Method: http.MethodGet, Path: "/plugins/kiro/status"},
+				{Method: http.MethodPost, Path: "/plugins/kiro/connect"},
+			},
 			Resources: []pluginapi.ResourceRoute{
-				{Path: "/connect"},
-				{Path: "/submit"},
 				{Path: "/capabilities"},
 				{Path: usageResourcePath, Menu: "Kiro Usage", Description: "Shows Kiro subscription usage for connected accounts."},
 			},
@@ -273,8 +273,7 @@ func handleLoginStart(raw []byte) ([]byte, error) {
 	cleanupLoginFlowsLocked(time.Now().UTC())
 	loginFlows[state] = loginFlow{ExpiresAt: expiresAt}
 	loginFlowsMu.Unlock()
-	loginURL := "/v0/resource/plugins/kiro/connect?state=" + url.QueryEscape(state)
-	return okEnvelope(pluginapi.AuthLoginStartResponse{Provider: providerName, URL: loginURL, State: state, ExpiresAt: expiresAt})
+	return okEnvelope(pluginapi.AuthLoginStartResponse{Provider: providerName, State: state, ExpiresAt: expiresAt})
 }
 
 func handleLoginPoll(raw []byte) ([]byte, error) {
@@ -328,7 +327,7 @@ func pluginRegistration() registration {
 		Metadata: pluginapi.Metadata{
 			Name:             pluginDisplayName,
 			Version:          pluginVersion,
-			Author:           "JPSAU501, nguyenha935",
+			Author:           "nguyenha935",
 			GitHubRepository: "https://github.com/nguyenha935/kiro-cpa-plugin",
 			ConfigFields:     pluginConfigFields(),
 		},
@@ -365,8 +364,10 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse Kiro credential: %w", err)
 	}
-	if err = reconcileParsedProfile(context.Background(), token, reconcileProfile); err != nil {
-		return nil, fmt.Errorf("validate Kiro profile: %w", err)
+	if !isAPIKeyCredential(token) {
+		if err = reconcileParsedProfile(context.Background(), token, reconcileProfile); err != nil {
+			return nil, fmt.Errorf("validate Kiro profile: %w", err)
+		}
 	}
 	return okEnvelope(pluginapi.AuthParseResponse{Handled: true, Auth: authData(token, req.FileName)})
 }
@@ -437,7 +438,7 @@ func authData(token *kiroauth.KiroTokenData, fileName string) pluginapi.AuthData
 		StorageJSON:      storage,
 		Metadata:         authMetadata(token),
 		Attributes:       authAttributes(token),
-		NextRefreshAfter: refreshAt(expiresAt),
+		NextRefreshAfter: nextRefreshAfter(token, expiresAt),
 	}
 }
 
@@ -452,6 +453,10 @@ func kiroFileName(token *kiroauth.KiroTokenData) string {
 	}
 	if id == "" && token.ClientID != "" {
 		hash := sha256.Sum256([]byte(token.ClientID))
+		id = hex.EncodeToString(hash[:])
+	}
+	if id == "" && isAPIKeyCredential(token) && token.AccessToken != "" {
+		hash := sha256.Sum256([]byte(token.AccessToken))
 		id = hex.EncodeToString(hash[:])
 	}
 	if len(id) > 12 {
@@ -482,6 +487,10 @@ func stableAuthID(token *kiroauth.KiroTokenData) string {
 	}
 	if token.ProfileArn != "" {
 		return "kiro-" + method + "-" + sanitize(token.ProfileArn)
+	}
+	if isAPIKeyCredential(token) && token.AccessToken != "" {
+		hash := sha256.Sum256([]byte(token.AccessToken))
+		return "kiro-" + method + "-" + hex.EncodeToString(hash[:6])
 	}
 	return "kiro-" + method
 }
@@ -547,6 +556,17 @@ func refreshAt(expiresAt time.Time) time.Time {
 	return refresh
 }
 
+func nextRefreshAfter(token *kiroauth.KiroTokenData, expiresAt time.Time) time.Time {
+	if isAPIKeyCredential(token) {
+		return time.Time{}
+	}
+	return refreshAt(expiresAt)
+}
+
+func isAPIKeyCredential(token *kiroauth.KiroTokenData) bool {
+	return token != nil && strings.EqualFold(strings.TrimSpace(token.AuthMethod), "api_key")
+}
+
 func decodeToken(raw []byte) (*kiroauth.KiroTokenData, error) {
 	var token kiroauth.KiroTokenData
 	if err := json.Unmarshal(raw, &token); err != nil {
@@ -575,7 +595,7 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	clearUsageCache()
-	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: authData(refreshed, ""), NextRefreshAfter: refreshAt(parseTime(refreshed.ExpiresAt))})
+	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: authData(refreshed, ""), NextRefreshAfter: nextRefreshAfter(refreshed, parseTime(refreshed.ExpiresAt))})
 }
 
 func handleModelsForAuth(raw []byte) ([]byte, error) {
@@ -598,16 +618,19 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 			return nil, err
 		}
 		clearUsageCache()
-	} else if err = reconcileProfile(ctx, token); err != nil {
-		if !isKiroAuthorizationError(err) {
-			return nil, err
+	} else if !isAPIKeyCredential(token) {
+		if err = reconcileProfile(ctx, token); err != nil {
+			if !isKiroAuthorizationError(err) {
+				return nil, err
+			}
+			token, _, err = refreshAndSaveUsageCredential(ctx, kiroFileName(token), req.StorageJSON, token)
+			if err != nil {
+				return nil, err
+			}
+			clearUsageCache()
 		}
-		token, _, err = refreshAndSaveUsageCredential(ctx, kiroFileName(token), req.StorageJSON, token)
-		if err != nil {
-			return nil, err
-		}
-		clearUsageCache()
 	}
+
 	models, err := listAvailableModels(ctx, token)
 	if err != nil {
 		return nil, fmt.Errorf("list Kiro models: %w", err)
@@ -673,19 +696,10 @@ func listAvailableModels(ctx context.Context, token *kiroauth.KiroTokenData) ([]
 		return nil, err
 	}
 	for page := 0; page < maxPages; page++ {
-		query := make([]string, 0, 3)
-		query = append(query, "origin=AI_EDITOR", "profileArn="+urlQueryEscape(token.ProfileArn))
-		if nextToken != "" {
-			query = append(query, "nextToken="+urlQueryEscape(nextToken))
-		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, managementEndpoint(token.Region, "List-Available-Models")+"?"+strings.Join(query, "&"), nil)
+		req, err := newModelCatalogRequest(ctx, token, nextToken)
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("Authorization", "Bearer "+token.AccessToken)
-		req.Header.Set("Accept", "application/json")
-		req.Header.Set("User-Agent", kiroauth.ClientUserAgent())
-		req.Header.Set("X-Amz-User-Agent", kiroauth.ClientAWSUserAgent("codewhisperer"))
 		resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("list Kiro models: %w", err)
@@ -714,8 +728,29 @@ func listAvailableModels(ctx context.Context, token *kiroauth.KiroTokenData) ([]
 	return models, errors.New("Kiro model pagination exceeded 10 pages")
 }
 
-func urlQueryEscape(value string) string {
-	return url.QueryEscape(value)
+func newModelCatalogRequest(ctx context.Context, token *kiroauth.KiroTokenData, nextToken string) (*http.Request, error) {
+	query := url.Values{"origin": {"AI_EDITOR"}}
+	endpoint := managementEndpoint(token.Region, "List-Available-Models")
+	if isAPIKeyCredential(token) {
+		endpoint = "https://q." + token.Region + ".amazonaws.com/ListAvailableModels"
+	} else if profileARN := strings.TrimSpace(token.ProfileArn); profileARN != "" {
+		query.Set("profileArn", profileARN)
+	}
+	if nextToken != "" {
+		query.Set("nextToken", nextToken)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"?"+query.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token.AccessToken)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", kiroauth.ClientUserAgent())
+	req.Header.Set("X-Amz-User-Agent", kiroauth.ClientAWSUserAgent("codewhisperer"))
+	if isAPIKeyCredential(token) {
+		req.Header.Set("TokenType", "API_KEY")
+	}
+	return req, nil
 }
 
 func thinkingSupport(capability modelcapabilities.Capability) *pluginapi.ThinkingSupport {
@@ -950,10 +985,8 @@ func handleManagement(raw []byte) ([]byte, error) {
 	case "/v0/management/plugins/kiro/status":
 		body, _ := json.Marshal(map[string]any{"provider": providerName, "version": pluginVersion, "auth": "multi-method", "model_catalog": "dynamic"})
 		return okEnvelope(pluginapi.ManagementResponse{StatusCode: http.StatusOK, Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: body})
-	case "/v0/resource/plugins/kiro/connect":
-		return handleConnectPage(req)
-	case "/v0/resource/plugins/kiro/submit":
-		return handleConnectSubmit(req)
+	case "/v0/management/plugins/kiro/connect":
+		return handleConnectAPI(req)
 	case "/v0/resource/plugins/kiro/capabilities":
 		capabilities := modelcapabilities.Snapshot()
 		sort.Slice(capabilities, func(i, j int) bool { return capabilities[i].ModelID < capabilities[j].ModelID })
@@ -994,16 +1027,6 @@ func validateRegion(region string) error {
 		return errors.New("Enter a valid AWS Region, for example us-east-1.")
 	}
 	return nil
-}
-
-// loginFormPage is retained as a compatibility helper for older plugin tests
-// and callers; the user-facing flow is now the multi-method connect page.
-func loginFormPage(state, errorMessage string) string {
-	return `<!doctype html><html lang="en"><body><form>` +
-		`<input type="hidden" name="state" value="` + html.EscapeString(state) + `">` +
-		`<input name="start_url" type="url" placeholder="your_subdomain.awsapps.com/start">` +
-		`<input name="region" type="text" placeholder="e.g., us-east-1">` +
-		`<button type="submit">Continue</button></form></body></html>`
 }
 
 func hostCall(method string, request []byte) ([]byte, error) {

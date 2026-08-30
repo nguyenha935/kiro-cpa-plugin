@@ -3233,11 +3233,14 @@ func (e *KiroExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
 		}
 		profileArn, _ := auth.Metadata["profile_arn"].(string)
 		tokenData = &kiroauth.KiroTokenData{AccessToken: payload.AccessToken, RefreshToken: payload.RefreshToken, ProfileArn: profileArn, ExpiresAt: expires, AuthMethod: "external_idp", Provider: "CLIProxyAPI", ClientID: clientID, Region: region, TokenEndpoint: endpoint, Scopes: scopes}
-	} else if clientID == "" || clientSecret == "" || authMethod != "idc" || region == "" {
-		return nil, fmt.Errorf("kiro executor: credential is not a complete IAM Identity Center registration")
+	} else if clientID == "" || clientSecret == "" || region == "" || authMethod != "idc" && authMethod != "builder-id" {
+		return nil, fmt.Errorf("kiro executor: credential is not a complete AWS device registration")
 	} else {
-		log.Debugf("kiro executor: refreshing IAM Identity Center token (region=%s)", region)
+		log.Debugf("kiro executor: refreshing AWS device token (method=%s, region=%s)", authMethod, region)
 		tokenData, err = ssoClient.RefreshTokenWithRegion(ctx, clientID, clientSecret, refreshToken, region, startURL)
+		if tokenData != nil {
+			tokenData.AuthMethod = authMethod
+		}
 	}
 
 	if err != nil {

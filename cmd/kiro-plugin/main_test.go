@@ -145,6 +145,9 @@ func TestPluginUsesKiroDisplayNameAndStableProviderID(t *testing.T) {
 	if registration.Metadata.GitHubRepository != "https://github.com/nguyenha935/kiro-cpa-plugin" {
 		t.Fatalf("plugin repository = %q, want standalone repository", registration.Metadata.GitHubRepository)
 	}
+	if registration.Metadata.Author != "nguyenha935" {
+		t.Fatalf("plugin author = %q, want standalone project owner", registration.Metadata.Author)
+	}
 	if !registration.Capabilities.AuthProvider {
 		t.Fatal("plugin must advertise OAuth/auth-provider support to the CPA panel")
 	}
@@ -195,20 +198,6 @@ func TestFormatMappingMatchesKiroTranslators(t *testing.T) {
 	}
 }
 
-func TestLoginFormStartsEmpty(t *testing.T) {
-	page := loginFormPage("state-value", "")
-	for _, unexpected := range []string{`name="start_url" type="url" value=`, `name="region" type="text" value=`, `us-east-1" value`} {
-		if strings.Contains(page, unexpected) {
-			t.Fatalf("login form contains a default value: %s", unexpected)
-		}
-	}
-	for _, expected := range []string{`placeholder="your_subdomain.awsapps.com/start"`, `placeholder="e.g., us-east-1"`, `>Continue</button>`, `lang="en"`} {
-		if !strings.Contains(page, expected) {
-			t.Fatalf("login form is missing %s", expected)
-		}
-	}
-}
-
 func TestValidateIDCInput(t *testing.T) {
 	valid := []struct{ startURL, region string }{
 		{"https://d-example.awsapps.com/start", "us-east-1"},
@@ -230,6 +219,73 @@ func TestValidateIDCInput(t *testing.T) {
 		if err := validateIDCInput(test.startURL, test.region); err == nil {
 			t.Fatalf("invalid IDC input accepted: %s %s", test.startURL, test.region)
 		}
+	}
+}
+
+func TestAPIKeyModelCatalogRequestUsesStaticCredentialContract(t *testing.T) {
+	token := &kiroauth.KiroTokenData{
+		AccessToken: "test-api-key",
+		AuthMethod:  "api_key",
+		Region:      "us-east-1",
+	}
+	req, err := newModelCatalogRequest(context.Background(), token, "next-page")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Header.Get("Authorization") != "Bearer test-api-key" {
+		t.Fatalf("unexpected authorization header: %q", req.Header.Get("Authorization"))
+	}
+	if req.Header.Get("TokenType") != "API_KEY" {
+		t.Fatalf("unexpected token type: %q", req.Header.Get("TokenType"))
+	}
+	query := req.URL.Query()
+	if query.Get("origin") != "AI_EDITOR" || query.Get("nextToken") != "next-page" {
+		t.Fatalf("unexpected API-key model query: %v", query)
+	}
+	if _, exists := query["profileArn"]; exists {
+		t.Fatalf("API-key model query must not contain profileArn: %v", query)
+	}
+	if req.URL.Host != "q.us-east-1.amazonaws.com" || req.URL.Path != "/ListAvailableModels" {
+		t.Fatalf("API-key model request used the wrong endpoint: %s", req.URL)
+	}
+	if credentialNeedsRefresh(token, time.Now().UTC()) {
+		t.Fatal("API-key credential was scheduled for OAuth refresh")
+	}
+	if !nextRefreshAfter(token, time.Time{}).IsZero() {
+		t.Fatal("API-key credential received an OAuth refresh deadline")
+	}
+}
+
+func TestOIDCModelCatalogRequestKeepsProfileContract(t *testing.T) {
+	token := &kiroauth.KiroTokenData{
+		AccessToken: "test-access-token",
+		AuthMethod:  "idc",
+		ProfileArn:  "arn:aws:codewhisperer:us-east-1:1:profile/test",
+		Region:      "us-east-1",
+	}
+	req, err := newModelCatalogRequest(context.Background(), token, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Header.Get("TokenType") != "" {
+		t.Fatalf("OIDC request inherited API-key token type: %q", req.Header.Get("TokenType"))
+	}
+	if req.URL.Query().Get("profileArn") != token.ProfileArn {
+		t.Fatalf("OIDC model query lost profile ARN: %v", req.URL.Query())
+	}
+}
+
+func TestAPIKeyCredentialIdentityDoesNotCollapseAccounts(t *testing.T) {
+	one := &kiroauth.KiroTokenData{AccessToken: "first-key", AuthMethod: "api_key", Region: "us-east-1"}
+	two := &kiroauth.KiroTokenData{AccessToken: "second-key", AuthMethod: "api_key", Region: "us-east-1"}
+	if kiroFileName(one) == kiroFileName(two) {
+		t.Fatalf("API-key file names collided: %s", kiroFileName(one))
+	}
+	if stableAuthID(one) == stableAuthID(two) {
+		t.Fatalf("API-key auth IDs collided: %s", stableAuthID(one))
+	}
+	if strings.Contains(kiroFileName(one), one.AccessToken) || strings.Contains(stableAuthID(one), one.AccessToken) {
+		t.Fatal("API-key secret leaked into credential identity")
 	}
 }
 

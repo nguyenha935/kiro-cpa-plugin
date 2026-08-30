@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html"
 	"io"
 	"net/http"
 	"net/url"
@@ -21,6 +20,7 @@ import (
 
 const (
 	maxConnectBody     = 64 << 10
+	maxConnectRequest  = 80 << 10
 	maxConnectAttempts = 10
 	builderStartURL    = "https://view.awsapps.com/start"
 )
@@ -78,78 +78,92 @@ func updateLoginFlow(state string, update func(*loginFlow)) error {
 	return nil
 }
 
-func handleConnectPage(req pluginapi.ManagementRequest) ([]byte, error) {
-	state := strings.TrimSpace(req.Query.Get("state"))
-	loginFlowsMu.Lock()
-	flow, ok := loginFlows[state]
-	loginFlowsMu.Unlock()
-	if !ok || time.Now().UTC().After(flow.ExpiresAt) {
-		return connectHTML(http.StatusBadRequest, connectMessagePage("Sign-in expired", "Start a new Kiro sign-in from CPA."))
-	}
-	return connectHTML(http.StatusOK, connectPage(state, ""))
-}
-
-func handleConnectSubmit(req pluginapi.ManagementRequest) ([]byte, error) {
+func handleConnectAPI(req pluginapi.ManagementRequest) ([]byte, error) {
 	if !strings.EqualFold(req.Method, http.MethodPost) {
-		return connectHTML(http.StatusMethodNotAllowed, connectMessagePage("Method not allowed", "Use the Kiro connection form."))
+		return connectAPIError(http.StatusMethodNotAllowed, "method not allowed")
 	}
-	if len(req.Body) > maxConnectBody {
-		return connectHTML(http.StatusRequestEntityTooLarge, connectMessagePage("Request too large", "Imported credentials are limited to 64 KiB."))
+	if len(req.Body) > maxConnectRequest {
+		return connectAPIError(http.StatusRequestEntityTooLarge, "Kiro connection request is too large")
 	}
-	values, err := url.ParseQuery(string(req.Body))
-	if err != nil {
-		return connectHTML(http.StatusBadRequest, connectMessagePage("Invalid form", "The submitted form could not be decoded."))
+	var input connectAPIRequest
+	decoder := json.NewDecoder(strings.NewReader(string(req.Body)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil {
+		return connectAPIError(http.StatusBadRequest, "invalid Kiro connection request")
 	}
-	state := strings.TrimSpace(values.Get("state"))
-	if _, err = connectFlow(state); err != nil {
-		return connectHTML(http.StatusBadRequest, connectMessagePage("Sign-in unavailable", err.Error()))
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return connectAPIError(http.StatusBadRequest, "invalid Kiro connection request")
 	}
-	method := strings.TrimSpace(values.Get("method"))
+	state := strings.TrimSpace(input.State)
+	if _, err := connectFlow(state); err != nil {
+		return connectAPIError(http.StatusBadRequest, err.Error())
+	}
+
+	method := strings.TrimSpace(input.Method)
 	var token *kiroauth.KiroTokenData
+	var err error
 	switch method {
 	case "builder-id":
-		return beginDeviceLogin(state, method, builderStartURL, "us-east-1")
+		return connectAPIDeviceLogin(state, method, builderStartURL, "us-east-1")
 	case "idc":
-		startURL := strings.TrimSpace(values.Get("start_url"))
-		region := strings.TrimSpace(values.Get("region"))
-		if err = validateIDCInput(startURL, region); err == nil {
-			return beginDeviceLogin(state, method, startURL, region)
+		if err = validateIDCInput(strings.TrimSpace(input.StartURL), strings.TrimSpace(input.Region)); err == nil {
+			return connectAPIDeviceLogin(state, method, strings.TrimSpace(input.StartURL), strings.TrimSpace(input.Region))
 		}
 	case "api_key":
-		token, err = importAPIKey(context.Background(), values.Get("api_key"), values.Get("region"))
+		token, err = importAPIKey(context.Background(), input.APIKey, input.Region)
 	case "refresh_token":
+		values := url.Values{
+			"refresh_auth_method": []string{input.RefreshAuthMethod},
+			"refresh_token":       []string{input.RefreshToken},
+			"client_id":           []string{input.ClientID},
+			"client_secret":       []string{input.ClientSecret},
+			"start_url":           []string{input.StartURL},
+			"region":              []string{input.Region},
+		}
 		token, err = importRefreshToken(context.Background(), values)
 	case "external_idp":
-		token, err = importExternalIDP([]byte(values.Get("credential_json")))
+		token, err = importExternalIDP([]byte(input.CredentialJSON))
 	default:
 		err = errors.New("select a supported Kiro authentication method")
 	}
 	if err != nil {
 		_ = updateLoginFlow(state, func(flow *loginFlow) { flow.Used = false })
-		return connectHTML(http.StatusBadRequest, connectPage(state, err.Error()))
+		return connectAPIError(http.StatusBadRequest, err.Error())
 	}
 	if err = updateLoginFlow(state, func(flow *loginFlow) {
 		flow.Completed = token
 		flow.Message = "Kiro credential connected"
 	}); err != nil {
-		return connectHTML(http.StatusBadRequest, connectMessagePage("Sign-in expired", err.Error()))
+		return connectAPIError(http.StatusBadRequest, err.Error())
 	}
-	return connectHTML(http.StatusOK, connectMessagePage("Credential accepted", "Return to CPA. The credential will appear in Authentication Files shortly."))
+	return connectAPIJSON(http.StatusOK, connectAPIResponse{Status: "connected"})
 }
 
-func beginDeviceLogin(state, method, startURL, region string) ([]byte, error) {
+func connectAPIDeviceLogin(state, method, startURL, region string) ([]byte, error) {
+	result, err := startDeviceLogin(state, method, startURL, region)
+	if err != nil {
+		_ = updateLoginFlow(state, func(flow *loginFlow) { flow.Used = false })
+		return connectAPIError(http.StatusBadGateway, err.Error())
+	}
+	return connectAPIJSON(http.StatusOK, connectAPIResponse{Status: "authorization_required", URL: result.URL, UserCode: result.UserCode})
+}
+
+func startDeviceLogin(state, method, startURL, region string) (deviceLoginResult, error) {
 	client := kiroauth.NewSSOOIDCClient(pluginConfig)
 	registration, err := client.RegisterClientWithRegion(context.Background(), region)
 	if err != nil {
-		return nil, fmt.Errorf("register Kiro OIDC client: %w", err)
+		return deviceLoginResult{}, fmt.Errorf("register Kiro OIDC client: %w", err)
 	}
 	device, err := client.StartDeviceAuthorizationWithIDC(context.Background(), registration.ClientID, registration.ClientSecret, startURL, region)
 	if err != nil {
-		return nil, fmt.Errorf("start Kiro device authorization: %w", err)
+		return deviceLoginResult{}, fmt.Errorf("start Kiro device authorization: %w", err)
 	}
 	loginURL := strings.TrimSpace(device.VerificationURIComplete)
 	if loginURL == "" {
 		loginURL = strings.TrimSpace(device.VerificationURI)
+	}
+	if err = validateAWSAuthorizationURL(loginURL); err != nil {
+		return deviceLoginResult{}, err
 	}
 	err = updateLoginFlow(state, func(flow *loginFlow) {
 		flow.ClientID, flow.ClientSecret, flow.DeviceCode = registration.ClientID, registration.ClientSecret, device.DeviceCode
@@ -157,9 +171,9 @@ func beginDeviceLogin(state, method, startURL, region string) ([]byte, error) {
 		flow.ExpiresAt = time.Now().UTC().Add(time.Duration(device.ExpiresIn) * time.Second)
 	})
 	if err != nil {
-		return connectHTML(http.StatusBadRequest, connectMessagePage("Sign-in expired", err.Error()))
+		return deviceLoginResult{}, err
 	}
-	return connectHTML(http.StatusOK, deviceLoginPage(loginURL, device.UserCode))
+	return deviceLoginResult{URL: loginURL, UserCode: device.UserCode}, nil
 }
 
 func importAPIKey(ctx context.Context, rawKey, rawRegion string) (*kiroauth.KiroTokenData, error) {
@@ -174,7 +188,11 @@ func importAPIKey(ctx context.Context, rawKey, rawRegion string) (*kiroauth.Kiro
 	if err := validateRegion(region); err != nil {
 		return nil, err
 	}
-	token := &kiroauth.KiroTokenData{AccessToken: key, AuthMethod: "api_key", Provider: "AWS", Region: region}
+	digest := sha256.Sum256([]byte(key))
+	token := &kiroauth.KiroTokenData{
+		AccessToken: key, AuthMethod: "api_key", Provider: "AWS", Region: region,
+		ClientIDHash: hex.EncodeToString(digest[:]),
+	}
 	models, err := listAvailableAPIKeyModels(ctx, key, region)
 	if err != nil {
 		return nil, fmt.Errorf("API key validation failed: %w", err)
@@ -256,18 +274,55 @@ func importRefreshToken(ctx context.Context, values url.Values) (*kiroauth.KiroT
 }
 
 type externalIDPJSON struct {
+	Type          string          `json:"type"`
 	AuthMethod    string          `json:"auth_method"`
+	AuthMethodAlt string          `json:"authMethod"`
 	AccessToken   string          `json:"access_token"`
+	AccessAlt     string          `json:"accessToken"`
 	RefreshToken  string          `json:"refresh_token"`
+	RefreshAlt    string          `json:"refreshToken"`
 	ClientID      string          `json:"client_id"`
+	ClientIDAlt   string          `json:"clientId"`
 	ClientSecret  string          `json:"client_secret"`
+	ClientSecAlt  string          `json:"clientSecret"`
 	TokenEndpoint string          `json:"token_endpoint"`
+	TokenAlt      string          `json:"tokenEndpoint"`
 	ProfileARN    string          `json:"profile_arn"`
+	ProfileAlt    string          `json:"profileArn"`
 	Region        string          `json:"region"`
 	Scopes        json.RawMessage `json:"scopes"`
 	Scope         string          `json:"scope"`
 	ExpiresAt     string          `json:"expires_at"`
+	ExpiresAlt    string          `json:"expiresAt"`
+	Expired       string          `json:"expired"`
 	Email         string          `json:"email"`
+	Provider      string          `json:"provider"`
+	ClientIDHash  string          `json:"clientIdHash"`
+	StartURL      string          `json:"startUrl"`
+}
+
+type connectAPIRequest struct {
+	State             string `json:"state"`
+	Method            string `json:"method"`
+	StartURL          string `json:"start_url"`
+	Region            string `json:"region"`
+	APIKey            string `json:"api_key"`
+	RefreshAuthMethod string `json:"refresh_auth_method"`
+	RefreshToken      string `json:"refresh_token"`
+	ClientID          string `json:"client_id"`
+	ClientSecret      string `json:"client_secret"`
+	CredentialJSON    string `json:"credential_json"`
+}
+
+type connectAPIResponse struct {
+	Status   string `json:"status"`
+	URL      string `json:"url,omitempty"`
+	UserCode string `json:"user_code,omitempty"`
+}
+
+type deviceLoginResult struct {
+	URL      string
+	UserCode string
 }
 
 func importExternalIDP(raw []byte) (*kiroauth.KiroTokenData, error) {
@@ -276,13 +331,22 @@ func importExternalIDP(raw []byte) (*kiroauth.KiroTokenData, error) {
 	}
 	var input externalIDPJSON
 	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&input); err != nil {
 		return nil, fmt.Errorf("invalid external_idp JSON: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, errors.New("invalid external_idp JSON: trailing data")
+	}
+	input.AuthMethod = firstNonEmpty(input.AuthMethod, input.AuthMethodAlt)
+	input.Type = strings.ToLower(strings.TrimSpace(input.Type))
+	if input.Type != "" && input.Type != providerName {
+		return nil, errors.New("type must be kiro")
 	}
 	if input.AuthMethod != "external_idp" {
 		return nil, errors.New("auth_method must be external_idp")
 	}
-	endpoint, err := validateMicrosoftTokenEndpoint(input.TokenEndpoint)
+	endpoint, err := validateMicrosoftTokenEndpoint(firstNonEmpty(input.TokenEndpoint, input.TokenAlt))
 	if err != nil {
 		return nil, err
 	}
@@ -290,7 +354,11 @@ func importExternalIDP(raw []byte) (*kiroauth.KiroTokenData, error) {
 	if err != nil {
 		return nil, err
 	}
-	input.AccessToken, input.RefreshToken, input.ClientID, input.ProfileARN = strings.TrimSpace(input.AccessToken), strings.TrimSpace(input.RefreshToken), strings.TrimSpace(input.ClientID), strings.TrimSpace(input.ProfileARN)
+	input.AccessToken = firstNonEmpty(input.AccessToken, input.AccessAlt)
+	input.RefreshToken = firstNonEmpty(input.RefreshToken, input.RefreshAlt)
+	input.ClientID = firstNonEmpty(input.ClientID, input.ClientIDAlt)
+	input.ClientSecret = firstNonEmpty(input.ClientSecret, input.ClientSecAlt)
+	input.ProfileARN = firstNonEmpty(input.ProfileARN, input.ProfileAlt)
 	if input.AccessToken == "" || input.RefreshToken == "" || input.ClientID == "" || input.ProfileARN == "" || scopes == "" {
 		return nil, errors.New("access_token, refresh_token, client_id, profile_arn, and scopes are required")
 	}
@@ -301,7 +369,7 @@ func importExternalIDP(raw []byte) (*kiroauth.KiroTokenData, error) {
 	if err = validateRegion(region); err != nil {
 		return nil, err
 	}
-	expires := strings.TrimSpace(input.ExpiresAt)
+	expires := firstNonEmpty(input.ExpiresAt, input.ExpiresAlt, input.Expired)
 	if _, parseErr := time.Parse(time.RFC3339, expires); parseErr != nil {
 		expires = time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
 	}
@@ -311,6 +379,15 @@ func importExternalIDP(raw []byte) (*kiroauth.KiroTokenData, error) {
 		ClientSecret: strings.TrimSpace(input.ClientSecret), Email: strings.TrimSpace(input.Email), Region: region,
 		TokenEndpoint: endpoint, Scopes: scopes,
 	}, nil
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func normalizeScopes(scope string, raw json.RawMessage) (string, error) {
@@ -349,53 +426,34 @@ func validateMicrosoftTokenEndpoint(raw string) (string, error) {
 	return parsed.String(), nil
 }
 
-func connectHTML(status int, page string) ([]byte, error) {
-	return okEnvelope(pluginapi.ManagementResponse{StatusCode: status, Headers: connectHeaders(), Body: []byte(page)})
-}
-
-func connectHeaders() http.Header {
-	return http.Header{
-		"Content-Type": []string{"text/html; charset=utf-8"}, "Cache-Control": []string{"no-store"},
-		"Content-Security-Policy": []string{"default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'self'; base-uri 'none'"},
-		"Referrer-Policy":         []string{"no-referrer"}, "X-Content-Type-Options": []string{"nosniff"},
+func validateAWSAuthorizationURL(raw string) error {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed == nil || parsed.Scheme != "https" || parsed.User != nil || parsed.Hostname() == "" {
+		return errors.New("Kiro returned an invalid AWS authorization URL")
 	}
-}
-
-func connectPage(state, errorMessage string) string {
-	errorBlock := ""
-	if errorMessage != "" {
-		errorBlock = `<div class="error" role="alert">` + html.EscapeString(errorMessage) + `</div>`
+	host := strings.ToLower(parsed.Hostname())
+	if !strings.HasSuffix(host, ".amazonaws.com") && !strings.HasSuffix(host, ".awsapps.com") {
+		return errors.New("Kiro returned an untrusted AWS authorization URL")
 	}
-	hidden := `<input type="hidden" name="state" value="` + html.EscapeString(state) + `">`
-	return connectDocument("Connect Kiro", `<h1>Connect Kiro</h1><p class="lead">Choose one authentication method. CPA will store the result as an Authentication File.</p>`+errorBlock+
-		`<div class="methods">`+
-		methodCard("builder-id", "AWS Builder ID", "Device login for a personal AWS Builder ID.", hidden, "")+
-		methodCard("idc", "AWS IAM Identity Center", "Enterprise device login.", hidden, `<label>Start URL<input name="start_url" type="url" placeholder="https://company.awsapps.com/start"></label><label>Region<input name="region" value="us-east-1"></label>`)+
-		methodCard("api_key", "API key", "Validated against Kiro's model catalog before saving.", hidden, `<label>API key<input name="api_key" type="password" autocomplete="off"></label><label>Region<input name="region" value="us-east-1"></label>`)+
-		methodCard("refresh_token", "Import refresh token", "AWS OIDC refresh requires its client registration.", hidden, `<label>Auth method<select name="refresh_auth_method"><option value="builder-id">Builder ID</option><option value="idc">IAM Identity Center</option></select></label><label>Refresh token<input name="refresh_token" type="password" autocomplete="off"></label><label>Client ID<input name="client_id" autocomplete="off"></label><label>Client secret<input name="client_secret" type="password" autocomplete="off"></label><label>Start URL (IDC only)<input name="start_url" type="url"></label><label>Region<input name="region" value="us-east-1"></label>`)+
-		methodCard("external_idp", "Import external_idp JSON", "CLIProxyAPI JSON using a Microsoft identity provider.", hidden, `<label>Credential JSON<textarea name="credential_json" rows="9" maxlength="65536" spellcheck="false"></textarea></label>`)+
-		`</div>`)
+	return nil
 }
 
-func methodCard(method, title, description, hidden, fields string) string {
-	return `<form class="method" method="post" action="/v0/resource/plugins/kiro/submit"><h2>` + html.EscapeString(title) + `</h2><p>` + html.EscapeString(description) + `</p>` + hidden + `<input type="hidden" name="method" value="` + html.EscapeString(method) + `">` + fields + `<button type="submit">Continue</button></form>`
-}
-
-func deviceLoginPage(loginURL, userCode string) string {
-	link := html.EscapeString(loginURL)
-	code := ""
-	if userCode != "" {
-		code = `<p>Code: <strong>` + html.EscapeString(userCode) + `</strong></p>`
+func connectAPIJSON(status int, value any) ([]byte, error) {
+	body, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
 	}
-	return connectDocument("Authorize Kiro", `<h1>Authorize Kiro</h1>`+code+`<p><a class="button" href="`+link+`" target="_blank" rel="noopener noreferrer">Open AWS authorization</a></p><p class="lead">Keep CPA open while it waits for authorization.</p>`)
+	return okEnvelope(pluginapi.ManagementResponse{
+		StatusCode: status,
+		Headers: http.Header{
+			"Cache-Control":          []string{"no-store"},
+			"Content-Type":           []string{"application/json; charset=utf-8"},
+			"X-Content-Type-Options": []string{"nosniff"},
+		},
+		Body: body,
+	})
 }
 
-func connectMessagePage(title, message string) string {
-	return connectDocument(title, `<h1>`+html.EscapeString(title)+`</h1><p class="lead">`+html.EscapeString(message)+`</p>`)
-}
-
-func connectDocument(title, content string) string {
-	return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>` + html.EscapeString(title) + `</title><style>
-:root{color-scheme:dark;--bg:#17141b;--card:#211e25;--text:#f5f2f7;--muted:#aaa4af;--border:#46404b;--accent:#8667f2;--danger:#ffd8e2}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,sans-serif}main{max-width:980px;margin:auto;padding:32px 18px}h1{font-size:25px;margin:0 0 8px}.lead{color:var(--muted);margin:0 0 24px}.methods{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}.method{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px}.method h2{font-size:17px;margin:0 0 6px}.method p{color:var(--muted);min-height:40px}label{display:block;margin-top:12px;font-weight:600}input,select,textarea{display:block;width:100%;margin-top:5px;padding:10px;border:1px solid var(--border);border-radius:6px;background:#171419;color:var(--text);font:inherit}textarea{resize:vertical}button,.button{display:inline-block;margin-top:16px;padding:10px 15px;border:1px solid #a28cff;border-radius:6px;background:var(--accent);color:white;text-decoration:none;font-weight:700;cursor:pointer}.error{margin:15px 0;padding:11px;border:1px solid #8c465d;border-radius:6px;color:var(--danger);background:#34232b}@media(max-width:560px){main{padding:22px 12px}.methods{grid-template-columns:1fr}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
-</style></head><body><main>` + content + `</main></body></html>`
+func connectAPIError(status int, message string) ([]byte, error) {
+	return connectAPIJSON(status, map[string]string{"error": message})
 }
