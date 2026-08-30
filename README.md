@@ -53,9 +53,11 @@ plugins:
       priority: 1
 ```
 
-Restart CLIProxyAPI and open the Kiro login action in the Management Center. Choose an authentication method; the result is stored as a standard CPA Authentication File. API keys are deliberately not stored in `config.yaml`.
+Restart CLIProxyAPI and open the OAuth page in the Vietnamese Management Center fork. Expand the Kiro card and choose an authentication method inline; the result is stored as a standard CPA Authentication File. API keys are deliberately not stored in `config.yaml`.
 
-The login uses Kiro CLI's remote device flow, so it also works in containers and on hosts without a browser. Complete the displayed verification URL and code in a trusted browser. The plugin identifies itself as the pinned Kiro CLI version and reports the real operating system and architecture; it does not fabricate a machine identifier or depend on Windows `MachineGuid`.
+The standalone plugin does not serve a separate credential-entry page. Its `StartLogin` call creates a short-lived state, while the panel submits the selected Kiro method to the authenticated `POST /v0/management/plugins/kiro/connect` route. This keeps API keys, refresh tokens, and imported JSON inside CPA's authenticated Management API.
+
+Builder ID and IAM Identity Center use Kiro CLI's remote device flow, so they also work in containers and on hosts without a browser. The panel displays only the real AWS verification URL and device code inside the expanded Kiro card. The plugin identifies itself as the pinned Kiro CLI version and reports the real operating system and architecture; it does not fabricate a machine identifier or depend on Windows `MachineGuid`.
 
 The plugin stores credentials through the CLIProxyAPI authentication mechanism. Do not put passwords, management keys, access tokens, refresh tokens, or client secrets in the configuration or repository.
 

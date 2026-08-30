@@ -48,7 +48,19 @@ func TestManagementRegistrationAndIncorrectResourcePath(t *testing.T) {
 		t.Fatal(err)
 	}
 	found := false
+	for _, route := range registration.Routes {
+		if route.Path == "/plugins/kiro/connect" {
+			found = route.Method == http.MethodPost
+		}
+	}
+	if !found {
+		t.Fatalf("authenticated Kiro connect route was not registered: %+v", registration.Routes)
+	}
+	found = false
 	for _, resource := range registration.Resources {
+		if resource.Path == "/connect" {
+			t.Fatalf("standalone Kiro connect resource must not be registered: %+v", registration.Resources)
+		}
 		if resource.Menu == "Kiro Usage" {
 			found = resource.Path == usageResourcePath
 		}

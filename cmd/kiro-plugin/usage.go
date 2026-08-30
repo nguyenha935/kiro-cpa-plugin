@@ -233,6 +233,7 @@ func refreshKiroCredential(ctx context.Context, token *kiroauth.KiroTokenData) (
 	if refreshed.Region == "" {
 		refreshed.Region = token.Region
 	}
+	refreshed.AuthMethod = token.AuthMethod
 	refreshed.ProfileArn = ""
 	if err := reconcileProfile(ctx, refreshed); err != nil {
 		return nil, fmt.Errorf("discover Kiro profile after refresh: %w", err)
@@ -549,6 +550,9 @@ func mergeRefreshedToken(original []byte, refreshed *kiroauth.KiroTokenData) ([]
 func credentialNeedsRefresh(token *kiroauth.KiroTokenData, now time.Time) bool {
 	if token == nil || token.AccessToken == "" {
 		return true
+	}
+	if isAPIKeyCredential(token) {
+		return false
 	}
 	expiresAt, err := time.Parse(time.RFC3339, token.ExpiresAt)
 	return err != nil || !expiresAt.After(now.Add(10*time.Minute))
