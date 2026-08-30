@@ -296,11 +296,14 @@ func TestListAvailableProfilesPaginatesAndKeepsAccountsIsolated(t *testing.T) {
 		if r.Method != http.MethodPost {
 			t.Fatalf("profile request method = %s, want POST", r.Method)
 		}
-		if r.Header.Get("Content-Type") != "application/x-amz-json-1.0" {
+		if r.URL.Path != "/ListAvailableProfiles" {
+			t.Fatalf("profile request path = %q, want /ListAvailableProfiles", r.URL.Path)
+		}
+		if r.Header.Get("Content-Type") != "application/json" {
 			t.Fatalf("profile content type = %q", r.Header.Get("Content-Type"))
 		}
-		if r.Header.Get("X-Amz-Target") != "AmazonCodeWhispererService.ListAvailableProfiles" {
-			t.Fatalf("profile target = %q", r.Header.Get("X-Amz-Target"))
+		if r.Header.Get("X-Amz-Target") != "" {
+			t.Fatalf("profile request must not use JSON-RPC target: %q", r.Header.Get("X-Amz-Target"))
 		}
 		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		body, err := io.ReadAll(r.Body)
@@ -331,11 +334,12 @@ func TestListAvailableProfilesPaginatesAndKeepsAccountsIsolated(t *testing.T) {
 	}))
 	defer server.Close()
 
-	profilesA, err := listAvailableProfiles(context.Background(), server.Client(), server.URL, "account-a")
+	endpoint := server.URL + "/ListAvailableProfiles"
+	profilesA, err := listAvailableProfiles(context.Background(), server.Client(), endpoint, "account-a")
 	if err != nil {
 		t.Fatalf("list account A profiles: %v", err)
 	}
-	profilesB, err := listAvailableProfiles(context.Background(), server.Client(), server.URL, "account-b")
+	profilesB, err := listAvailableProfiles(context.Background(), server.Client(), endpoint, "account-b")
 	if err != nil {
 		t.Fatalf("list account B profiles: %v", err)
 	}
@@ -355,6 +359,14 @@ func TestListAvailableProfilesPaginatesAndKeepsAccountsIsolated(t *testing.T) {
 	}
 	if got := strings.Join(requests["account-b"], ","); got != "" {
 		t.Fatalf("account B pagination = %q", got)
+	}
+}
+
+func TestCodeWhispererProfilesEndpointUsesRESTOperationPath(t *testing.T) {
+	got := codeWhispererProfilesEndpoint("us-east-1")
+	want := "https://codewhisperer.us-east-1.amazonaws.com/ListAvailableProfiles"
+	if got != want {
+		t.Fatalf("profile endpoint = %q, want %q", got, want)
 	}
 }
 
