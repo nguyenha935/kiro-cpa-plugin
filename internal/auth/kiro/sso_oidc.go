@@ -16,7 +16,15 @@ import (
 
 const (
 	defaultIDCRegion = "us-east-1"
+	kiroClientName   = "kiro-oauth-client"
+	kiroIssuerURL    = "https://identitycenter.amazonaws.com/ssoins-722374e8c3c8e6c6"
 )
+
+var kiroScopes = []string{
+	"codewhisperer:completions",
+	"codewhisperer:analysis",
+	"codewhisperer:conversations",
+}
 
 var (
 	ErrAuthorizationPending = errors.New("authorization_pending")
@@ -58,6 +66,7 @@ type CreateTokenResponse struct {
 	TokenType    string `json:"tokenType"`
 	ExpiresIn    int    `json:"expiresIn"`
 	RefreshToken string `json:"refreshToken"`
+	ProfileArn   string `json:"profileArn"`
 }
 
 func getOIDCEndpoint(region string) string {
@@ -68,23 +77,22 @@ func getOIDCEndpoint(region string) string {
 }
 
 func (c *SSOOIDCClient) RegisterClientWithRegion(ctx context.Context, region string) (*RegisterClientResponse, error) {
-	payload := map[string]any{
-		"clientName": "Kiro CLI",
-		"clientType": "public",
-		"scopes": []string{
-			"codewhisperer:completions",
-			"codewhisperer:analysis",
-			"codewhisperer:conversations",
-			"codewhisperer:transformations",
-			"codewhisperer:taskassist",
-		},
-		"grantTypes": []string{"urn:ietf:params:oauth:grant-type:device_code", "refresh_token"},
-	}
+	payload := kiroClientRegistrationPayload()
 	var response RegisterClientResponse
 	if err := c.postJSON(ctx, getOIDCEndpoint(region)+"/client/register", payload, nil, &response); err != nil {
 		return nil, fmt.Errorf("register IDC client: %w", err)
 	}
 	return &response, nil
+}
+
+func kiroClientRegistrationPayload() map[string]any {
+	return map[string]any{
+		"clientName": kiroClientName,
+		"clientType": "public",
+		"scopes":     append([]string(nil), kiroScopes...),
+		"grantTypes": []string{"urn:ietf:params:oauth:grant-type:device_code", "refresh_token"},
+		"issuerUrl":  kiroIssuerURL,
+	}
 }
 
 func (c *SSOOIDCClient) StartDeviceAuthorizationWithIDC(ctx context.Context, clientID, clientSecret, startURL, region string) (*StartDeviceAuthResponse, error) {
@@ -125,7 +133,7 @@ func (c *SSOOIDCClient) RefreshTokenWithRegion(ctx context.Context, clientID, cl
 		response.RefreshToken = refreshToken
 	}
 	return &KiroTokenData{
-		AccessToken: response.AccessToken, RefreshToken: response.RefreshToken,
+		AccessToken: response.AccessToken, RefreshToken: response.RefreshToken, ProfileArn: response.ProfileArn,
 		ExpiresAt:  time.Now().Add(time.Duration(response.ExpiresIn) * time.Second).Format(time.RFC3339),
 		AuthMethod: "idc", Provider: "AWS", ClientID: clientID, ClientSecret: clientSecret,
 		StartURL: startURL, Region: region,

@@ -234,10 +234,10 @@ func refreshKiroCredential(ctx context.Context, token *kiroauth.KiroTokenData) (
 		refreshed.Region = token.Region
 	}
 	refreshed.AuthMethod = token.AuthMethod
-	refreshed.ProfileArn = ""
-	if err := reconcileProfile(ctx, refreshed); err != nil {
-		return nil, fmt.Errorf("discover Kiro profile after refresh: %w", err)
+	if strings.TrimSpace(refreshed.ProfileArn) == "" {
+		refreshed.ProfileArn = token.ProfileArn
 	}
+	reconcileProfileBestEffort(ctx, refreshed, "after refresh")
 	return refreshed, nil
 }
 

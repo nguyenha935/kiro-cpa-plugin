@@ -341,18 +341,25 @@ func buildKiroEndpointConfigs(region string) []kiroEndpointConfig {
 	}
 	return []kiroEndpointConfig{
 		{
-			// Primary: Q endpoint - works for all regions and auth types
+			// Amazon Q surface for API-key credentials.
 			URL:       fmt.Sprintf("https://q.%s.amazonaws.com/generateAssistantResponse", region),
 			Origin:    "AI_EDITOR",
 			AmzTarget: "", // Empty = don't set X-Amz-Target header
 			Name:      "AmazonQ",
 		},
 		{
-			// Fallback: CodeWhisperer endpoint (legacy, only works in us-east-1)
+			// CodeWhisperer surface for IDC and external IdP credentials.
 			URL:       fmt.Sprintf("https://codewhisperer.%s.amazonaws.com/generateAssistantResponse", region),
 			Origin:    "AI_EDITOR",
 			AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
 			Name:      "CodeWhisperer",
+		},
+		{
+			// Kiro desktop runtime for Builder ID credentials.
+			URL:       fmt.Sprintf("https://runtime.%s.kiro.dev/generateAssistantResponse", region),
+			Origin:    "AI_EDITOR",
+			AmzTarget: "",
+			Name:      "KiroRuntime",
 		},
 	}
 }
@@ -410,15 +417,17 @@ func getKiroEndpointConfigs(auth *cliproxyauth.Auth) []kiroEndpointConfig {
 	// Build endpoint configs for the specified region
 	endpointConfigs := buildKiroEndpointConfigs(region)
 
-	// For IDC auth, use Q endpoint with AI_EDITOR origin
-	// IDC tokens work with Q endpoint using Bearer auth
-	// The difference is only in how tokens are refreshed (OIDC with clientId/clientSecret for IDC)
-	// NOT in how API calls are made - both Social and IDC use the same endpoint/origin
+	// Order surfaces by credential type. A credential rejected by the wrong
+	// surface can otherwise look like an invalid account even though it is valid.
 	if auth.Metadata != nil {
 		authMethod, _ := auth.Metadata["auth_method"].(string)
-		if strings.ToLower(authMethod) == "idc" {
-			log.Debugf("kiro: IDC auth, using Q endpoint (region: %s)", region)
-			return endpointConfigs
+		switch strings.ToLower(strings.TrimSpace(authMethod)) {
+		case "builder-id", "social", "imported":
+			return orderKiroEndpoints(endpointConfigs, "KiroRuntime", "CodeWhisperer", "AmazonQ")
+		case "idc", "external_idp":
+			return orderKiroEndpoints(endpointConfigs, "CodeWhisperer", "AmazonQ", "KiroRuntime")
+		case "api_key":
+			return orderKiroEndpoints(endpointConfigs, "AmazonQ", "CodeWhisperer", "KiroRuntime")
 		}
 	}
 
@@ -472,6 +481,18 @@ func getKiroEndpointConfigs(auth *cliproxyauth.Auth) []kiroEndpointConfig {
 	return append(sorted, remaining...)
 }
 
+func orderKiroEndpoints(configs []kiroEndpointConfig, names ...string) []kiroEndpointConfig {
+	ordered := make([]kiroEndpointConfig, 0, len(configs))
+	for _, name := range names {
+		for _, cfg := range configs {
+			if strings.EqualFold(cfg.Name, name) {
+				ordered = append(ordered, cfg)
+			}
+		}
+	}
+	return ordered
+}
+
 // KiroExecutor handles requests to AWS CodeWhisperer (Kiro) API.
 type KiroExecutor struct {
 	cfg       *config.Config
@@ -485,9 +506,12 @@ func setKiroAuthorization(req *http.Request, auth *cliproxyauth.Auth, accessToke
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	if auth != nil && auth.Metadata != nil {
 		method, _ := auth.Metadata["auth_method"].(string)
-		if strings.EqualFold(strings.TrimSpace(method), "api_key") {
+		switch strings.ToLower(strings.TrimSpace(method)) {
+		case "api_key":
 			req.Header.Set("TokenType", "API_KEY")
-		} else {
+		case "external_idp":
+			req.Header.Set("TokenType", "EXTERNAL_IDP")
+		default:
 			req.Header.Del("TokenType")
 		}
 	}

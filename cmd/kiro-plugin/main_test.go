@@ -370,34 +370,50 @@ func TestCodeWhispererProfilesEndpointUsesRESTOperationPath(t *testing.T) {
 	}
 }
 
-func TestExpiredParsePreservesPersistedProfileUntilRefresh(t *testing.T) {
+func TestParsePreservesPersistedProfileWithoutRediscovery(t *testing.T) {
 	token := &kiroauth.KiroTokenData{
 		ProfileArn: "arn:validated-profile",
-		ExpiresAt:  time.Now().UTC().Add(-time.Hour).Format(time.RFC3339),
+		ExpiresAt:  time.Now().UTC().Add(time.Hour).Format(time.RFC3339),
 	}
+	called := false
 	discoveryError := func(context.Context, *kiroauth.KiroTokenData) error {
+		called = true
 		return io.EOF
 	}
 	if err := reconcileParsedProfile(context.Background(), token, discoveryError); err != nil {
-		t.Fatalf("expired parse returned an error: %v", err)
+		t.Fatalf("parse returned an error: %v", err)
 	}
 	if token.ProfileArn != "arn:validated-profile" {
-		t.Fatalf("expired parse profile = %q", token.ProfileArn)
+		t.Fatalf("parse profile = %q", token.ProfileArn)
+	}
+	if called {
+		t.Fatal("parse rediscovered a profile that was already persisted")
 	}
 }
 
-func TestCurrentParseRejectsUnvalidatedProfile(t *testing.T) {
+func TestParseDiscoversMissingProfile(t *testing.T) {
 	token := &kiroauth.KiroTokenData{
-		ProfileArn: "arn:stale-profile",
-		ExpiresAt:  time.Now().UTC().Add(time.Hour).Format(time.RFC3339),
+		ExpiresAt: time.Now().UTC().Add(time.Hour).Format(time.RFC3339),
 	}
-	discoveryError := func(context.Context, *kiroauth.KiroTokenData) error {
-		return io.EOF
+	discover := func(_ context.Context, token *kiroauth.KiroTokenData) error {
+		token.ProfileArn = "arn:discovered-profile"
+		return nil
 	}
-	if err := reconcileParsedProfile(context.Background(), token, discoveryError); err == nil {
-		t.Fatal("current parse accepted an unvalidated profile")
+	if err := reconcileParsedProfile(context.Background(), token, discover); err != nil {
+		t.Fatal(err)
+	}
+	if token.ProfileArn != "arn:discovered-profile" {
+		t.Fatalf("parse profile = %q", token.ProfileArn)
+	}
+}
+
+func TestParseKeepsCredentialWhenOptionalProfileDiscoveryFails(t *testing.T) {
+	token := &kiroauth.KiroTokenData{ExpiresAt: time.Now().UTC().Add(time.Hour).Format(time.RFC3339)}
+	discover := func(context.Context, *kiroauth.KiroTokenData) error { return io.EOF }
+	if err := reconcileParsedProfile(context.Background(), token, discover); err != nil {
+		t.Fatalf("optional profile discovery rejected credential: %v", err)
 	}
 	if token.ProfileArn != "" {
-		t.Fatalf("current parse kept unvalidated profile %q", token.ProfileArn)
+		t.Fatalf("failed discovery invented profile %q", token.ProfileArn)
 	}
 }

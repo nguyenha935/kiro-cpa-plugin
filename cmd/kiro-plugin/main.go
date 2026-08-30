@@ -313,10 +313,8 @@ func handleLoginPoll(raw []byte) ([]byte, error) {
 	delete(loginFlows, req.State)
 	loginFlowsMu.Unlock()
 	hash := sha256.Sum256([]byte(flow.ClientID))
-	token := &kiroauth.KiroTokenData{AccessToken: created.AccessToken, RefreshToken: created.RefreshToken, ExpiresAt: time.Now().UTC().Add(time.Duration(created.ExpiresIn) * time.Second).Format(time.RFC3339), AuthMethod: flow.AuthMethod, Provider: authProviderLabel(flow.AuthMethod), ClientID: flow.ClientID, ClientSecret: flow.ClientSecret, ClientIDHash: hex.EncodeToString(hash[:]), StartURL: flow.StartURL, Region: flow.Region}
-	if err := reconcileProfile(context.Background(), token); err != nil {
-		return nil, fmt.Errorf("discover Kiro profile after login: %w", err)
-	}
+	token := &kiroauth.KiroTokenData{AccessToken: created.AccessToken, RefreshToken: created.RefreshToken, ProfileArn: created.ProfileArn, ExpiresAt: time.Now().UTC().Add(time.Duration(created.ExpiresIn) * time.Second).Format(time.RFC3339), AuthMethod: flow.AuthMethod, Provider: authProviderLabel(flow.AuthMethod), ClientID: flow.ClientID, ClientSecret: flow.ClientSecret, ClientIDHash: hex.EncodeToString(hash[:]), StartURL: flow.StartURL, Region: flow.Region}
+	reconcileProfileBestEffort(context.Background(), token, "after login")
 	clearUsageCache()
 	return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusSuccess, Message: "Kiro device login completed", Auth: authData(token, "")})
 }
@@ -618,7 +616,7 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 			return nil, err
 		}
 		clearUsageCache()
-	} else if !isAPIKeyCredential(token) {
+	} else if !isAPIKeyCredential(token) && strings.TrimSpace(token.ProfileArn) == "" {
 		if err = reconcileProfile(ctx, token); err != nil {
 			if !isKiroAuthorizationError(err) {
 				return nil, err
@@ -798,15 +796,25 @@ func reconcileProfile(ctx context.Context, token *kiroauth.KiroTokenData) error 
 }
 
 func reconcileParsedProfile(ctx context.Context, token *kiroauth.KiroTokenData, discover func(context.Context, *kiroauth.KiroTokenData) error) error {
-	persistedProfileARN := token.ProfileArn
-	token.ProfileArn = ""
+	if token == nil {
+		return errors.New("Kiro token is missing")
+	}
+	if strings.TrimSpace(token.ProfileArn) != "" {
+		return nil
+	}
 	if err := discover(ctx, token); err != nil {
-		if parseTime(token.ExpiresAt).After(time.Now().UTC()) {
-			return err
-		}
-		token.ProfileArn = persistedProfileARN
+		log.Printf("kiro: profile discovery while parsing credential unavailable: %v; continuing without profile ARN", err)
 	}
 	return nil
+}
+
+func reconcileProfileBestEffort(ctx context.Context, token *kiroauth.KiroTokenData, phase string) {
+	if token == nil || strings.TrimSpace(token.ProfileArn) != "" {
+		return
+	}
+	if err := reconcileProfile(ctx, token); err != nil {
+		log.Printf("kiro: profile discovery %s unavailable: %v; continuing without profile ARN", phase, err)
+	}
 }
 
 func listAvailableProfiles(ctx context.Context, client *http.Client, endpoint, accessToken string) ([]availableProfile, error) {
@@ -840,7 +848,7 @@ func listAvailableProfiles(ctx context.Context, client *http.Client, endpoint, a
 			return nil, readErr
 		}
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("list Kiro profiles returned HTTP %d", resp.StatusCode)
+			return nil, profileDiscoveryHTTPError(resp, responseBody)
 		}
 		var result struct {
 			Profiles  []availableProfile `json:"profiles"`
@@ -868,6 +876,30 @@ func codeWhispererEndpoint(region string) string {
 
 func codeWhispererProfilesEndpoint(region string) string {
 	return codeWhispererEndpoint(region) + "/ListAvailableProfiles"
+}
+
+func profileDiscoveryHTTPError(resp *http.Response, body []byte) error {
+	var payload struct {
+		Code      string `json:"code"`
+		Type      string `json:"__type"`
+		Message   string `json:"message"`
+		MessageV1 string `json:"Message"`
+	}
+	_ = json.Unmarshal(body, &payload)
+	detail := firstNonEmpty(payload.Message, payload.MessageV1, payload.Code, payload.Type)
+	if len(detail) > 512 {
+		detail = detail[:512]
+	}
+	detail = strings.Join(strings.Fields(detail), " ")
+	requestID := firstNonEmpty(resp.Header.Get("x-amzn-requestid"), resp.Header.Get("x-amz-request-id"))
+	message := fmt.Sprintf("list Kiro profiles returned HTTP %d", resp.StatusCode)
+	if detail != "" {
+		message += ": " + detail
+	}
+	if requestID != "" {
+		message += " (request_id=" + requestID + ")"
+	}
+	return errors.New(message)
 }
 
 func buildCoreAuth(req pluginapi.ExecutorRequest) (*coreauth.Auth, error) {
