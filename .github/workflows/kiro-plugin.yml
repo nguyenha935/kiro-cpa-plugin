@@ -62,8 +62,9 @@ jobs:
           $env:GOOS = 'windows'
           $env:GOARCH = 'amd64'
           $env:CGO_ENABLED = '1'
+          $version = if ($env:GITHUB_REF -like 'refs/tags/v*') { $env:GITHUB_REF_NAME.TrimStart('v') } else { "dev-$($env:GITHUB_SHA.Substring(0,7))" }
           go build -trimpath -buildmode=c-shared `
-            -ldflags "-X github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro.clientVersion=2.19.0" `
+            -ldflags "-X github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro.clientVersion=2.19.0 -X main.pluginVersion=$version" `
             -o package/kiro.dll ./cmd/kiro-plugin
           $hash = (Get-FileHash -Algorithm SHA256 package/kiro.dll).Hash.ToLowerInvariant()
           "$hash  kiro.dll" | Set-Content -NoNewline -Encoding ascii package/kiro.dll.sha256
@@ -105,9 +106,12 @@ jobs:
           CC: ${{ matrix.cc }}
         run: |
           mkdir -p package
+          version="dev-${GITHUB_SHA::7}"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then version="${GITHUB_REF_NAME#v}"; fi
           go build -trimpath -buildmode=c-shared \
-            -ldflags "-X github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro.clientVersion=2.19.0" \
+            -ldflags "-X github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro.clientVersion=2.19.0 -X main.pluginVersion=$version" \
             -o package/kiro.so ./cmd/kiro-plugin
+          strings package/kiro.so | grep -Fq "$version"
           sha256sum package/kiro.so | sed 's#package/##' > package/kiro.so.sha256
           tar -C package -czf "kiro-linux-${GOARCH}.tar.gz" kiro.so kiro.h kiro.so.sha256
           sha256sum "kiro-linux-${GOARCH}.tar.gz" > "kiro-linux-${GOARCH}.tar.gz.sha256"

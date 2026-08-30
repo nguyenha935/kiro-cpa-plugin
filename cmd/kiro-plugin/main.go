@@ -73,9 +73,10 @@ import (
 const (
 	providerName      = "kiro"
 	pluginDisplayName = "Kiro"
-	pluginVersion     = "0.7.0-ha5"
 	maxPages          = 10
 )
+
+var pluginVersion = "dev"
 
 var (
 	hostAPI        *C.cliproxy_host_api
