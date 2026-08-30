@@ -1,9 +1,10 @@
 # Kiro plugin for CLIProxyAPI
 
-Native cross-platform plugin that connects CLIProxyAPI 7.2.143 to a Kiro subscription through AWS IAM Identity Center.
+Standalone native cross-platform plugin that connects CLIProxyAPI to Kiro accounts through the CPA plugin ABI.
 
 The plugin:
 
+- supports AWS Builder ID, IAM Identity Center, API-key credentials, refresh-token import, and CLIProxyAPI `external_idp` import;
 - discovers the Kiro profile with the access token of each account;
 - keeps Identity Center registrations isolated;
 - loads only the models available to the authenticated account;
@@ -23,7 +24,7 @@ The plugin:
 - Windows amd64, Linux amd64, or Linux arm64
 - Go 1.26
 - A C compiler available to CGO
-- A Kiro account connected through AWS IAM Identity Center
+- A Kiro account connected through one of the supported methods
 
 ## Build
 
@@ -50,14 +51,15 @@ plugins:
     kiro:
       enabled: true
       priority: 1
-      auth_method: idc
 ```
 
-Restart CLIProxyAPI and open the Kiro login action in the Management Center. Enter the AWS IAM Identity Center Start URL and region for that account. The form does not provide default values.
+Restart CLIProxyAPI and open the Kiro login action in the Management Center. Choose an authentication method; the result is stored as a standard CPA Authentication File. API keys are deliberately not stored in `config.yaml`.
 
 The login uses Kiro CLI's remote device flow, so it also works in containers and on hosts without a browser. Complete the displayed verification URL and code in a trusted browser. The plugin identifies itself as the pinned Kiro CLI version and reports the real operating system and architecture; it does not fabricate a machine identifier or depend on Windows `MachineGuid`.
 
-The plugin stores the resulting Identity Center session through the CLIProxyAPI authentication mechanism. Do not put passwords, management keys, access tokens, refresh tokens, or client secrets in the configuration or repository.
+The plugin stores credentials through the CLIProxyAPI authentication mechanism. Do not put passwords, management keys, access tokens, refresh tokens, or client secrets in the configuration or repository.
+
+Kiro's account-protection limiter is independent from CPA scheduler cooldown. CPA remains responsible for selecting credentials and round-robin failover; Kiro returns status-aware errors (429/403/401) so CPA can move to another account.
 
 ## Model capabilities
 
