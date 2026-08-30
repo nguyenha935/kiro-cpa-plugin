@@ -102,6 +102,34 @@ func TestProfileAndCatalogIntegration(t *testing.T) {
 	}
 }
 
+func TestBuilderIDCatalogAndUsageIntegration(t *testing.T) {
+	path := os.Getenv("KIRO_BUILDER_ID_INTEGRATION_TOKEN_PATH")
+	if path == "" {
+		t.Skip("KIRO_BUILDER_ID_INTEGRATION_TOKEN_PATH is not set")
+	}
+	token, err := kiroauth.LoadKiroTokenFromPath(path)
+	if err != nil {
+		t.Fatalf("load Builder ID integration token: %v", err)
+	}
+	if !isBuilderIDCredential(token) || strings.TrimSpace(token.ProfileArn) != "" {
+		t.Fatalf("integration credential is not profileless Builder ID")
+	}
+	models, err := listAvailableModels(t.Context(), token)
+	if err != nil {
+		t.Fatalf("list Builder ID models: %v", err)
+	}
+	if len(models) == 0 {
+		t.Fatal("Builder ID returned no models")
+	}
+	usage, err := requestUsageLimits(t.Context(), &http.Client{Timeout: 20 * time.Second}, token)
+	if err != nil {
+		t.Fatalf("load Builder ID usage: %v", err)
+	}
+	if strings.TrimSpace(usage.SubscriptionInfo.SubscriptionTitle) == "" || len(usage.UsageBreakdownList) == 0 {
+		t.Fatalf("Builder ID returned incomplete usage: %+v", usage)
+	}
+}
+
 func TestAuthDataPreservesIDCRefreshMaterial(t *testing.T) {
 	token := &kiroauth.KiroTokenData{
 		AccessToken:  "access",
@@ -253,6 +281,23 @@ func TestAPIKeyModelCatalogRequestUsesStaticCredentialContract(t *testing.T) {
 	}
 	if !nextRefreshAfter(token, time.Time{}).IsZero() {
 		t.Fatal("API-key credential received an OAuth refresh deadline")
+	}
+}
+
+func TestBuilderIDModelCatalogUsesProfilelessAmazonQContract(t *testing.T) {
+	token := &kiroauth.KiroTokenData{AccessToken: "builder-token", AuthMethod: "builder-id", Region: "us-east-1"}
+	req, err := newModelCatalogRequest(context.Background(), token, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.URL.Host != "q.us-east-1.amazonaws.com" || req.URL.Path != "/ListAvailableModels" {
+		t.Fatalf("Builder ID model request used %s", req.URL)
+	}
+	if req.URL.Query().Has("profileArn") {
+		t.Fatalf("Builder ID model request included profileArn: %v", req.URL.Query())
+	}
+	if req.Header.Get("TokenType") != "" {
+		t.Fatalf("Builder ID model request used TokenType %q", req.Header.Get("TokenType"))
 	}
 }
 

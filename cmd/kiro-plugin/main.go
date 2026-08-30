@@ -362,7 +362,7 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse Kiro credential: %w", err)
 	}
-	if !isAPIKeyCredential(token) {
+	if !isAPIKeyCredential(token) && !isBuilderIDCredential(token) {
 		if err = reconcileParsedProfile(context.Background(), token, reconcileProfile); err != nil {
 			return nil, fmt.Errorf("validate Kiro profile: %w", err)
 		}
@@ -616,7 +616,7 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 			return nil, err
 		}
 		clearUsageCache()
-	} else if !isAPIKeyCredential(token) && strings.TrimSpace(token.ProfileArn) == "" {
+	} else if !isAPIKeyCredential(token) && !isBuilderIDCredential(token) && strings.TrimSpace(token.ProfileArn) == "" {
 		if err = reconcileProfile(ctx, token); err != nil {
 			if !isKiroAuthorizationError(err) {
 				return nil, err
@@ -662,6 +662,10 @@ func isKiroAuthorizationError(err error) bool {
 	}
 	message := err.Error()
 	return strings.Contains(message, "HTTP 401") || strings.Contains(message, "HTTP 403")
+}
+
+func isBuilderIDCredential(token *kiroauth.KiroTokenData) bool {
+	return token != nil && strings.EqualFold(strings.TrimSpace(token.AuthMethod), "builder-id")
 }
 
 func normalizeModelID(id string) string {
@@ -729,7 +733,7 @@ func listAvailableModels(ctx context.Context, token *kiroauth.KiroTokenData) ([]
 func newModelCatalogRequest(ctx context.Context, token *kiroauth.KiroTokenData, nextToken string) (*http.Request, error) {
 	query := url.Values{"origin": {"AI_EDITOR"}}
 	endpoint := managementEndpoint(token.Region, "List-Available-Models")
-	if isAPIKeyCredential(token) {
+	if isAPIKeyCredential(token) || isBuilderIDCredential(token) {
 		endpoint = "https://q." + token.Region + ".amazonaws.com/ListAvailableModels"
 	} else if profileARN := strings.TrimSpace(token.ProfileArn); profileARN != "" {
 		query.Set("profileArn", profileARN)
