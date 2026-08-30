@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -477,6 +478,21 @@ type KiroExecutor struct {
 	refreshMu sync.Mutex // Serializes token refresh operations to prevent race conditions
 }
 
+func setKiroAuthorization(req *http.Request, auth *cliproxyauth.Auth, accessToken string) {
+	if req == nil {
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	if auth != nil && auth.Metadata != nil {
+		method, _ := auth.Metadata["auth_method"].(string)
+		if strings.EqualFold(strings.TrimSpace(method), "api_key") {
+			req.Header.Set("TokenType", "API_KEY")
+		} else {
+			req.Header.Del("TokenType")
+		}
+	}
+}
+
 // isIDCAuth checks if the auth uses IDC (Identity Center) authentication method.
 func isIDCAuth(auth *cliproxyauth.Auth) bool {
 	if auth == nil || auth.Metadata == nil {
@@ -598,7 +614,7 @@ func (e *KiroExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth
 
 	req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
 	req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
-	req.Header.Set("Authorization", "Bearer "+accessToken)
+	setKiroAuthorization(req, auth, accessToken)
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
@@ -641,7 +657,7 @@ func getTokenKey(auth *cliproxyauth.Auth) string {
 func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	accessToken, profileArn := kiroCredentials(auth)
 	if accessToken == "" {
-		return resp, fmt.Errorf("kiro: access token not found in auth")
+		return resp, statusErr{code: http.StatusUnauthorized, msg: "kiro: access token not found in auth"}
 	}
 
 	// Rate limiting: get token key for tracking
@@ -654,7 +670,10 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		remaining := cooldownMgr.GetRemainingCooldown(tokenKey)
 		reason := cooldownMgr.GetCooldownReason(tokenKey)
 		log.Warnf("kiro: token %s is in cooldown (reason: %s), remaining: %v", tokenKey, reason, remaining)
-		return resp, fmt.Errorf("kiro: token is in cooldown for %v (reason: %s)", remaining, reason)
+		return resp, statusErr{code: http.StatusTooManyRequests, msg: fmt.Sprintf("kiro: token is in cooldown for %v (reason: %s)", remaining, reason), retryAfter: &remaining}
+	}
+	if reason, remaining, unavailable := rateLimiter.TokenUnavailable(tokenKey); unavailable {
+		return resp, statusErr{code: http.StatusTooManyRequests, msg: fmt.Sprintf("kiro: token unavailable for %v (%s)", remaining, reason), retryAfter: &remaining}
 	}
 
 	// Wait for rate limiter before proceeding
@@ -749,7 +768,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 		for attempt := 0; attempt <= maxRetries; attempt++ {
 			httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(kiroPayload))
 			if err != nil {
-				return resp, err
+				return resp, upstreamTransportErr{cause: err}
 			}
 
 			httpReq.Header.Set("Content-Type", kiroContentType)
@@ -767,8 +786,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 			httpReq.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
 			httpReq.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
 
-			// Bearer token authentication for all auth types (Builder ID, IDC, social, etc.)
-			httpReq.Header.Set("Authorization", "Bearer "+accessToken)
+			setKiroAuthorization(httpReq, auth, accessToken)
 
 			var attrs map[string]string
 			if auth != nil {
@@ -1030,7 +1048,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 	if last429Err != nil {
 		return resp, last429Err
 	}
-	return resp, fmt.Errorf("kiro: all endpoints exhausted")
+	return resp, statusErr{code: http.StatusServiceUnavailable, msg: "kiro: all endpoints exhausted"}
 }
 
 // ExecuteStream handles streaming requests to Kiro API.
@@ -1038,7 +1056,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	accessToken, profileArn := kiroCredentials(auth)
 	if accessToken == "" {
-		return nil, fmt.Errorf("kiro: access token not found in auth")
+		return nil, statusErr{code: http.StatusUnauthorized, msg: "kiro: access token not found in auth"}
 	}
 
 	// Rate limiting: get token key for tracking
@@ -1051,7 +1069,10 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		remaining := cooldownMgr.GetRemainingCooldown(tokenKey)
 		reason := cooldownMgr.GetCooldownReason(tokenKey)
 		log.Warnf("kiro: token %s is in cooldown (reason: %s), remaining: %v", tokenKey, reason, remaining)
-		return nil, fmt.Errorf("kiro: token is in cooldown for %v (reason: %s)", remaining, reason)
+		return nil, statusErr{code: http.StatusTooManyRequests, msg: fmt.Sprintf("kiro: token is in cooldown for %v (reason: %s)", remaining, reason), retryAfter: &remaining}
+	}
+	if reason, remaining, unavailable := rateLimiter.TokenUnavailable(tokenKey); unavailable {
+		return nil, statusErr{code: http.StatusTooManyRequests, msg: fmt.Sprintf("kiro: token unavailable for %v (%s)", remaining, reason), retryAfter: &remaining}
 	}
 
 	// Wait for rate limiter before proceeding
@@ -1148,7 +1169,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 		for attempt := 0; attempt <= maxRetries; attempt++ {
 			httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(kiroPayload))
 			if err != nil {
-				return nil, err
+				return nil, upstreamTransportErr{cause: err}
 			}
 
 			httpReq.Header.Set("Content-Type", kiroContentType)
@@ -1167,7 +1188,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 			httpReq.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
 
 			// Bearer token authentication for all auth types (Builder ID, IDC, social, etc.)
-			httpReq.Header.Set("Authorization", "Bearer "+accessToken)
+			setKiroAuthorization(httpReq, auth, accessToken)
 
 			var attrs map[string]string
 			if auth != nil {
@@ -1422,7 +1443,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 	if last429Err != nil {
 		return nil, last429Err
 	}
-	return nil, fmt.Errorf("kiro: stream all endpoints exhausted")
+	return nil, statusErr{code: http.StatusServiceUnavailable, msg: "kiro: stream all endpoints exhausted"}
 }
 
 // kiroCredentials extracts access token and profile ARN from auth.
@@ -3168,11 +3189,56 @@ func (e *KiroExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
 
 	ssoClient := kiroauth.NewSSOOIDCClient(e.cfg)
 
-	if clientID == "" || clientSecret == "" || authMethod != "idc" || region == "" {
+	if authMethod == "external_idp" {
+		endpoint, _ := auth.Metadata["token_endpoint"].(string)
+		scopes, _ := auth.Metadata["scopes"].(string)
+		if endpoint == "" || clientID == "" || region == "" {
+			return nil, fmt.Errorf("kiro executor: external_idp refresh material is incomplete")
+		}
+		form := url.Values{"grant_type": {"refresh_token"}, "client_id": {clientID}, "refresh_token": {refreshToken}}
+		if scopes != "" {
+			form.Set("scope", scopes)
+		}
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
+		if reqErr != nil {
+			return nil, reqErr
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		response, doErr := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+		if doErr != nil {
+			return nil, fmt.Errorf("kiro executor: external_idp refresh failed: %w", doErr)
+		}
+		defer response.Body.Close()
+		body, readErr := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+		if readErr != nil {
+			return nil, readErr
+		}
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			return nil, statusErr{code: response.StatusCode, msg: "external_idp refresh rejected"}
+		}
+		var payload struct {
+			AccessToken  string `json:"access_token"`
+			RefreshToken string `json:"refresh_token"`
+			ExpiresIn    int    `json:"expires_in"`
+		}
+		if json.Unmarshal(body, &payload) != nil || payload.AccessToken == "" {
+			return nil, fmt.Errorf("kiro executor: external_idp refresh returned invalid token")
+		}
+		if payload.RefreshToken == "" {
+			payload.RefreshToken = refreshToken
+		}
+		expires := time.Now().UTC().Add(time.Duration(payload.ExpiresIn) * time.Second).Format(time.RFC3339)
+		if payload.ExpiresIn <= 0 {
+			expires = time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+		}
+		profileArn, _ := auth.Metadata["profile_arn"].(string)
+		tokenData = &kiroauth.KiroTokenData{AccessToken: payload.AccessToken, RefreshToken: payload.RefreshToken, ProfileArn: profileArn, ExpiresAt: expires, AuthMethod: "external_idp", Provider: "CLIProxyAPI", ClientID: clientID, Region: region, TokenEndpoint: endpoint, Scopes: scopes}
+	} else if clientID == "" || clientSecret == "" || authMethod != "idc" || region == "" {
 		return nil, fmt.Errorf("kiro executor: credential is not a complete IAM Identity Center registration")
+	} else {
+		log.Debugf("kiro executor: refreshing IAM Identity Center token (region=%s)", region)
+		tokenData, err = ssoClient.RefreshTokenWithRegion(ctx, clientID, clientSecret, refreshToken, region, startURL)
 	}
-	log.Debugf("kiro executor: refreshing IAM Identity Center token (region=%s)", region)
-	tokenData, err = ssoClient.RefreshTokenWithRegion(ctx, clientID, clientSecret, refreshToken, region, startURL)
 
 	if err != nil {
 		return nil, fmt.Errorf("kiro executor: token refresh failed: %w", err)

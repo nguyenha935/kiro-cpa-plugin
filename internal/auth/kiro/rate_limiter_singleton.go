@@ -10,6 +10,7 @@ import (
 var (
 	globalRateLimiter     *RateLimiter
 	globalRateLimiterOnce sync.Once
+	globalRateLimiterMu   sync.RWMutex
 
 	globalCooldownManager     *CooldownManager
 	globalCooldownManagerOnce sync.Once
@@ -19,10 +20,24 @@ var (
 // GetGlobalRateLimiter returns the singleton RateLimiter instance.
 func GetGlobalRateLimiter() *RateLimiter {
 	globalRateLimiterOnce.Do(func() {
+		globalRateLimiterMu.Lock()
+		defer globalRateLimiterMu.Unlock()
 		globalRateLimiter = NewRateLimiter()
 		log.Info("kiro: global RateLimiter initialized")
 	})
+	globalRateLimiterMu.RLock()
+	defer globalRateLimiterMu.RUnlock()
 	return globalRateLimiter
+}
+
+// ConfigureGlobalRateLimiter atomically replaces the process-wide limiter.
+// Existing credential state is deliberately discarded when plugin config changes.
+func ConfigureGlobalRateLimiter(cfg RateLimiterConfig) {
+	globalRateLimiterOnce.Do(func() {})
+	globalRateLimiterMu.Lock()
+	globalRateLimiter = NewRateLimiterWithConfig(cfg)
+	globalRateLimiterMu.Unlock()
+	log.Info("kiro: global RateLimiter configuration updated")
 }
 
 // GetGlobalCooldownManager returns the singleton CooldownManager instance.

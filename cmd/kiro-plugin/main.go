@@ -73,30 +73,31 @@ import (
 const (
 	providerName      = "kiro"
 	pluginDisplayName = "Kiro"
-	pluginVersion     = "0.6.0"
+	pluginVersion     = "0.7.0-ha1"
 	maxPages          = 10
 )
 
 var (
-	hostAPI       *C.cliproxy_host_api
-	pluginConfig  = &config.Config{AuthDir: "~/.cli-proxy-api"}
-	kiroExecutor  = kiroexecutor.NewKiroExecutor(pluginConfig)
-	configuredIDC = idcConfig{AuthMethod: "idc"}
-	loginFlows    = map[string]idcLoginFlow{}
-	loginFlowsMu  sync.Mutex
+	hostAPI        *C.cliproxy_host_api
+	pluginConfig   = &config.Config{AuthDir: "~/.cli-proxy-api"}
+	kiroExecutor   = kiroexecutor.NewKiroExecutor(pluginConfig)
+	pluginSettings = defaultPluginSettings()
+	loginFlows     = map[string]loginFlow{}
+	loginFlowsMu   sync.Mutex
 )
 
-type idcConfig struct {
-	AuthMethod string `yaml:"auth_method"`
-}
-
-type idcLoginFlow struct {
+type loginFlow struct {
 	ClientID     string
 	ClientSecret string
 	DeviceCode   string
+	AuthMethod   string
 	StartURL     string
 	Region       string
 	LoginURL     string
+	Completed    *kiroauth.KiroTokenData
+	Message      string
+	Attempts     int
+	Used         bool
 	ExpiresAt    time.Time
 }
 
@@ -204,7 +205,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		configurePlugin(request)
 		return okEnvelope(pluginRegistration())
 	case pluginabi.MethodModelStatic:
-		return okEnvelope(pluginapi.ModelResponse{Provider: providerName})
+		return okEnvelope(staticModels())
 	case pluginabi.MethodModelForAuth:
 		return handleModelsForAuth(request)
 	case pluginabi.MethodAuthIdentifier:
@@ -229,8 +230,8 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return okEnvelope(managementRegistrationResponse{
 			Routes: []pluginapi.ManagementRoute{{Method: http.MethodGet, Path: "/status"}},
 			Resources: []pluginapi.ResourceRoute{
-				{Path: "/login"},
-				{Path: "/begin"},
+				{Path: "/connect"},
+				{Path: "/submit"},
 				{Path: "/capabilities"},
 				{Path: usageResourcePath, Menu: "Kiro Usage", Description: "Shows Kiro subscription usage for connected accounts."},
 			},
@@ -248,14 +249,12 @@ func configurePlugin(raw []byte) {
 	if json.Unmarshal(raw, &req) != nil || len(req.ConfigYAML) == 0 {
 		return
 	}
-	var next idcConfig
+	next := defaultPluginSettings()
 	if yaml.Unmarshal(req.ConfigYAML, &next) != nil {
 		return
 	}
-	if next.AuthMethod == "" {
-		next.AuthMethod = "idc"
-	}
-	configuredIDC = next
+	pluginSettings = next.normalized()
+	kiroauth.ConfigureGlobalRateLimiter(pluginSettings.rateLimiterConfig())
 }
 
 func handleLoginStart(raw []byte) ([]byte, error) {
@@ -270,15 +269,11 @@ func handleLoginStart(raw []byte) ([]byte, error) {
 	state := hex.EncodeToString(stateBytes)
 	expiresAt := time.Now().UTC().Add(10 * time.Minute)
 	loginFlowsMu.Lock()
-	loginFlows[state] = idcLoginFlow{ExpiresAt: expiresAt}
+	cleanupLoginFlowsLocked(time.Now().UTC())
+	loginFlows[state] = loginFlow{ExpiresAt: expiresAt}
 	loginFlowsMu.Unlock()
-	base, err := url.Parse(req.BaseURL)
-	if err != nil {
-		return nil, fmt.Errorf("parse host login base URL: %w", err)
-	}
-	base.Path = "/v0/resource/plugins/kiro/login"
-	base.RawQuery = "state=" + url.QueryEscape(state)
-	return okEnvelope(pluginapi.AuthLoginStartResponse{Provider: providerName, URL: base.String(), State: state, ExpiresAt: expiresAt})
+	loginURL := "/v0/resource/plugins/kiro/connect?state=" + url.QueryEscape(state)
+	return okEnvelope(pluginapi.AuthLoginStartResponse{Provider: providerName, URL: loginURL, State: state, ExpiresAt: expiresAt})
 }
 
 func handleLoginPoll(raw []byte) ([]byte, error) {
@@ -288,18 +283,24 @@ func handleLoginPoll(raw []byte) ([]byte, error) {
 	}
 	loginFlowsMu.Lock()
 	flow, found := loginFlows[req.State]
-	loginFlowsMu.Unlock()
 	if !found {
+		loginFlowsMu.Unlock()
 		return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusError, Message: "Kiro login state was not found"})
 	}
 	if time.Now().UTC().After(flow.ExpiresAt) {
-		loginFlowsMu.Lock()
 		delete(loginFlows, req.State)
 		loginFlowsMu.Unlock()
 		return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusError, Message: "Kiro login expired"})
 	}
+	if flow.Completed != nil {
+		delete(loginFlows, req.State)
+		loginFlowsMu.Unlock()
+		clearUsageCache()
+		return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusSuccess, Message: defaultString(flow.Message, "Kiro credential connected"), Auth: authData(flow.Completed, "")})
+	}
+	loginFlowsMu.Unlock()
 	if flow.DeviceCode == "" {
-		return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending, Message: "Waiting for Identity Center Start URL and region"})
+		return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending, Message: "Waiting for a Kiro authentication method"})
 	}
 	created, err := kiroauth.NewSSOOIDCClient(pluginConfig).CreateTokenWithRegion(context.Background(), flow.ClientID, flow.ClientSecret, flow.DeviceCode, flow.Region)
 	if errors.Is(err, kiroauth.ErrAuthorizationPending) || errors.Is(err, kiroauth.ErrSlowDown) {
@@ -312,12 +313,12 @@ func handleLoginPoll(raw []byte) ([]byte, error) {
 	delete(loginFlows, req.State)
 	loginFlowsMu.Unlock()
 	hash := sha256.Sum256([]byte(flow.ClientID))
-	token := &kiroauth.KiroTokenData{AccessToken: created.AccessToken, RefreshToken: created.RefreshToken, ExpiresAt: time.Now().UTC().Add(time.Duration(created.ExpiresIn) * time.Second).Format(time.RFC3339), AuthMethod: "idc", Provider: "Enterprise", ClientID: flow.ClientID, ClientSecret: flow.ClientSecret, ClientIDHash: hex.EncodeToString(hash[:]), StartURL: flow.StartURL, Region: flow.Region}
+	token := &kiroauth.KiroTokenData{AccessToken: created.AccessToken, RefreshToken: created.RefreshToken, ExpiresAt: time.Now().UTC().Add(time.Duration(created.ExpiresIn) * time.Second).Format(time.RFC3339), AuthMethod: flow.AuthMethod, Provider: authProviderLabel(flow.AuthMethod), ClientID: flow.ClientID, ClientSecret: flow.ClientSecret, ClientIDHash: hex.EncodeToString(hash[:]), StartURL: flow.StartURL, Region: flow.Region}
 	if err := reconcileProfile(context.Background(), token); err != nil {
 		return nil, fmt.Errorf("discover Kiro profile after login: %w", err)
 	}
 	clearUsageCache()
-	return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusSuccess, Message: "Kiro IAM Identity Center login completed", Auth: authData(token, "")})
+	return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusSuccess, Message: "Kiro device login completed", Auth: authData(token, "")})
 }
 
 func pluginRegistration() registration {
@@ -326,17 +327,15 @@ func pluginRegistration() registration {
 		Metadata: pluginapi.Metadata{
 			Name:             pluginDisplayName,
 			Version:          pluginVersion,
-			Author:           "JPSAU501",
-			GitHubRepository: "https://github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin",
-			ConfigFields: []pluginapi.ConfigField{
-				{Name: "auth_method", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"idc"}, Description: "Kiro authentication method."},
-			},
+			Author:           "JPSAU501, nguyenha935",
+			GitHubRepository: "https://github.com/nguyenha935/CLIProxyAPI-Kiro-Plugin",
+			ConfigFields:     pluginConfigFields(),
 		},
 		Capabilities: registrationCapabilities{
 			ModelProvider:         true,
 			AuthProvider:          true,
 			Executor:              true,
-			ExecutorModelScope:    pluginapi.ExecutorModelScopeOAuth,
+			ExecutorModelScope:    pluginapi.ExecutorModelScopeBoth,
 			ExecutorInputFormats:  []string{"openai-response", "claude", "openai"},
 			ExecutorOutputFormats: []string{"openai-response", "claude", "openai"},
 			ManagementAPI:         true,
@@ -360,8 +359,7 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 	if strings.TrimSpace(req.Path) != "" {
 		token, err = kiroauth.LoadKiroTokenFromPath(req.Path)
 	} else {
-		token = &kiroauth.KiroTokenData{}
-		err = json.Unmarshal(req.RawJSON, token)
+		token, err = decodeKiroCredential(req.RawJSON)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("parse Kiro credential: %w", err)
@@ -372,14 +370,52 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 	return okEnvelope(pluginapi.AuthParseResponse{Handled: true, Auth: authData(token, req.FileName)})
 }
 
+// decodeKiroCredential accepts both the plugin's camelCase storage and the
+// snake_case external_idp/9router import shape without retaining unknown data.
+func decodeKiroCredential(raw []byte) (*kiroauth.KiroTokenData, error) {
+	var token kiroauth.KiroTokenData
+	if err := json.Unmarshal(raw, &token); err != nil {
+		return nil, err
+	}
+	var shape map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &shape); err != nil {
+		return nil, err
+	}
+	decode := func(key string, dst *string) {
+		if value, ok := shape[key]; ok {
+			_ = json.Unmarshal(value, dst)
+		}
+	}
+	decode("access_token", &token.AccessToken)
+	decode("refresh_token", &token.RefreshToken)
+	decode("profile_arn", &token.ProfileArn)
+	decode("expires_at", &token.ExpiresAt)
+	decode("auth_method", &token.AuthMethod)
+	decode("client_id", &token.ClientID)
+	decode("client_secret", &token.ClientSecret)
+	decode("client_id_hash", &token.ClientIDHash)
+	decode("start_url", &token.StartURL)
+	decode("token_endpoint", &token.TokenEndpoint)
+	decode("scopes", &token.Scopes)
+	decode("region", &token.Region)
+	decode("email", &token.Email)
+	if token.AuthMethod == "" && token.AccessToken != "" {
+		token.AuthMethod = "imported"
+	}
+	return &token, nil
+}
+
 func looksLikeKiroToken(raw []byte) bool {
 	var shape map[string]json.RawMessage
 	if json.Unmarshal(raw, &shape) != nil {
 		return false
 	}
 	_, access := shape["accessToken"]
-	_, method := shape["authMethod"]
-	return access && method
+	if access {
+		return true
+	}
+	_, access = shape["access_token"]
+	return access
 }
 
 func authData(token *kiroauth.KiroTokenData, fileName string) pluginapi.AuthData {
@@ -398,14 +434,21 @@ func authData(token *kiroauth.KiroTokenData, fileName string) pluginapi.AuthData
 		FileName:         filepath.Base(fileName),
 		Label:            label,
 		StorageJSON:      storage,
-		Metadata:         map[string]any{"type": providerName, "auth_method": token.AuthMethod, "expires_at": token.ExpiresAt},
-		Attributes:       map[string]string{"auth_method": token.AuthMethod, "region": token.Region, "start_url": token.StartURL},
+		Metadata:         authMetadata(token),
+		Attributes:       authAttributes(token),
 		NextRefreshAfter: refreshAt(expiresAt),
 	}
 }
 
 func kiroFileName(token *kiroauth.KiroTokenData) string {
-	id := sanitize(token.ClientIDHash)
+	method := strings.ToLower(strings.TrimSpace(token.AuthMethod))
+	if method == "" {
+		method = "imported"
+	}
+	id := sanitize(token.Email)
+	if id == "" {
+		id = sanitize(token.ClientIDHash)
+	}
 	if id == "" && token.ClientID != "" {
 		hash := sha256.Sum256([]byte(token.ClientID))
 		id = hex.EncodeToString(hash[:])
@@ -414,19 +457,69 @@ func kiroFileName(token *kiroauth.KiroTokenData) string {
 		id = id[:12]
 	}
 	if id == "" {
-		return "kiro-idc.json"
+		id = sanitize(token.ProfileArn)
 	}
-	return "kiro-idc-" + id + ".json"
+	if len(id) > 24 {
+		id = id[:24]
+	}
+	if id == "" {
+		id = "credential"
+	}
+	return "kiro-" + method + "-" + id + ".json"
 }
 
 func stableAuthID(token *kiroauth.KiroTokenData) string {
+	method := strings.ToLower(strings.TrimSpace(token.AuthMethod))
+	if method == "" {
+		method = "imported"
+	}
 	if token.Email != "" {
-		return "kiro-" + sanitize(token.Email)
+		return "kiro-" + method + "-" + sanitize(token.Email)
 	}
 	if token.ClientIDHash != "" {
-		return "kiro-idc-" + sanitize(token.ClientIDHash)
+		return "kiro-" + method + "-" + sanitize(token.ClientIDHash)
 	}
-	return "kiro-idc"
+	if token.ProfileArn != "" {
+		return "kiro-" + method + "-" + sanitize(token.ProfileArn)
+	}
+	return "kiro-" + method
+}
+
+func authMetadata(token *kiroauth.KiroTokenData) map[string]any {
+	metadata := map[string]any{"type": providerName, "auth_method": token.AuthMethod, "expires_at": token.ExpiresAt, "region": token.Region}
+	if token.AccessToken != "" {
+		metadata["access_token"] = token.AccessToken
+	}
+	if token.RefreshToken != "" {
+		metadata["refresh_token"] = token.RefreshToken
+	}
+	if token.ClientID != "" {
+		metadata["client_id"] = token.ClientID
+	}
+	if token.ClientSecret != "" {
+		metadata["client_secret"] = token.ClientSecret
+	}
+	if token.ProfileArn != "" {
+		metadata["profile_arn"] = token.ProfileArn
+	}
+	if token.TokenEndpoint != "" {
+		metadata["token_endpoint"] = token.TokenEndpoint
+	}
+	if token.Scopes != "" {
+		metadata["scopes"] = token.Scopes
+	}
+	return metadata
+}
+
+func authAttributes(token *kiroauth.KiroTokenData) map[string]string {
+	attrs := map[string]string{"auth_method": token.AuthMethod, "region": token.Region, "start_url": token.StartURL}
+	if token.ProfileArn != "" {
+		attrs["profile_arn"] = token.ProfileArn
+	}
+	if token.Email != "" {
+		attrs["email"] = token.Email
+	}
+	return attrs
 }
 
 func sanitize(value string) string {
@@ -743,7 +836,13 @@ func buildCoreAuth(req pluginapi.ExecutorRequest) (*coreauth.Auth, error) {
 		"expires_at": token.ExpiresAt, "auth_method": token.AuthMethod, "client_id": token.ClientID,
 		"client_secret": token.ClientSecret, "region": token.Region, "start_url": token.StartURL,
 	}
-	return &coreauth.Auth{ID: req.AuthID, Provider: providerName, Label: "Kiro", Metadata: metadata, Attributes: map[string]string{"profile_arn": token.ProfileArn}}, nil
+	if token.TokenEndpoint != "" {
+		metadata["token_endpoint"] = token.TokenEndpoint
+	}
+	if token.Scopes != "" {
+		metadata["scopes"] = token.Scopes
+	}
+	return &coreauth.Auth{ID: req.AuthID, Provider: providerName, Label: "Kiro", Metadata: metadata, Attributes: authAttributes(token)}, nil
 }
 
 func coreRequest(req pluginapi.ExecutorRequest) coreexec.Request {
@@ -848,12 +947,12 @@ func handleManagement(raw []byte) ([]byte, error) {
 	}
 	switch req.Path {
 	case "/v0/management/plugins/kiro/status":
-		body, _ := json.Marshal(map[string]any{"provider": providerName, "version": pluginVersion, "auth": "AWS IAM Identity Center", "model_catalog": "dynamic"})
+		body, _ := json.Marshal(map[string]any{"provider": providerName, "version": pluginVersion, "auth": "multi-method", "model_catalog": "dynamic"})
 		return okEnvelope(pluginapi.ManagementResponse{StatusCode: http.StatusOK, Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: body})
-	case "/v0/resource/plugins/kiro/login":
-		return handleLoginForm(req)
-	case "/v0/resource/plugins/kiro/begin":
-		return handleLoginBegin(req)
+	case "/v0/resource/plugins/kiro/connect":
+		return handleConnectPage(req)
+	case "/v0/resource/plugins/kiro/submit":
+		return handleConnectSubmit(req)
 	case "/v0/resource/plugins/kiro/capabilities":
 		capabilities := modelcapabilities.Snapshot()
 		sort.Slice(capabilities, func(i, j int) bool { return capabilities[i].ModelID < capabilities[j].ModelID })
@@ -872,54 +971,6 @@ func handleManagement(raw []byte) ([]byte, error) {
 		return handleUsagePage(req)
 	}
 	return okEnvelope(pluginapi.ManagementResponse{StatusCode: http.StatusNotFound, Headers: http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}}, Body: []byte("Not found")})
-}
-
-func handleLoginForm(req pluginapi.ManagementRequest) ([]byte, error) {
-	state := strings.TrimSpace(req.Query.Get("state"))
-	loginFlowsMu.Lock()
-	_, found := loginFlows[state]
-	loginFlowsMu.Unlock()
-	if !found {
-		return managementHTML(http.StatusBadRequest, loginMessagePage("Sign-in expired", "Start a new Kiro sign-in from the Management Center."))
-	}
-	return managementHTML(http.StatusOK, loginFormPage(state, ""))
-}
-
-func handleLoginBegin(req pluginapi.ManagementRequest) ([]byte, error) {
-	state := strings.TrimSpace(req.Query.Get("state"))
-	startURL := strings.TrimSpace(req.Query.Get("start_url"))
-	region := strings.TrimSpace(req.Query.Get("region"))
-	if err := validateIDCInput(startURL, region); err != nil {
-		return managementHTML(http.StatusBadRequest, loginFormPage(state, err.Error()))
-	}
-	loginFlowsMu.Lock()
-	flow, found := loginFlows[state]
-	loginFlowsMu.Unlock()
-	if !found || time.Now().UTC().After(flow.ExpiresAt) {
-		return managementHTML(http.StatusBadRequest, loginMessagePage("Sign-in expired", "Start a new Kiro sign-in from the Management Center."))
-	}
-	if flow.LoginURL == "" {
-		client := kiroauth.NewSSOOIDCClient(pluginConfig)
-		registration, err := client.RegisterClientWithRegion(context.Background(), region)
-		if err != nil {
-			return nil, fmt.Errorf("register Kiro IDC client: %w", err)
-		}
-		device, err := client.StartDeviceAuthorizationWithIDC(context.Background(), registration.ClientID, registration.ClientSecret, startURL, region)
-		if err != nil {
-			return nil, fmt.Errorf("start Kiro IDC login: %w", err)
-		}
-		flow.ClientID, flow.ClientSecret, flow.DeviceCode = registration.ClientID, registration.ClientSecret, device.DeviceCode
-		flow.StartURL, flow.Region = startURL, region
-		flow.ExpiresAt = time.Now().UTC().Add(time.Duration(device.ExpiresIn) * time.Second)
-		flow.LoginURL = device.VerificationURIComplete
-		if flow.LoginURL == "" {
-			flow.LoginURL = device.VerificationURI
-		}
-		loginFlowsMu.Lock()
-		loginFlows[state] = flow
-		loginFlowsMu.Unlock()
-	}
-	return okEnvelope(pluginapi.ManagementResponse{StatusCode: http.StatusFound, Headers: http.Header{"Location": []string{flow.LoginURL}}, Body: []byte{}})
 }
 
 func validateIDCInput(startURL, region string) error {
@@ -944,27 +995,14 @@ func validateRegion(region string) error {
 	return nil
 }
 
+// loginFormPage is retained as a compatibility helper for older plugin tests
+// and callers; the user-facing flow is now the multi-method connect page.
 func loginFormPage(state, errorMessage string) string {
-	errorBlock := ""
-	if errorMessage != "" {
-		errorBlock = `<div class="error" id="form-error" role="alert">` + html.EscapeString(errorMessage) + `</div>`
-	}
-	describedBy := ""
-	if errorMessage != "" {
-		describedBy = ` aria-describedby="form-error"`
-	}
-	return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in with AWS IAM Identity Center</title><style>
-:root{color-scheme:dark;--page:#19161d;--surface:#211e25;--text:#f3f0f5;--muted:#aaa4af;--border:#4a444f;--focus:#9a7dff;--button:#7f5af0;--button-hover:#906ff5;--danger-bg:#34232b;--danger-border:#8c465d;--danger-text:#ffd7e2}
-*{box-sizing:border-box}body{margin:0;min-height:100vh;background:var(--page);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.45}main{min-height:100vh;display:grid;place-items:center;padding:32px 20px}.card{width:100%;max-width:440px;padding:32px;background:var(--surface);border:1px solid #38333d;border-radius:12px;box-shadow:0 18px 50px rgba(0,0,0,.24)}h1{margin:0 0 28px;font-size:22px;line-height:1.25;font-weight:600;letter-spacing:-.01em}.field{margin-top:22px}.field:first-of-type{margin-top:0}label{display:block;font-weight:600;font-size:14px}.help{margin:4px 0 9px;color:var(--muted);font-size:13px}input{display:block;width:100%;height:42px;padding:0 12px;border:1px solid var(--border);border-radius:6px;background:#171419;color:var(--text);font:inherit;outline:none;transition:border-color .15s,box-shadow .15s,background .15s}input::placeholder{color:#77717c}input:hover{background:#1b181e;border-color:#625b68}input:focus-visible{border-color:var(--focus);box-shadow:0 0 0 3px rgba(154,125,255,.22)}button{width:100%;height:42px;margin-top:26px;border:1px solid #9c85ef;border-radius:6px;background:var(--button);color:#fff;font:600 14px/1 inherit;cursor:pointer;transition:background .15s,border-color .15s,transform .05s}button:hover{background:var(--button-hover);border-color:#ad99f4}button:active{transform:translateY(1px)}button:focus-visible{outline:3px solid rgba(154,125,255,.38);outline-offset:2px}.error{margin:0 0 22px;padding:11px 12px;border:1px solid var(--danger-border);border-radius:6px;background:var(--danger-bg);color:var(--danger-text);font-size:13px}@media(max-width:520px){main{padding:20px 14px}.card{padding:25px 20px}}@media(prefers-reduced-motion:reduce){input,button{transition:none}}
-</style></head><body><main><section class="card" aria-labelledby="page-title"><h1 id="page-title">Sign in with AWS IAM Identity Center</h1>` + errorBlock + `<form method="get" action="/v0/resource/plugins/kiro/begin"` + describedBy + `><input type="hidden" name="state" value="` + html.EscapeString(state) + `"><div class="field"><label for="start_url">AWS IAM Identity Center Start URL</label><p class="help" id="start-url-help">Provided by an admin or help desk.</p><input id="start_url" name="start_url" type="url" inputmode="url" autocomplete="url" required aria-describedby="start-url-help" placeholder="your_subdomain.awsapps.com/start"></div><div class="field"><label for="region">Region</label><p class="help" id="region-help">AWS Region that hosts your Identity Center instance.</p><input id="region" name="region" type="text" inputmode="text" autocomplete="off" required aria-describedby="region-help" pattern="[a-z]{2}(-gov)?-[a-z]+-[0-9]" placeholder="e.g., us-east-1"></div><button type="submit">Continue</button></form></section></main></body></html>`
-}
-
-func loginMessagePage(title, message string) string {
-	return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>` + html.EscapeString(title) + `</title></head><body><main><h1>` + html.EscapeString(title) + `</h1><p>` + html.EscapeString(message) + `</p></main></body></html>`
-}
-
-func managementHTML(status int, page string) ([]byte, error) {
-	return okEnvelope(pluginapi.ManagementResponse{StatusCode: status, Headers: http.Header{"Content-Type": []string{"text/html; charset=utf-8"}, "Cache-Control": []string{"no-store"}}, Body: []byte(page)})
+	return `<!doctype html><html lang="en"><body><form>` +
+		`<input type="hidden" name="state" value="` + html.EscapeString(state) + `">` +
+		`<input name="start_url" type="url" placeholder="your_subdomain.awsapps.com/start">` +
+		`<input name="region" type="text" placeholder="e.g., us-east-1">` +
+		`<button type="submit">Continue</button></form></body></html>`
 }
 
 func hostCall(method string, request []byte) ([]byte, error) {
@@ -1035,7 +1073,8 @@ func errorEnvelopeFromError(err error) []byte {
 		return errorEnvelope("plugin_error", "plugin call failed")
 	}
 	status := 0
-	if statusError, ok := err.(interface{ StatusCode() int }); ok {
+	var statusError interface{ StatusCode() int }
+	if errors.As(err, &statusError) {
 		status = statusError.StatusCode()
 	}
 	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{

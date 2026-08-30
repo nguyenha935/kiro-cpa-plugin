@@ -260,6 +260,27 @@ func (rl *RateLimiter) IsTokenAvailable(tokenKey string) bool {
 	return true
 }
 
+// TokenUnavailable reports why a credential is unavailable and when it can be
+// tried again. Callers use this instead of sleeping so CPA can fail over to a
+// different Kiro credential immediately.
+func (rl *RateLimiter) TokenUnavailable(tokenKey string) (string, time.Duration, bool) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	state := rl.getOrCreateState(tokenKey)
+	rl.resetDailyIfNeeded(state)
+	now := time.Now()
+	if state.IsSuspended && now.Before(state.SuspendedAt.Add(rl.suspendCooldown)) {
+		return state.SuspendReason, time.Until(state.SuspendedAt.Add(rl.suspendCooldown)), true
+	}
+	if now.Before(state.CooldownEnd) {
+		return "temporary backoff", time.Until(state.CooldownEnd), true
+	}
+	if state.DailyRequests >= rl.dailyMaxRequests {
+		return "daily request limit reached", time.Until(state.DailyResetTime), true
+	}
+	return "", 0, false
+}
+
 // calculateBackoff 计算指数退避时间
 func (rl *RateLimiter) calculateBackoff(failCount int) time.Duration {
 	if failCount <= 0 {

@@ -49,6 +49,10 @@ type KiroTokenData struct {
 	StartURL string `json:"startUrl,omitempty"`
 	// Region is the AWS region for IDC authentication (only for IDC auth method)
 	Region string `json:"region,omitempty"`
+	// TokenEndpoint is used to refresh imported external identity-provider tokens.
+	TokenEndpoint string `json:"token_endpoint,omitempty"`
+	// Scopes contains the space-delimited scopes used by an external identity provider.
+	Scopes string `json:"scopes,omitempty"`
 }
 
 // KiroAuthBundle aggregates authentication data after OAuth flow completion

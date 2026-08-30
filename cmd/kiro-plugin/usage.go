@@ -201,6 +201,12 @@ func credentialUsageLock(token *kiroauth.KiroTokenData, fallback string) *sync.M
 }
 
 func refreshKiroCredential(ctx context.Context, token *kiroauth.KiroTokenData) (*kiroauth.KiroTokenData, error) {
+	if token != nil && strings.EqualFold(token.AuthMethod, "api_key") {
+		return token, nil
+	}
+	if token != nil && strings.EqualFold(token.AuthMethod, "external_idp") {
+		return refreshExternalIDP(ctx, token)
+	}
 	if token == nil || token.RefreshToken == "" || token.ClientID == "" || token.ClientSecret == "" {
 		return nil, errors.New("Kiro IDC refresh material is incomplete")
 	}
@@ -232,6 +238,52 @@ func refreshKiroCredential(ctx context.Context, token *kiroauth.KiroTokenData) (
 		return nil, fmt.Errorf("discover Kiro profile after refresh: %w", err)
 	}
 	return refreshed, nil
+}
+
+func refreshExternalIDP(ctx context.Context, token *kiroauth.KiroTokenData) (*kiroauth.KiroTokenData, error) {
+	if token == nil || token.RefreshToken == "" || token.ClientID == "" || token.TokenEndpoint == "" {
+		return nil, errors.New("Kiro external_idp refresh material is incomplete")
+	}
+	form := url.Values{"grant_type": {"refresh_token"}, "client_id": {token.ClientID}, "refresh_token": {token.RefreshToken}}
+	if token.Scopes != "" {
+		form.Set("scope", token.Scopes)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, token.TokenEndpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("external_idp refresh returned HTTP %d", resp.StatusCode)
+	}
+	var payload struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int    `json:"expires_in"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil || payload.AccessToken == "" {
+		return nil, errors.New("external_idp refresh returned invalid token")
+	}
+	if payload.RefreshToken == "" {
+		payload.RefreshToken = token.RefreshToken
+	}
+	expiresIn := payload.ExpiresIn
+	if expiresIn <= 0 {
+		expiresIn = 3600
+	}
+	copy := *token
+	copy.AccessToken, copy.RefreshToken = payload.AccessToken, payload.RefreshToken
+	copy.ExpiresAt = time.Now().UTC().Add(time.Duration(expiresIn) * time.Second).Format(time.RFC3339)
+	return &copy, nil
 }
 
 func handleUsagePage(req pluginapi.ManagementRequest) ([]byte, error) {
@@ -503,8 +555,11 @@ func credentialNeedsRefresh(token *kiroauth.KiroTokenData, now time.Time) bool {
 }
 
 func requestUsageLimits(ctx context.Context, client httpDoer, token *kiroauth.KiroTokenData) (*usageLimitsResponse, error) {
-	if token == nil || token.AccessToken == "" || token.ProfileArn == "" {
+	if token == nil || token.AccessToken == "" {
 		return nil, errors.New("Kiro credential is incomplete")
+	}
+	if strings.EqualFold(token.AuthMethod, "api_key") || strings.EqualFold(token.AuthMethod, "external_idp") && token.ProfileArn == "" {
+		return nil, errors.New("usage is not available for this Kiro credential type")
 	}
 	if err := validateRegion(token.Region); err != nil {
 		return nil, err
