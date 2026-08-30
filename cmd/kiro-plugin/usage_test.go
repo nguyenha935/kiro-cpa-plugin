@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	kiroauth "github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/auth/kiro"
+	kiroauth "github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )

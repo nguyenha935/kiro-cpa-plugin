@@ -58,9 +58,9 @@ import (
 	"time"
 	"unsafe"
 
-	kiroauth "github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/auth/kiro"
-	"github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/modelcapabilities"
-	kiroexecutor "github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/runtime/executor"
+	kiroauth "github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro"
+	"github.com/nguyenha935/kiro-cpa-plugin/internal/modelcapabilities"
+	kiroexecutor "github.com/nguyenha935/kiro-cpa-plugin/internal/runtime/executor"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreexec "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -73,7 +73,7 @@ import (
 const (
 	providerName      = "kiro"
 	pluginDisplayName = "Kiro"
-	pluginVersion     = "0.7.0-ha1"
+	pluginVersion     = "0.7.0-ha2"
 	maxPages          = 10
 )
 

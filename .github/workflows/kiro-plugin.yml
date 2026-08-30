@@ -63,7 +63,7 @@ jobs:
           $env:GOARCH = 'amd64'
           $env:CGO_ENABLED = '1'
           go build -trimpath -buildmode=c-shared `
-            -ldflags "-X github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/auth/kiro.clientVersion=2.19.0" `
+            -ldflags "-X github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro.clientVersion=2.19.0" `
             -o package/kiro.dll ./cmd/kiro-plugin
           $hash = (Get-FileHash -Algorithm SHA256 package/kiro.dll).Hash.ToLowerInvariant()
           "$hash  kiro.dll" | Set-Content -NoNewline -Encoding ascii package/kiro.dll.sha256
@@ -106,7 +106,7 @@ jobs:
         run: |
           mkdir -p package
           go build -trimpath -buildmode=c-shared \
-            -ldflags "-X github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/auth/kiro.clientVersion=2.19.0" \
+            -ldflags "-X github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro.clientVersion=2.19.0" \
             -o package/kiro.so ./cmd/kiro-plugin
           sha256sum package/kiro.so | sed 's#package/##' > package/kiro.so.sha256
           tar -C package -czf "kiro-linux-${GOARCH}.tar.gz" kiro.so kiro.h kiro.so.sha256

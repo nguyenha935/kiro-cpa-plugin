@@ -7,8 +7,8 @@ import (
 	"encoding/json"
 	"strings"
 
-	"github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/modelcapabilities"
-	kirocommon "github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/translator/kiro/common"
+	"github.com/nguyenha935/kiro-cpa-plugin/internal/modelcapabilities"
+	kirocommon "github.com/nguyenha935/kiro-cpa-plugin/internal/translator/kiro/common"
 	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
