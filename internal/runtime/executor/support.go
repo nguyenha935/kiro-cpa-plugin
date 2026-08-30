@@ -21,6 +21,8 @@ type statusErr struct {
 
 type requestValidationErr struct{ msg string }
 
+type upstreamTransportErr struct{ cause error }
+
 func (e requestValidationErr) Error() string         { return e.msg }
 func (e requestValidationErr) IsRequestScoped() bool { return true }
 func (e requestValidationErr) StatusCode() int       { return http.StatusBadRequest }
@@ -28,6 +30,11 @@ func (e requestValidationErr) StatusCode() int       { return http.StatusBadRequ
 func (e statusErr) Error() string              { return e.msg }
 func (e statusErr) StatusCode() int            { return e.code }
 func (e statusErr) RetryAfter() *time.Duration { return e.retryAfter }
+func (e upstreamTransportErr) Error() string {
+	return "Kiro upstream connection failed: " + e.cause.Error()
+}
+func (e upstreamTransportErr) Unwrap() error   { return e.cause }
+func (e upstreamTransportErr) StatusCode() int { return http.StatusBadGateway }
 
 type upstreamRequestLog struct {
 	URL, Method, Provider, AuthID, AuthLabel, AuthType, AuthValue string
