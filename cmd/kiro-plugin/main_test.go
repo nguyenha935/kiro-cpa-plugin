@@ -257,6 +257,37 @@ func TestAuthDataPreservesIDCRefreshMaterial(t *testing.T) {
 	}
 }
 
+func TestAuthDataExposesStableNonSecretBuilderIdentity(t *testing.T) {
+	token := &kiroauth.KiroTokenData{
+		AccessToken:  "opaque-access-token",
+		AuthMethod:   "builder-id",
+		ClientIDHash: "1afac73cd16484acdee830d3634573e72cf41166",
+		Region:       "us-east-1",
+	}
+
+	data := authData(token, "kiro-builder.json")
+	want := "kiro-builder-id-1afac73cd164"
+	if data.Metadata["email"] != want || data.Attributes["email"] != want {
+		t.Fatalf("CPA identity = metadata:%v attributes:%q, want %q", data.Metadata["email"], data.Attributes["email"], want)
+	}
+	if strings.Contains(want, token.AccessToken) {
+		t.Fatal("credential identity leaked the access token")
+	}
+}
+
+func TestAPIKeyDisplayIdentityDoesNotCollapseOrLeakSecrets(t *testing.T) {
+	one := &kiroauth.KiroTokenData{AccessToken: "first-key", AuthMethod: "api_key", Region: "us-east-1"}
+	two := &kiroauth.KiroTokenData{AccessToken: "second-key", AuthMethod: "api_key", Region: "us-east-1"}
+	oneIdentity := credentialIdentity(one)
+	twoIdentity := credentialIdentity(two)
+	if oneIdentity == twoIdentity {
+		t.Fatalf("API-key display identities collided: %q", oneIdentity)
+	}
+	if strings.Contains(oneIdentity, one.AccessToken) || strings.Contains(twoIdentity, two.AccessToken) {
+		t.Fatal("API-key display identity leaked a secret")
+	}
+}
+
 func TestAuthLabelUsesStartURLDomain(t *testing.T) {
 	token := &kiroauth.KiroTokenData{
 		AccessToken: "access",

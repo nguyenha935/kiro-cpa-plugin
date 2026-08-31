@@ -563,6 +563,9 @@ func stableAuthID(token *kiroauth.KiroTokenData) string {
 
 func authMetadata(token *kiroauth.KiroTokenData) map[string]any {
 	metadata := map[string]any{"type": providerName, "auth_method": token.AuthMethod, "expires_at": token.ExpiresAt, "region": token.Region}
+	if identity := credentialIdentity(token); identity != "" {
+		metadata["email"] = identity
+	}
 	if token.AccessToken != "" {
 		metadata["access_token"] = token.AccessToken
 	}
@@ -589,13 +592,52 @@ func authMetadata(token *kiroauth.KiroTokenData) map[string]any {
 
 func authAttributes(token *kiroauth.KiroTokenData) map[string]string {
 	attrs := map[string]string{"auth_method": token.AuthMethod, "region": token.Region, "start_url": token.StartURL}
+	if identity := credentialIdentity(token); identity != "" {
+		// CPA uses this non-secret account identifier to populate AccountInfo for
+		// OAuth credentials. Builder ID tokens are opaque and have no email claim,
+		// so use a stable method/hash label instead of leaving MKP with no identity.
+		attrs["email"] = identity
+	}
 	if token.ProfileArn != "" {
 		attrs["profile_arn"] = token.ProfileArn
 	}
-	if token.Email != "" {
-		attrs["email"] = token.Email
-	}
 	return attrs
+}
+
+// credentialIdentity returns a stable, non-secret display identity for CPA and
+// management plugins. Real email remains preferred; opaque Builder ID and
+// imported credentials fall back to a short client/profile fingerprint.
+func credentialIdentity(token *kiroauth.KiroTokenData) string {
+	if token == nil {
+		return ""
+	}
+	if email := strings.TrimSpace(token.Email); email != "" {
+		return email
+	}
+	method := strings.ToLower(strings.TrimSpace(token.AuthMethod))
+	if method == "" {
+		method = "imported"
+	}
+	fingerprint := strings.TrimSpace(token.ClientIDHash)
+	if fingerprint == "" && token.ClientID != "" {
+		hash := sha256.Sum256([]byte(token.ClientID))
+		fingerprint = hex.EncodeToString(hash[:])
+	}
+	if fingerprint == "" && token.ProfileArn != "" {
+		hash := sha256.Sum256([]byte(token.ProfileArn))
+		fingerprint = hex.EncodeToString(hash[:])
+	}
+	if fingerprint == "" && isAPIKeyCredential(token) && token.AccessToken != "" {
+		hash := sha256.Sum256([]byte(token.AccessToken))
+		fingerprint = hex.EncodeToString(hash[:])
+	}
+	if fingerprint != "" {
+		if len(fingerprint) > 12 {
+			fingerprint = fingerprint[:12]
+		}
+		return "kiro-" + method + "-" + fingerprint
+	}
+	return "kiro-" + method
 }
 
 func sanitize(value string) string {
