@@ -7,10 +7,10 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"encoding/hex"
 	"io"
 	"net"
 	"net/http"
@@ -2397,7 +2397,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 				errMsg = msg
 			}
 			log.Errorf("kiro: received AWS error in stream: type=%s, message=%s", errType, errMsg)
-				out <- cliproxyexecutor.StreamChunk{Err: streamStatusError(errType, errMsg)}
+			out <- cliproxyexecutor.StreamChunk{Err: streamStatusError(errType, errMsg)}
 			return false
 		}
 		if errType, hasErrType := event["type"].(string); hasErrType && (errType == "error" || errType == "exception") {

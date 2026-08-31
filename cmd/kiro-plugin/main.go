@@ -508,7 +508,7 @@ func authData(token *kiroauth.KiroTokenData, fileName string) pluginapi.AuthData
 		label += " - " + strings.ToLower(startURL.Hostname())
 	}
 	return pluginapi.AuthData{
-		Provider:         providerName,
+		Provider: providerName,
 		// CPA's file-auth loader uses the path relative to auth-dir (the filename
 		// here) as the canonical auth ID.  Keeping the extension is important:
 		// otherwise the host callback and auth-dir catalog create two records for
