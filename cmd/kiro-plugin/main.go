@@ -76,7 +76,7 @@ const (
 	maxPages          = 10
 )
 
-var pluginVersion = "dev"
+var pluginVersion = "0.8.0-ha13"
 
 var (
 	hostAPI        *C.cliproxy_host_api
@@ -333,8 +333,10 @@ func handleLoginPoll(raw []byte) ([]byte, error) {
 	loginFlowsMu.Unlock()
 	hash := sha256.Sum256([]byte(flow.ClientID))
 	token := &kiroauth.KiroTokenData{AccessToken: created.AccessToken, RefreshToken: created.RefreshToken, ProfileArn: created.ProfileArn, ExpiresAt: time.Now().UTC().Add(time.Duration(created.ExpiresIn) * time.Second).Format(time.RFC3339), AuthMethod: flow.AuthMethod, Provider: authProviderLabel(flow.AuthMethod), ClientID: flow.ClientID, ClientSecret: flow.ClientSecret, ClientIDHash: hex.EncodeToString(hash[:]), StartURL: flow.StartURL, Region: flow.Region}
-	if !isBuilderIDCredential(token) {
-		reconcileProfileBestEffort(context.Background(), token, "after login")
+	if profileRequired(token) && strings.TrimSpace(token.ProfileArn) == "" {
+		if err = reconcileProfile(context.Background(), token); err != nil {
+			return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusError, Message: "Kiro profile discovery failed after login: " + err.Error()})
+		}
 	}
 	clearUsageCache()
 	return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusSuccess, Message: "Kiro device login completed", Auth: authData(token, "")})
@@ -735,6 +737,7 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	ctx := context.Background()
+	authUpdated := false
 	lock := credentialUsageLock(token, req.AuthID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -744,17 +747,13 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
+		authUpdated = true
 		clearUsageCache()
 	} else if !isAPIKeyCredential(token) && !isBuilderIDCredential(token) && strings.TrimSpace(token.ProfileArn) == "" {
 		if err = reconcileProfile(ctx, token); err != nil {
-			if !isKiroAuthorizationError(err) {
-				return nil, err
-			}
-			token, _, err = refreshAndSaveUsageCredential(ctx, kiroFileName(token), req.StorageJSON, token)
-			if err != nil {
-				return nil, err
-			}
-			clearUsageCache()
+			return nil, fmt.Errorf("discover required Kiro profile: %w", err)
+		} else {
+			authUpdated = true
 		}
 	}
 
@@ -782,7 +781,15 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 		})
 	}
 	modelcapabilities.ReplaceForAuth(req.AuthID, capabilities)
-	return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: out})
+	response := pluginapi.ModelResponse{Provider: providerName, Models: out}
+	if authUpdated {
+		fileName := ""
+		if req.Attributes != nil {
+			fileName = filepath.Base(req.Attributes[coreauth.AttributePath])
+		}
+		response.AuthUpdate = authData(token, fileName)
+	}
+	return okEnvelope(response)
 }
 
 func isKiroAuthorizationError(err error) bool {
@@ -861,7 +868,8 @@ func listAvailableModels(ctx context.Context, token *kiroauth.KiroTokenData) ([]
 
 func newModelCatalogRequest(ctx context.Context, token *kiroauth.KiroTokenData, nextToken string) (*http.Request, error) {
 	query := url.Values{"origin": {"AI_EDITOR"}}
-	endpoint := "https://q." + token.Region + ".amazonaws.com/ListAvailableModels"
+	region := kiroServiceRegion(token)
+	endpoint := "https://q." + region + ".amazonaws.com/ListAvailableModels"
 	if !isAPIKeyCredential(token) && !isBuilderIDCredential(token) {
 		profileARN := strings.TrimSpace(token.ProfileArn)
 		if profileARN == "" {
@@ -886,6 +894,19 @@ func newModelCatalogRequest(ctx context.Context, token *kiroauth.KiroTokenData, 
 		req.Header.Set("TokenType", "EXTERNAL_IDP")
 	}
 	return req, nil
+}
+
+func kiroServiceRegion(token *kiroauth.KiroTokenData) string {
+	if token != nil {
+		parts := strings.Split(strings.TrimSpace(token.ProfileArn), ":")
+		if len(parts) > 3 && validateRegion(parts[3]) == nil {
+			return parts[3]
+		}
+		if validateRegion(token.Region) == nil {
+			return token.Region
+		}
+	}
+	return "us-east-1"
 }
 
 func thinkingSupport(capability modelcapabilities.Capability) *pluginapi.ThinkingSupport {
@@ -940,9 +961,24 @@ func reconcileParsedProfile(ctx context.Context, token *kiroauth.KiroTokenData, 
 		return nil
 	}
 	if err := discover(ctx, token); err != nil {
-		log.Printf("kiro: profile discovery while parsing credential unavailable: %v; continuing without profile ARN", err)
+		if profileRequired(token) {
+			return fmt.Errorf("discover required Kiro profile: %w", err)
+		}
+		log.Printf("kiro: optional profile discovery while parsing credential unavailable: %v", err)
 	}
 	return nil
+}
+
+func profileRequired(token *kiroauth.KiroTokenData) bool {
+	if token == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(token.AuthMethod)) {
+	case "idc", "external_idp", "imported":
+		return true
+	default:
+		return false
+	}
 }
 
 func reconcileProfileBestEffort(ctx context.Context, token *kiroauth.KiroTokenData, phase string) {
