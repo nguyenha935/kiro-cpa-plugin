@@ -519,7 +519,7 @@ func orderKiroEndpoints(configs []kiroEndpointConfig, names ...string) []kiroEnd
 // KiroExecutor handles requests to AWS CodeWhisperer (Kiro) API.
 type KiroExecutor struct {
 	cfg       *config.Config
-	refreshMu sync.Mutex // Serializes token refresh operations to prevent race conditions
+	refreshLocks sync.Map // one mutex per credential; unrelated accounts refresh concurrently
 }
 
 func setKiroAuthorization(req *http.Request, auth *cliproxyauth.Auth, accessToken string) {
@@ -3201,9 +3201,16 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 // Supports both AWS Builder ID (SSO OIDC) and Google OAuth (social login).
 // Uses mutex to prevent race conditions when multiple concurrent requests try to refresh.
 func (e *KiroExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
-	// Serialize token refresh operations to prevent race conditions
-	e.refreshMu.Lock()
-	defer e.refreshMu.Unlock()
+	// Serialize refreshes only for this credential. A global lock lets one slow
+	// account block every other Kiro account and increases stale-token races.
+	lockKey := "<nil>"
+	if auth != nil && strings.TrimSpace(auth.ID) != "" {
+		lockKey = auth.ID
+	}
+	lockValue, _ := e.refreshLocks.LoadOrStore(lockKey, &sync.Mutex{})
+	refreshLock := lockValue.(*sync.Mutex)
+	refreshLock.Lock()
+	defer refreshLock.Unlock()
 
 	var authID string
 	if auth != nil {
@@ -3296,6 +3303,10 @@ func (e *KiroExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
 		scopes, _ := auth.Metadata["scopes"].(string)
 		if endpoint == "" || clientID == "" || region == "" {
 			return nil, fmt.Errorf("kiro executor: external_idp refresh material is incomplete")
+		}
+		endpoint, err = validateExternalIDPTokenEndpoint(endpoint)
+		if err != nil {
+			return nil, statusErr{code: http.StatusBadRequest, msg: err.Error()}
 		}
 		form := url.Values{"grant_type": {"refresh_token"}, "client_id": {clientID}, "refresh_token": {refreshToken}}
 		if clientSecret != "" {

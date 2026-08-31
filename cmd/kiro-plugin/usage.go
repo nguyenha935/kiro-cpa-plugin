@@ -257,6 +257,10 @@ func refreshExternalIDP(ctx context.Context, token *kiroauth.KiroTokenData) (*ki
 	if token == nil || token.RefreshToken == "" || token.ClientID == "" || token.TokenEndpoint == "" {
 		return nil, errors.New("Kiro external_idp refresh material is incomplete")
 	}
+	endpoint, err := validateMicrosoftTokenEndpoint(token.TokenEndpoint)
+	if err != nil {
+		return nil, pluginStatusError{status: http.StatusBadRequest, message: err.Error()}
+	}
 	form := url.Values{"grant_type": {"refresh_token"}, "client_id": {token.ClientID}, "refresh_token": {token.RefreshToken}}
 	if token.ClientSecret != "" {
 		form.Set("client_secret", token.ClientSecret)
@@ -264,7 +268,7 @@ func refreshExternalIDP(ctx context.Context, token *kiroauth.KiroTokenData) (*ki
 	if token.Scopes != "" {
 		form.Set("scope", token.Scopes)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, token.TokenEndpoint, strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, err
 	}

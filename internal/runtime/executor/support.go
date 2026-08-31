@@ -7,6 +7,8 @@ import (
 	"html"
 	"net"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -14,6 +16,24 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	"github.com/tidwall/gjson"
 )
+
+var microsoftTokenPath = regexp.MustCompile(`(?i)^/[^/]+/oauth2(?:/v2\.0)?/token/?$`)
+
+func validateExternalIDPTokenEndpoint(raw string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed == nil || parsed.Scheme != "https" || parsed.User != nil || parsed.Port() != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", errors.New("token_endpoint must be a valid HTTPS Microsoft token URL")
+	}
+	switch strings.ToLower(parsed.Hostname()) {
+	case "login.microsoftonline.com", "login.microsoft.com", "login.windows.net":
+	default:
+		return "", errors.New("token_endpoint must use an allowlisted Microsoft login host")
+	}
+	if !microsoftTokenPath.MatchString(parsed.EscapedPath()) {
+		return "", errors.New("token_endpoint path is not a Microsoft OAuth token endpoint")
+	}
+	return parsed.String(), nil
+}
 
 type statusErr struct {
 	code       int
