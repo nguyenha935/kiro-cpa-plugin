@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -26,8 +27,11 @@ type usageReporter struct {
 	once        sync.Once
 }
 
-func newUsageReporter(ctx context.Context, provider, model string, auth *cliproxyauth.Auth) *usageReporter {
+func newUsageReporter(ctx context.Context, provider, model string, auth *cliproxyauth.Auth, requestHeaders ...http.Header) *usageReporter {
 	apiKey := apiKeyFromContext(ctx)
+	if apiKey == "" && len(requestHeaders) > 0 {
+		apiKey = apiKeyFromHeaders(requestHeaders[0])
+	}
 	reporter := &usageReporter{
 		provider:    provider,
 		model:       model,
@@ -40,6 +44,26 @@ func newUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 		reporter.authIndex = auth.EnsureIndex()
 	}
 	return reporter
+}
+
+// apiKeyFromHeaders recovers the authenticated CPA client key when the native
+// plugin ABI invokes the executor with context.Background(). The host passes
+// inbound headers in ExecutorRequest, but cannot serialize its request context
+// across the shared-library boundary.
+func apiKeyFromHeaders(headers http.Header) string {
+	if headers == nil {
+		return ""
+	}
+	for _, name := range []string{"Authorization", "X-Goog-Api-Key", "X-Api-Key"} {
+		value := strings.TrimSpace(headers.Get(name))
+		if strings.EqualFold(name, "Authorization") {
+			value = strings.TrimSpace(strings.TrimPrefix(value, "Bearer "))
+		}
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func (r *usageReporter) publish(ctx context.Context, detail usage.Detail) {
@@ -118,14 +142,16 @@ func apiKeyFromContext(ctx context.Context) string {
 	if !ok || ginCtx == nil {
 		return ""
 	}
-	if v, exists := ginCtx.Get("apiKey"); exists {
-		switch value := v.(type) {
-		case string:
-			return value
-		case fmt.Stringer:
-			return value.String()
-		default:
-			return fmt.Sprintf("%v", value)
+	for _, key := range []string{"userApiKey", "apiKey"} {
+		if v, exists := ginCtx.Get(key); exists {
+			switch value := v.(type) {
+			case string:
+				return strings.TrimSpace(value)
+			case fmt.Stringer:
+				return strings.TrimSpace(value.String())
+			default:
+				return strings.TrimSpace(fmt.Sprintf("%v", value))
+			}
 		}
 	}
 	return ""

@@ -748,7 +748,7 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		}
 	}
 
-	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth)
+	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth, opts.Headers)
 	defer reporter.trackFailure(ctx, &err)
 
 	from := opts.SourceFormat
@@ -1147,7 +1147,7 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		}
 	}
 
-	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth)
+	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth, opts.Headers)
 	defer reporter.trackFailure(ctx, &err)
 
 	from := opts.SourceFormat
