@@ -49,6 +49,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -487,7 +488,14 @@ func looksLikeKiroToken(raw []byte) bool {
 }
 
 func authData(token *kiroauth.KiroTokenData, fileName string) pluginapi.AuthData {
-	storage, _ := json.Marshal(token)
+	// Persist the non-secret display identity in the credential JSON itself.
+	// CPA rebuilds Auth records from StorageJSON after restart; Metadata and
+	// Attributes are runtime-only and are not guaranteed to survive that scan.
+	storageToken := *token
+	if strings.TrimSpace(storageToken.Email) == "" {
+		storageToken.Email = credentialIdentity(token)
+	}
+	storage, _ := json.Marshal(&storageToken)
 	if fileName == "" {
 		fileName = kiroFileName(token)
 	}
@@ -563,6 +571,11 @@ func stableAuthID(token *kiroauth.KiroTokenData) string {
 
 func authMetadata(token *kiroauth.KiroTokenData) map[string]any {
 	metadata := map[string]any{"type": providerName, "auth_method": token.AuthMethod, "expires_at": token.ExpiresAt, "region": token.Region}
+	if isAPIKeyCredential(token) {
+		metadata["auth_kind"] = coreauth.AuthKindAPIKey
+	} else {
+		metadata["auth_kind"] = coreauth.AuthKindOAuth
+	}
 	if identity := credentialIdentity(token); identity != "" {
 		metadata["email"] = identity
 	}
@@ -591,7 +604,13 @@ func authMetadata(token *kiroauth.KiroTokenData) map[string]any {
 }
 
 func authAttributes(token *kiroauth.KiroTokenData) map[string]string {
-	attrs := map[string]string{"auth_method": token.AuthMethod, "region": token.Region, "start_url": token.StartURL}
+	authKind := coreauth.AuthKindOAuth
+	attrs := map[string]string{"auth_method": token.AuthMethod, "region": token.Region, "start_url": token.StartURL, coreauth.AttributeAuthKind: authKind}
+	if isAPIKeyCredential(token) {
+		authKind = coreauth.AuthKindAPIKey
+		attrs[coreauth.AttributeAuthKind] = authKind
+		attrs[coreauth.AttributeAPIKey] = token.AccessToken
+	}
 	if identity := credentialIdentity(token); identity != "" {
 		// CPA uses this non-secret account identifier to populate AccountInfo for
 		// OAuth credentials. Builder ID tokens are opaque and have no email claim,
@@ -1025,18 +1044,93 @@ func buildCoreAuth(req pluginapi.ExecutorRequest) (*coreauth.Auth, error) {
 	if err != nil {
 		return nil, err
 	}
-	metadata := map[string]any{
-		"access_token": token.AccessToken, "refresh_token": token.RefreshToken, "profile_arn": token.ProfileArn,
-		"expires_at": token.ExpiresAt, "auth_method": token.AuthMethod, "client_id": token.ClientID,
-		"client_secret": token.ClientSecret, "region": token.Region, "start_url": token.StartURL,
-	}
+	metadata := authMetadata(token)
 	if token.TokenEndpoint != "" {
 		metadata["token_endpoint"] = token.TokenEndpoint
 	}
 	if token.Scopes != "" {
 		metadata["scopes"] = token.Scopes
 	}
-	return &coreauth.Auth{ID: req.AuthID, Provider: providerName, Label: "Kiro", Metadata: metadata, Attributes: authAttributes(token)}, nil
+	attributes := authAttributes(token)
+	// Preserve host-owned routing fields (especially the physical auth path)
+	// when the executor is reconstructed from the plugin ABI request.
+	for key, value := range req.AuthAttributes {
+		if strings.TrimSpace(value) != "" {
+			attributes[key] = value
+		}
+	}
+	fileName := strings.TrimSpace(attributes[coreauth.AttributePath])
+	if fileName != "" {
+		fileName = filepath.Base(fileName)
+	}
+	if fileName == "" {
+		fileName = strings.TrimSpace(req.AuthID)
+	}
+	return &coreauth.Auth{ID: req.AuthID, Provider: providerName, Label: "Kiro", FileName: fileName, Storage: &kiroAuthStorage{raw: append([]byte(nil), req.StorageJSON...)}, Metadata: metadata, Attributes: attributes}, nil
+}
+
+// kiroAuthStorage keeps the original credential schema while allowing CPA's
+// executor refresh path to persist updated metadata without dropping fields.
+type kiroAuthStorage struct {
+	raw  []byte
+	meta map[string]any
+}
+
+func (s *kiroAuthStorage) SetMetadata(meta map[string]any) {
+	if s == nil {
+		return
+	}
+	s.meta = meta
+}
+
+func (s *kiroAuthStorage) SaveTokenToFile(path string) error {
+	if s == nil || strings.TrimSpace(path) == "" {
+		return errors.New("Kiro auth storage path is missing")
+	}
+	destination := map[string]any{}
+	if len(bytes.TrimSpace(s.raw)) > 0 {
+		if err := json.Unmarshal(s.raw, &destination); err != nil {
+			return fmt.Errorf("decode Kiro auth storage: %w", err)
+		}
+	}
+	for key, value := range s.meta {
+		destination[key] = value
+		switch key {
+		case "access_token":
+			destination["accessToken"] = value
+		case "refresh_token":
+			destination["refreshToken"] = value
+		case "profile_arn":
+			destination["profileArn"] = value
+		case "expires_at":
+			destination["expiresAt"] = value
+		case "auth_method":
+			destination["authMethod"] = value
+		case "client_id":
+			destination["clientId"] = value
+		case "client_secret":
+			destination["clientSecret"] = value
+		case "start_url":
+			destination["startUrl"] = value
+		}
+	}
+	destination["type"] = providerName
+	raw, err := json.Marshal(destination)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 func coreRequest(req pluginapi.ExecutorRequest) coreexec.Request {
