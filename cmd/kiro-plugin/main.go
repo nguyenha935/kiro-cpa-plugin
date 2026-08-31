@@ -430,6 +430,8 @@ func decodeKiroCredential(raw []byte) (*kiroauth.KiroTokenData, error) {
 		}
 	}
 	decodeFallback("access_token", &token.AccessToken)
+	decodeFallback("api_key", &token.AccessToken)
+	decodeFallback("apiKey", &token.AccessToken)
 	decodeFallback("refresh_token", &token.RefreshToken)
 	decodeFallback("profile_arn", &token.ProfileArn)
 	decodeFallback("expires_at", &token.ExpiresAt)
@@ -442,6 +444,13 @@ func decodeKiroCredential(raw []byte) (*kiroauth.KiroTokenData, error) {
 	decodeFallback("scopes", &token.Scopes)
 	decodeFallback("region", &token.Region)
 	decodeFallback("email", &token.Email)
+	if token.AuthMethod == "" {
+		var authKind string
+		decodeFallback("auth_kind", &authKind)
+		if strings.EqualFold(authKind, coreauth.AuthKindAPIKey) || strings.EqualFold(authKind, "api_key") || strings.EqualFold(authKind, "api-key") {
+			token.AuthMethod = "api_key"
+		}
+	}
 	if token.AuthMethod == "" && token.AccessToken != "" {
 		token.AuthMethod = "imported"
 	}
@@ -453,6 +462,14 @@ func normalizeAndValidateKiroToken(token *kiroauth.KiroTokenData) error {
 		return errors.New("Kiro access token is missing")
 	}
 	token.AuthMethod = strings.ToLower(strings.TrimSpace(token.AuthMethod))
+	switch token.AuthMethod {
+	case "apikey", "api-key":
+		token.AuthMethod = "api_key"
+	case "builderid", "builder_id":
+		token.AuthMethod = "builder-id"
+	case "refresh-token", "refresh_token":
+		token.AuthMethod = "imported"
+	}
 	if token.AuthMethod == "" {
 		token.AuthMethod = "imported"
 	}
@@ -702,14 +719,17 @@ func isAPIKeyCredential(token *kiroauth.KiroTokenData) bool {
 }
 
 func decodeToken(raw []byte) (*kiroauth.KiroTokenData, error) {
-	var token kiroauth.KiroTokenData
-	if err := json.Unmarshal(raw, &token); err != nil {
+	token, err := decodeKiroCredential(raw)
+	if err != nil {
 		return nil, err
 	}
-	if token.AccessToken == "" {
+	if err = normalizeAndValidateKiroToken(token); err != nil {
+		return nil, pluginStatusError{status: http.StatusUnauthorized, message: "invalid Kiro credential: " + err.Error()}
+	}
+	if strings.TrimSpace(token.AccessToken) == "" {
 		return nil, pluginStatusError{status: http.StatusUnauthorized, message: "Kiro access token is missing"}
 	}
-	return &token, nil
+	return token, nil
 }
 
 func handleRefreshAuth(raw []byte) ([]byte, error) {
