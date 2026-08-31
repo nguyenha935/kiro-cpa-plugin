@@ -539,6 +539,21 @@ func TestAuthDataUsesCPAClassificationForOAuthAndAPIKey(t *testing.T) {
 			if test.name == "api key" && account != test.token.AccessToken {
 				t.Fatalf("CPA API-key account = %q, want original key", account)
 			}
+			if test.name == "api key" {
+				if !strings.Contains(data.ID, ":apikey:") {
+					t.Fatalf("CPA API-key ID = %q, want colon-delimited synthesized ID", data.ID)
+				}
+				if data.FileName == data.ID || !strings.HasSuffix(data.FileName, ".json") {
+					t.Fatalf("API-key file identity must remain a filename: id=%q file=%q", data.ID, data.FileName)
+				}
+				var persisted map[string]any
+				if err := json.Unmarshal(data.StorageJSON, &persisted); err != nil {
+					t.Fatalf("decode persisted API-key credential: %v", err)
+				}
+				if persisted[coreauth.AttributeAuthKind] != coreauth.AuthKindAPIKey || persisted[coreauth.AttributeAPIKey] != test.token.AccessToken {
+					t.Fatalf("persisted CPA classification = %#v", persisted)
+				}
+			}
 		})
 	}
 }

@@ -515,6 +515,21 @@ func authData(token *kiroauth.KiroTokenData, fileName string) pluginapi.AuthData
 		storageToken.Email = credentialIdentity(token)
 	}
 	storage, _ := json.Marshal(&storageToken)
+	// Keep CPA's classification fields in the persisted file as well as in
+	// AuthData.Attributes. This makes the credential self-describing for host
+	// diagnostics and fallback readers after a restart.
+	var storageMap map[string]any
+	if json.Unmarshal(storage, &storageMap) == nil {
+		storageMap["type"] = providerName
+		storageMap[coreauth.AttributeAuthKind] = coreauth.AuthKindOAuth
+		if isAPIKeyCredential(token) {
+			storageMap[coreauth.AttributeAuthKind] = coreauth.AuthKindAPIKey
+			storageMap[coreauth.AttributeAPIKey] = token.AccessToken
+		}
+		if normalized, err := json.Marshal(storageMap); err == nil {
+			storage = normalized
+		}
+	}
 	if fileName == "" {
 		fileName = kiroFileName(token)
 	}
@@ -524,13 +539,17 @@ func authData(token *kiroauth.KiroTokenData, fileName string) pluginapi.AuthData
 	if startURL, err := url.Parse(token.StartURL); err == nil && startURL.Hostname() != "" {
 		label += " - " + strings.ToLower(startURL.Hostname())
 	}
+	authID := fileName
+	if isAPIKeyCredential(token) {
+		// CPA's synthesized API-key credentials use a colon-delimited ID
+		// (provider:apikey:hash).  MKP and CPA both use that shape to distinguish
+		// an API key from a file-backed OAuth account.  FileName remains the safe
+		// on-disk name used by the auth store.
+		authID = stableAuthID(token)
+	}
 	return pluginapi.AuthData{
-		Provider: providerName,
-		// CPA's file-auth loader uses the path relative to auth-dir (the filename
-		// here) as the canonical auth ID.  Keeping the extension is important:
-		// otherwise the host callback and auth-dir catalog create two records for
-		// the same credential after restart.
-		ID:               fileName,
+		Provider:         providerName,
+		ID:               authID,
 		FileName:         fileName,
 		Label:            label,
 		StorageJSON:      storage,
@@ -588,7 +607,7 @@ func stableAuthID(token *kiroauth.KiroTokenData) string {
 	}
 	if isAPIKeyCredential(token) && token.AccessToken != "" {
 		hash := sha256.Sum256([]byte(token.AccessToken))
-		return "kiro-" + method + "-" + hex.EncodeToString(hash[:6])
+		return "kiro:apikey:" + hex.EncodeToString(hash[:6])
 	}
 	return "kiro-" + method
 }
@@ -769,7 +788,10 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	ctx := context.Background()
-	authUpdated := false
+	// CPA's generic file synthesizer applies OAuth defaults after plugin parsing.
+	// Returning AuthUpdate during model discovery restores the API-key kind and
+	// api_key attribute in the live auth record without requiring a CPA patch.
+	authUpdated := isAPIKeyCredential(token)
 	lock := credentialUsageLock(token, req.AuthID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -1174,6 +1196,10 @@ func (s *kiroAuthStorage) SaveTokenToFile(path string) error {
 			destination["expiresAt"] = value
 		case "auth_method":
 			destination["authMethod"] = value
+		case "auth_kind":
+			destination[coreauth.AttributeAuthKind] = value
+		case coreauth.AttributeAPIKey:
+			destination["apiKey"] = value
 		case "client_id":
 			destination["clientId"] = value
 		case "client_secret":
