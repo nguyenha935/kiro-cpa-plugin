@@ -294,9 +294,9 @@ func refreshSocialCredential(ctx context.Context, token *kiroauth.KiroTokenData)
 		return nil, pluginStatusError{status: status, message: fmt.Sprintf("Kiro social refresh returned HTTP %d", resp.StatusCode)}
 	}
 	var result struct {
-		AccessToken string `json:"accessToken"`
+		AccessToken  string `json:"accessToken"`
 		RefreshToken string `json:"refreshToken"`
-		ExpiresIn int `json:"expiresIn"`
+		ExpiresIn    int    `json:"expiresIn"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil || strings.TrimSpace(result.AccessToken) == "" {
 		return nil, pluginStatusError{status: http.StatusBadGateway, message: "Kiro social refresh returned invalid token"}
