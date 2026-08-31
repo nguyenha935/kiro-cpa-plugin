@@ -693,7 +693,7 @@ func getTokenKey(auth *cliproxyauth.Auth) string {
 // Execute sends the request to Kiro API and returns the response.
 // Supports automatic token refresh on 401/403 errors.
 func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
-	accessToken, profileArn := kiroCredentials(auth)
+	accessToken, profileArn := kiroRuntimeCredentials(auth)
 	if accessToken == "" {
 		return resp, statusErr{code: http.StatusUnauthorized, msg: "kiro: access token not found in auth"}
 	}
@@ -728,7 +728,7 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		if reloadErr == nil && reloadedAuth != nil {
 			// 文件中有更新的 token，使用它
 			auth = reloadedAuth
-			accessToken, profileArn = kiroCredentials(auth)
+			accessToken, profileArn = kiroRuntimeCredentials(auth)
 			log.Infof("kiro: recovered token from file (background refresh), expires_at: %v", auth.Metadata["expires_at"])
 		} else {
 			// 文件中的 token 也过期了，执行主动刷新
@@ -742,7 +742,7 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 				if persistErr := e.persistRefreshedAuth(auth); persistErr != nil {
 					log.Warnf("kiro: failed to persist refreshed auth: %v", persistErr)
 				}
-				accessToken, profileArn = kiroCredentials(auth)
+				accessToken, profileArn = kiroRuntimeCredentials(auth)
 				log.Infof("kiro: token refreshed successfully before request")
 			}
 		}
@@ -768,11 +768,9 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	}
 
 	// Determine the effective profile ARN for the selected credential.
-	effectiveProfileArn := effectiveGenerateProfileARN(auth, profileArn)
-
 	// Execute with retry on 401/403 and 429 (quota exhausted)
 	// Note: currentOrigin and kiroPayload are built inside executeWithRetry for each endpoint
-	resp, err = e.executeWithRetry(ctx, auth, req, opts, accessToken, effectiveProfileArn, nil, body, from, to, reporter, "", kiroModelID, tokenKey)
+	resp, err = e.executeWithRetry(ctx, auth, req, opts, accessToken, profileArn, nil, body, from, to, reporter, "", kiroModelID, tokenKey)
 	return resp, err
 }
 
@@ -953,7 +951,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 						log.Warnf("kiro: failed to persist refreshed auth: %v", persistErr)
 						// Continue anyway - the token is valid for this request
 					}
-					accessToken, profileArn = kiroCredentials(auth)
+					accessToken, profileArn = kiroRuntimeCredentials(auth)
 					// Rebuild payload with new profile ARN if changed
 					kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, from, opts.Metadata)
 					if attempt < maxRetries {
@@ -1024,7 +1022,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 							log.Warnf("kiro: failed to persist refreshed auth: %v", persistErr)
 							// Continue anyway - the token is valid for this request
 						}
-						accessToken, profileArn = kiroCredentials(auth)
+						accessToken, profileArn = kiroRuntimeCredentials(auth)
 						kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, from, opts.Metadata)
 						log.Infof("kiro: token refreshed for 403, retrying request")
 						continue
@@ -1094,7 +1092,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 // ExecuteStream handles streaming requests to Kiro API.
 // Supports automatic token refresh on 401/403 errors and quota fallback on 429.
 func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
-	accessToken, profileArn := kiroCredentials(auth)
+	accessToken, profileArn := kiroRuntimeCredentials(auth)
 	if accessToken == "" {
 		return nil, statusErr{code: http.StatusUnauthorized, msg: "kiro: access token not found in auth"}
 	}
@@ -1129,7 +1127,7 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		if reloadErr == nil && reloadedAuth != nil {
 			// 文件中有更新的 token，使用它
 			auth = reloadedAuth
-			accessToken, profileArn = kiroCredentials(auth)
+			accessToken, profileArn = kiroRuntimeCredentials(auth)
 			log.Infof("kiro: recovered token from file (background refresh) for stream, expires_at: %v", auth.Metadata["expires_at"])
 		} else {
 			// 文件中的 token 也过期了，执行主动刷新
@@ -1143,7 +1141,7 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 				if persistErr := e.persistRefreshedAuth(auth); persistErr != nil {
 					log.Warnf("kiro: failed to persist refreshed auth: %v", persistErr)
 				}
-				accessToken, profileArn = kiroCredentials(auth)
+				accessToken, profileArn = kiroRuntimeCredentials(auth)
 				log.Infof("kiro: token refreshed successfully before stream request")
 			}
 		}
@@ -1169,11 +1167,9 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	}
 
 	// Determine the effective profile ARN for the selected credential.
-	effectiveProfileArn := effectiveGenerateProfileARN(auth, profileArn)
-
 	// Execute stream with retry on 401/403 and 429 (quota exhausted)
 	// Note: currentOrigin and kiroPayload are built inside executeStreamWithRetry for each endpoint
-	streamKiro, errStreamKiro := e.executeStreamWithRetry(ctx, auth, req, opts, accessToken, effectiveProfileArn, nil, body, from, reporter, "", kiroModelID, tokenKey)
+	streamKiro, errStreamKiro := e.executeStreamWithRetry(ctx, auth, req, opts, accessToken, profileArn, nil, body, from, reporter, "", kiroModelID, tokenKey)
 	if errStreamKiro != nil {
 		return nil, errStreamKiro
 	}
@@ -1356,7 +1352,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 						log.Warnf("kiro: failed to persist refreshed auth: %v", persistErr)
 						// Continue anyway - the token is valid for this request
 					}
-					accessToken, profileArn = kiroCredentials(auth)
+					accessToken, profileArn = kiroRuntimeCredentials(auth)
 					// Rebuild payload with new profile ARN if changed
 					kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, from, opts.Metadata)
 					if attempt < maxRetries {
@@ -1426,7 +1422,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 							log.Warnf("kiro: failed to persist refreshed auth: %v", persistErr)
 							// Continue anyway - the token is valid for this request
 						}
-						accessToken, profileArn = kiroCredentials(auth)
+						accessToken, profileArn = kiroRuntimeCredentials(auth)
 						kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, from, opts.Metadata)
 						log.Infof("kiro: token refreshed for 403, retrying stream request")
 						continue
@@ -1520,6 +1516,15 @@ func kiroCredentials(auth *cliproxyauth.Auth) (accessToken, profileArn string) {
 	}
 
 	return accessToken, profileArn
+}
+
+// kiroRuntimeCredentials returns credentials with the profile contract required
+// by the GenerateAssistantResponse runtime surface. Builder ID and social
+// credentials do not carry profileArn in their token file, but the runtime
+// payload still requires their public profile ARN.
+func kiroRuntimeCredentials(auth *cliproxyauth.Auth) (accessToken, profileArn string) {
+	accessToken, profileArn = kiroCredentials(auth)
+	return accessToken, effectiveGenerateProfileARN(auth, profileArn)
 }
 
 // effectiveGenerateProfileARN applies only the profile contract used by
