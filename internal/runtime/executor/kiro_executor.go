@@ -518,7 +518,7 @@ func orderKiroEndpoints(configs []kiroEndpointConfig, names ...string) []kiroEnd
 
 // KiroExecutor handles requests to AWS CodeWhisperer (Kiro) API.
 type KiroExecutor struct {
-	cfg       *config.Config
+	cfg          *config.Config
 	refreshLocks sync.Map // one mutex per credential; unrelated accounts refresh concurrently
 }
 
