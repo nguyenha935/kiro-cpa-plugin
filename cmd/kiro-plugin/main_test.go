@@ -14,6 +14,7 @@ import (
 	"time"
 
 	kiroauth "github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
@@ -493,6 +494,56 @@ func TestAPIKeyCredentialIdentityDoesNotCollapseAccounts(t *testing.T) {
 	}
 	if strings.Contains(kiroFileName(one), one.AccessToken) || strings.Contains(stableAuthID(one), one.AccessToken) {
 		t.Fatal("API-key secret leaked into credential identity")
+	}
+}
+
+func TestAuthDataUsesCPAClassificationForOAuthAndAPIKey(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		token      *kiroauth.KiroTokenData
+		kind       string
+		accountTyp string
+	}{
+		{name: "oauth", token: &kiroauth.KiroTokenData{AccessToken: "access", RefreshToken: "refresh", AuthMethod: "builder-id", Email: "user@example.com"}, kind: coreauth.AuthKindOAuth, accountTyp: "oauth"},
+		{name: "api key", token: &kiroauth.KiroTokenData{AccessToken: "key-value", AuthMethod: "api_key", Region: "us-east-1"}, kind: coreauth.AuthKindAPIKey, accountTyp: "api_key"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			data := authData(test.token, "kiro-test.json")
+			auth := &coreauth.Auth{Provider: data.Provider, Metadata: data.Metadata, Attributes: data.Attributes}
+			if got := auth.AuthKind(); got != test.kind {
+				t.Fatalf("CPA AuthKind() = %q, want %q", got, test.kind)
+			}
+			accountType, account := auth.AccountInfo()
+			if accountType != test.accountTyp || account == "" {
+				t.Fatalf("CPA AccountInfo() = %q, %q", accountType, account)
+			}
+			if test.name == "api key" && account != test.token.AccessToken {
+				t.Fatalf("CPA API-key account = %q, want original key", account)
+			}
+		})
+	}
+}
+
+func TestKiroAuthStoragePreservesCredentialSchemaOnRefresh(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "kiro-api_key-test.json")
+	storage := &kiroAuthStorage{raw: []byte(`{"type":"kiro","provider":"AWS","authMethod":"api_key","accessToken":"old-key","email":"kiro-api"}`)}
+	storage.SetMetadata(map[string]any{"access_token": "new-key", "auth_kind": coreauth.AuthKindAPIKey, "region": "us-east-1"})
+	if err := storage.SaveTokenToFile(path); err != nil {
+		t.Fatal(err)
+	}
+	var saved map[string]any
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &saved); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{"type": "kiro", "provider": "AWS", "authMethod": "api_key", "accessToken": "new-key", "email": "kiro-api", "access_token": "new-key"} {
+		if got := saved[key]; got != want {
+			t.Fatalf("saved[%q] = %#v, want %q", key, got, want)
+		}
 	}
 }
 
