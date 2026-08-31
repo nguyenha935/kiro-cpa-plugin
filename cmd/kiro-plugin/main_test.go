@@ -208,6 +208,30 @@ func TestParseAuthAcceptsExistingAWSProviderLabel(t *testing.T) {
 	}
 }
 
+func TestDecodeKiroCredentialPrefersCanonicalCamelCaseFields(t *testing.T) {
+	raw := []byte(`{
+		"accessToken":"current-access",
+		"access_token":"stale-access",
+		"refreshToken":"current-refresh",
+		"refresh_token":"stale-refresh",
+		"expiresAt":"2026-09-01T00:00:00Z",
+		"expires_at":"2026-08-01T00:00:00Z",
+		"authMethod":"builder-id",
+		"auth_method":"idc",
+		"region":"us-east-1"
+	}`)
+	token, err := decodeKiroCredential(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token.AccessToken != "current-access" || token.RefreshToken != "current-refresh" {
+		t.Fatalf("stale snake_case token fields won: %#v", token)
+	}
+	if token.ExpiresAt != "2026-09-01T00:00:00Z" || token.AuthMethod != "builder-id" {
+		t.Fatalf("stale snake_case metadata fields won: %#v", token)
+	}
+}
+
 func TestAuthDataPreservesIDCRefreshMaterial(t *testing.T) {
 	token := &kiroauth.KiroTokenData{
 		AccessToken:  "access",

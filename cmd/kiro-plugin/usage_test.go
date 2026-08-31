@@ -191,7 +191,7 @@ func TestMergeRefreshedTokenPreservesHostMetadata(t *testing.T) {
 	if err := json.Unmarshal(merged, &value); err != nil {
 		t.Fatal(err)
 	}
-	if value["priority"] != float64(4) || value["disabled"] != true || value["note"] != "keep" || value["accessToken"] != "new" || value["profileArn"] != "profile" {
+	if value["priority"] != float64(4) || value["disabled"] != true || value["note"] != "keep" || value["accessToken"] != "new" || value["access_token"] != "new" || value["profileArn"] != "profile" || value["profile_arn"] != "profile" {
 		t.Fatalf("unexpected merged credential fields: %#v", value)
 	}
 	if _, ok := value["custom"]; !ok {
