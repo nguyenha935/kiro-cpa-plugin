@@ -113,6 +113,31 @@ func TestToolResultsAttachedToCurrentMessage(t *testing.T) {
 	}
 }
 
+func TestToolResultPreservesErrorStatusAndArrayContent(t *testing.T) {
+	input := []byte(`{
+		"messages": [
+			{"role":"user","content":"Run it"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"run","arguments":"{}"}}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","is_error":true,"content":[{"type":"text","text":"failed"}]}]}
+		]
+	}`)
+	result, _ := BuildKiroPayloadFromOpenAI(input, "kiro-model", "", "CLI", modelcapabilities.Capability{}, "")
+	var payload KiroPayload
+	if err := json.Unmarshal(result, &payload); err != nil {
+		t.Fatal(err)
+	}
+	ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+	if ctx == nil || len(ctx.ToolResults) != 1 {
+		t.Fatalf("tool results = %#v", ctx)
+	}
+	if got := ctx.ToolResults[0].Status; got != "error" {
+		t.Fatalf("tool result status = %q, want error", got)
+	}
+	if got := ctx.ToolResults[0].Content[0].Text; got != "failed" {
+		t.Fatalf("tool result content = %q, want failed", got)
+	}
+}
+
 // TestToolResultsInHistoryUserMessage verifies that when there are multiple user messages
 // after tool results, the tool results are attached to the correct user message in history.
 func TestToolResultsInHistoryUserMessage(t *testing.T) {

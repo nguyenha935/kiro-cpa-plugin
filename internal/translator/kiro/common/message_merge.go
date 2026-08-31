@@ -42,8 +42,10 @@ func MergeAdjacentMessages(messages []gjson.Result) []gjson.Result {
 				mergedToolCalls = mergeToolCalls(lastMsg.Get("tool_calls"), msg.Get("tool_calls"))
 			}
 
-			// Create a new merged message JSON.
-			mergedMsg := createMergedMessage(lastRole, mergedContent, mergedToolCalls)
+			// Start from the original message so provider-specific metadata (for
+			// example reasoning_content, refusal, name, or annotations) is not
+			// silently discarded while adjacent content is coalesced.
+			mergedMsg := createMergedMessageFrom(lastMsg, lastRole, mergedContent, mergedToolCalls)
 			merged[len(merged)-1] = gjson.Parse(mergedMsg)
 		} else {
 			merged = append(merged, msg)
@@ -127,15 +129,16 @@ func blockToMap(block gjson.Result) map[string]interface{} {
 	return result
 }
 
-// createMergedMessage creates a JSON string for a merged message.
-// toolCalls is optional and only emitted for assistant role.
-func createMergedMessage(role string, content string, toolCalls []interface{}) string {
-	msg := map[string]interface{}{
-		"role":    role,
-		"content": json.RawMessage(content),
-	}
-	if role == "assistant" && len(toolCalls) > 0 {
-		msg["tool_calls"] = toolCalls
+func createMergedMessageFrom(original gjson.Result, role, content string, toolCalls []interface{}) string {
+	msg := blockToMap(original)
+	msg["role"] = role
+	msg["content"] = json.RawMessage(content)
+	if role == "assistant" {
+		if len(toolCalls) > 0 {
+			msg["tool_calls"] = toolCalls
+		} else {
+			delete(msg, "tool_calls")
+		}
 	}
 	result, _ := json.Marshal(msg)
 	return string(result)
