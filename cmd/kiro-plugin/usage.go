@@ -558,8 +558,13 @@ func mergeRefreshedToken(original []byte, refreshed *kiroauth.KiroTokenData) ([]
 	for key, value := range source {
 		destination[key] = value
 	}
+	destination["access_token"] = refreshed.AccessToken
+	destination["refresh_token"] = refreshed.RefreshToken
+	destination["profile_arn"] = refreshed.ProfileArn
 	destination["expires_at"] = refreshed.ExpiresAt
 	destination["auth_method"] = refreshed.AuthMethod
+	destination["client_id"] = refreshed.ClientID
+	destination["client_secret"] = refreshed.ClientSecret
 	destination["type"] = providerName
 	return json.Marshal(destination)
 }

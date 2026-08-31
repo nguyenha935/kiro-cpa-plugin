@@ -418,24 +418,27 @@ func decodeKiroCredential(raw []byte) (*kiroauth.KiroTokenData, error) {
 	if err := json.Unmarshal(raw, &shape); err != nil {
 		return nil, err
 	}
-	decode := func(key string, dst *string) {
+	decodeFallback := func(key string, dst *string) {
+		if strings.TrimSpace(*dst) != "" {
+			return
+		}
 		if value, ok := shape[key]; ok {
 			_ = json.Unmarshal(value, dst)
 		}
 	}
-	decode("access_token", &token.AccessToken)
-	decode("refresh_token", &token.RefreshToken)
-	decode("profile_arn", &token.ProfileArn)
-	decode("expires_at", &token.ExpiresAt)
-	decode("auth_method", &token.AuthMethod)
-	decode("client_id", &token.ClientID)
-	decode("client_secret", &token.ClientSecret)
-	decode("client_id_hash", &token.ClientIDHash)
-	decode("start_url", &token.StartURL)
-	decode("token_endpoint", &token.TokenEndpoint)
-	decode("scopes", &token.Scopes)
-	decode("region", &token.Region)
-	decode("email", &token.Email)
+	decodeFallback("access_token", &token.AccessToken)
+	decodeFallback("refresh_token", &token.RefreshToken)
+	decodeFallback("profile_arn", &token.ProfileArn)
+	decodeFallback("expires_at", &token.ExpiresAt)
+	decodeFallback("auth_method", &token.AuthMethod)
+	decodeFallback("client_id", &token.ClientID)
+	decodeFallback("client_secret", &token.ClientSecret)
+	decodeFallback("client_id_hash", &token.ClientIDHash)
+	decodeFallback("start_url", &token.StartURL)
+	decodeFallback("token_endpoint", &token.TokenEndpoint)
+	decodeFallback("scopes", &token.Scopes)
+	decodeFallback("region", &token.Region)
+	decodeFallback("email", &token.Email)
 	if token.AuthMethod == "" && token.AccessToken != "" {
 		token.AuthMethod = "imported"
 	}
