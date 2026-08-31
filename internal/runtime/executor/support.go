@@ -55,6 +55,28 @@ func normalizeTransportError(err error) error {
 	return upstreamTransportErr{cause: err}
 }
 
+func streamStatusError(kind, message string) error {
+	text := strings.TrimSpace(message)
+	if text == "" {
+		text = "upstream stream error"
+	}
+	lower := strings.ToLower(kind + " " + text)
+	code := http.StatusBadGateway
+	switch {
+	case strings.Contains(lower, "429"), strings.Contains(lower, "throttl"), strings.Contains(lower, "rate limit"), strings.Contains(lower, "too many"):
+		code = http.StatusTooManyRequests
+	case strings.Contains(lower, "401"), strings.Contains(lower, "unauthorized"), strings.Contains(lower, "token") && strings.Contains(lower, "expired"):
+		code = http.StatusUnauthorized
+	case strings.Contains(lower, "403"), strings.Contains(lower, "forbidden"), strings.Contains(lower, "suspend"):
+		code = http.StatusForbidden
+	case strings.Contains(lower, "400"), strings.Contains(lower, "validation"), strings.Contains(lower, "invalid"):
+		code = http.StatusBadRequest
+	case strings.Contains(lower, "500"), strings.Contains(lower, "internal"):
+		code = http.StatusBadGateway
+	}
+	return statusErr{code: code, msg: "kiro API stream error: " + text}
+}
+
 type upstreamRequestLog struct {
 	URL, Method, Provider, AuthID, AuthLabel, AuthType, AuthValue string
 	Headers                                                       http.Header
@@ -78,6 +100,10 @@ func applyCustomHeadersFromAttrs(request *http.Request, attrs map[string]string)
 		}
 		name := strings.TrimSpace(strings.TrimPrefix(key, "header:"))
 		value = strings.TrimSpace(value)
+		switch strings.ToLower(name) {
+		case "authorization", "tokentype", "host", "content-length", "connection", "transfer-encoding":
+			continue
+		}
 		if name != "" && value != "" {
 			request.Header.Set(name, value)
 		}
