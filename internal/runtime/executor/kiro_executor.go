@@ -3330,9 +3330,9 @@ func (e *KiroExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
 			return nil, statusErr{code: response.StatusCode, msg: fmt.Sprintf("kiro social refresh returned HTTP %d", response.StatusCode)}
 		}
 		var payloadResp struct {
-			AccessToken string `json:"accessToken"`
+			AccessToken  string `json:"accessToken"`
 			RefreshToken string `json:"refreshToken"`
-			ExpiresIn int `json:"expiresIn"`
+			ExpiresIn    int    `json:"expiresIn"`
 		}
 		if json.Unmarshal(body, &payloadResp) != nil || payloadResp.AccessToken == "" {
 			return nil, statusErr{code: http.StatusBadGateway, msg: "kiro social refresh returned invalid token"}
