@@ -543,6 +543,28 @@ func TestAuthDataUsesCPAClassificationForOAuthAndAPIKey(t *testing.T) {
 	}
 }
 
+func TestDecodeTokenAcceptsCPAAndKiroAPIKeyShapes(t *testing.T) {
+	for _, raw := range []string{
+		`{"type":"kiro","authMethod":"api_key","accessToken":"key-one","region":"us-east-1"}`,
+		`{"type":"kiro","auth_method":"api-key","api_key":"key-two","auth_kind":"apikey","region":"us-east-1"}`,
+		`{"type":"kiro","auth_method":"api_key","access_token":"key-three","region":"us-east-1"}`,
+	} {
+		token, err := decodeToken([]byte(raw))
+		if err != nil {
+			t.Fatalf("decodeToken rejected compatible API-key shape: %v", err)
+		}
+		if token.AuthMethod != "api_key" || token.AccessToken == "" {
+			t.Fatalf("decoded API-key token = %+v", token)
+		}
+	}
+}
+
+func TestDecodeTokenRejectsMissingCredential(t *testing.T) {
+	if _, err := decodeToken([]byte(`{"type":"kiro","auth_kind":"apikey","region":"us-east-1"}`)); err == nil {
+		t.Fatal("decodeToken accepted a credential without an API key or access token")
+	}
+}
+
 func TestKiroAuthStoragePreservesCredentialSchemaOnRefresh(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "kiro-api_key-test.json")
