@@ -3389,23 +3389,21 @@ func (e *KiroExecutor) persistRefreshedAuth(auth *cliproxyauth.Auth) error {
 		}
 	}
 
-	// Marshal metadata to JSON
-	raw, err := json.Marshal(auth.Metadata)
-	if err != nil {
-		return fmt.Errorf("kiro executor: marshal metadata failed: %w", err)
+	// Prefer the host/plugin storage implementation. It preserves the original
+	// credential JSON (including type, provider, identity and auth method) while
+	// merging refreshed runtime metadata. Falling back to metadata-only writes
+	// would corrupt Kiro auth files and is intentionally no longer supported.
+	if auth.Storage != nil {
+		if setter, ok := auth.Storage.(interface{ SetMetadata(map[string]any) }); ok {
+			setter.SetMetadata(auth.Metadata)
+		}
+		if err := auth.Storage.SaveTokenToFile(authPath); err != nil {
+			return fmt.Errorf("kiro executor: persist refreshed auth via storage failed: %w", err)
+		}
+		log.Debugf("kiro executor: persisted refreshed auth to %s", authPath)
+		return nil
 	}
-
-	// Write to temp file first, then rename (atomic write)
-	tmp := authPath + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return fmt.Errorf("kiro executor: write temp auth file failed: %w", err)
-	}
-	if err := os.Rename(tmp, authPath); err != nil {
-		return fmt.Errorf("kiro executor: rename auth file failed: %w", err)
-	}
-
-	log.Debugf("kiro executor: persisted refreshed auth to %s", authPath)
-	return nil
+	return fmt.Errorf("kiro executor: auth storage is unavailable")
 }
 
 // reloadAuthFromFile 从文件重新加载 auth 数据（方案 B: Fallback 机制）
