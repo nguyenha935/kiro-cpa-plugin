@@ -501,6 +501,7 @@ func authData(token *kiroauth.KiroTokenData, fileName string) pluginapi.AuthData
 	if fileName == "" {
 		fileName = kiroFileName(token)
 	}
+	fileName = filepath.Base(fileName)
 	expiresAt, _ := time.Parse(time.RFC3339, token.ExpiresAt)
 	label := "Kiro"
 	if startURL, err := url.Parse(token.StartURL); err == nil && startURL.Hostname() != "" {
@@ -508,8 +509,12 @@ func authData(token *kiroauth.KiroTokenData, fileName string) pluginapi.AuthData
 	}
 	return pluginapi.AuthData{
 		Provider:         providerName,
-		ID:               stableAuthID(token),
-		FileName:         filepath.Base(fileName),
+		// CPA's file-auth loader uses the path relative to auth-dir (the filename
+		// here) as the canonical auth ID.  Keeping the extension is important:
+		// otherwise the host callback and auth-dir catalog create two records for
+		// the same credential after restart.
+		ID:               fileName,
+		FileName:         fileName,
 		Label:            label,
 		StorageJSON:      storage,
 		Metadata:         authMetadata(token),
@@ -724,7 +729,14 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	clearUsageCache()
-	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: authData(refreshed, ""), NextRefreshAfter: nextRefreshAfter(refreshed, parseTime(refreshed.ExpiresAt))})
+	fileName := ""
+	if req.Attributes != nil {
+		fileName = filepath.Base(strings.TrimSpace(req.Attributes[coreauth.AttributePath]))
+	}
+	if fileName == "" {
+		fileName = filepath.Base(strings.TrimSpace(req.AuthID))
+	}
+	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: authData(refreshed, fileName), NextRefreshAfter: nextRefreshAfter(refreshed, parseTime(refreshed.ExpiresAt))})
 }
 
 func handleModelsForAuth(raw []byte) ([]byte, error) {

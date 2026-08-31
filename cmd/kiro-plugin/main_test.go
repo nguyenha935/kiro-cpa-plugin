@@ -268,12 +268,16 @@ func TestAuthDataExposesStableNonSecretBuilderIdentity(t *testing.T) {
 	}
 
 	data := authData(token, "kiro-builder.json")
-	want := "kiro-builder-id-1afac73cd164"
-	if data.Metadata["email"] != want || data.Attributes["email"] != want {
-		t.Fatalf("CPA identity = metadata:%v attributes:%q, want %q", data.Metadata["email"], data.Attributes["email"], want)
+	wantIdentity := "kiro-builder-id-1afac73cd164"
+	if data.Metadata["email"] != wantIdentity || data.Attributes["email"] != wantIdentity {
+		t.Fatalf("CPA identity = metadata:%v attributes:%q, want %q", data.Metadata["email"], data.Attributes["email"], wantIdentity)
 	}
-	if strings.Contains(want, token.AccessToken) {
+	if strings.Contains(wantIdentity, token.AccessToken) {
 		t.Fatal("credential identity leaked the access token")
+	}
+	wantFile := "kiro-builder.json"
+	if data.ID != wantFile || data.FileName != wantFile {
+		t.Fatalf("canonical auth identity = id:%q filename:%q, want %q", data.ID, data.FileName, wantFile)
 	}
 }
 
