@@ -366,7 +366,7 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
-	if req.Provider != "" && !strings.EqualFold(req.Provider, providerName) {
+	if req.Provider != "" && !isKiroProviderLabel(req.Provider) {
 		return okEnvelope(pluginapi.AuthParseResponse{Handled: false})
 	}
 	if !strings.Contains(strings.ToLower(req.FileName), "kiro") && !looksLikeKiroToken(req.RawJSON) {
@@ -393,6 +393,18 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 		}
 	}
 	return okEnvelope(pluginapi.AuthParseResponse{Handled: true, Auth: authData(token, req.FileName)})
+}
+
+// isKiroProviderLabel accepts the labels emitted by existing Kiro credential
+// files (for example "AWS" or "AWS builder-id") as well as the canonical
+// plugin id. CPA passes this field back during restart discovery, so rejecting
+// the display label would silently drop an otherwise valid credential.
+func isKiroProviderLabel(value string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	if normalized == "" || normalized == providerName {
+		return true
+	}
+	return normalized == "aws" || strings.HasPrefix(normalized, "aws ") || normalized == "amazon"
 }
 
 // decodeKiroCredential accepts both the plugin's camelCase storage and the

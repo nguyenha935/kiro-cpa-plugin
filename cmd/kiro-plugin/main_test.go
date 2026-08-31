@@ -178,6 +178,36 @@ func TestBuilderIDHostParseAndModelIntegration(t *testing.T) {
 	}
 }
 
+func TestParseAuthAcceptsExistingAWSProviderLabel(t *testing.T) {
+	raw, err := json.Marshal(map[string]any{
+		"accessToken": "builder-access-token",
+		"authMethod":  "builder-id",
+		"provider":    "AWS",
+		"region":      "us-east-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, _ := json.Marshal(pluginapi.AuthParseRequest{
+		Provider: "AWS", FileName: "kiro-builder-id.json", RawJSON: raw,
+	})
+	parsedRaw, err := handleParseAuth(request)
+	if err != nil {
+		t.Fatalf("parse existing AWS-labelled credential: %v", err)
+	}
+	var parsedEnvelope envelope
+	if err := json.Unmarshal(parsedRaw, &parsedEnvelope); err != nil {
+		t.Fatal(err)
+	}
+	var parsed pluginapi.AuthParseResponse
+	if err := json.Unmarshal(parsedEnvelope.Result, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if !parsed.Handled || parsed.Auth.Provider != providerName {
+		t.Fatalf("AWS-labelled Kiro credential was not handled: %+v", parsed)
+	}
+}
+
 func TestAuthDataPreservesIDCRefreshMaterial(t *testing.T) {
 	token := &kiroauth.KiroTokenData{
 		AccessToken:  "access",
