@@ -748,9 +748,6 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		}
 	}
 
-	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth, opts.Headers)
-	defer reporter.trackFailure(ctx, &err)
-
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("kiro")
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
@@ -770,7 +767,7 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	// Determine the effective profile ARN for the selected credential.
 	// Execute with retry on 401/403 and 429 (quota exhausted)
 	// Note: currentOrigin and kiroPayload are built inside executeWithRetry for each endpoint
-	resp, err = e.executeWithRetry(ctx, auth, req, opts, accessToken, profileArn, nil, body, from, to, reporter, "", kiroModelID, tokenKey)
+	resp, err = e.executeWithRetry(ctx, auth, req, opts, accessToken, profileArn, nil, body, from, to, "", kiroModelID, tokenKey)
 	return resp, err
 }
 
@@ -780,7 +777,7 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 // - CodeWhisperer endpoint (AI_EDITOR origin) uses Kiro IDE quota
 // Also supports multi-endpoint fallback similar to Antigravity implementation.
 // tokenKey is used for rate limiting and cooldown tracking.
-func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, accessToken, profileArn string, kiroPayload, body []byte, from, to sdktranslator.Format, reporter *usageReporter, currentOrigin, kiroModelID, tokenKey string) (cliproxyexecutor.Response, error) {
+func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, accessToken, profileArn string, kiroPayload, body []byte, from, to sdktranslator.Format, currentOrigin, kiroModelID, tokenKey string) (cliproxyexecutor.Response, error) {
 	var resp cliproxyexecutor.Response
 	maxRetries := 2 // Allow retries for token refresh + endpoint fallback
 	rateLimiter := kiroauth.GetGlobalRateLimiter()
@@ -1058,12 +1055,12 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				return resp, normalizeTransportError(err)
 			}
 
-			if usageInfo.TotalTokens == 0 {
-				usageInfo.TotalTokens = usageInfo.InputTokens + usageInfo.OutputTokens
-			}
-
 			appendAPIResponseChunk(ctx, e.cfg, []byte(content))
-			reporter.publish(ctx, usageInfo)
+			requestPayload := opts.OriginalRequest
+			if len(bytes.TrimSpace(requestPayload)) == 0 {
+				requestPayload = req.Payload
+			}
+			usageInfo = completeKiroUsage(usageInfo, requestPayload, content, reasoning, toolUses)
 
 			// Record success for rate limiting
 			rateLimiter.MarkTokenSuccess(tokenKey)
@@ -1147,9 +1144,6 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		}
 	}
 
-	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth, opts.Headers)
-	defer reporter.trackFailure(ctx, &err)
-
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("kiro")
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
@@ -1169,7 +1163,7 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	// Determine the effective profile ARN for the selected credential.
 	// Execute stream with retry on 401/403 and 429 (quota exhausted)
 	// Note: currentOrigin and kiroPayload are built inside executeStreamWithRetry for each endpoint
-	streamKiro, errStreamKiro := e.executeStreamWithRetry(ctx, auth, req, opts, accessToken, profileArn, nil, body, from, reporter, "", kiroModelID, tokenKey)
+	streamKiro, errStreamKiro := e.executeStreamWithRetry(ctx, auth, req, opts, accessToken, profileArn, nil, body, from, "", kiroModelID, tokenKey)
 	if errStreamKiro != nil {
 		return nil, errStreamKiro
 	}
@@ -1182,7 +1176,7 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 // - CodeWhisperer endpoint (AI_EDITOR origin) uses Kiro IDE quota
 // Also supports multi-endpoint fallback similar to Antigravity implementation.
 // tokenKey is used for rate limiting and cooldown tracking.
-func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, accessToken, profileArn string, kiroPayload, body []byte, from sdktranslator.Format, reporter *usageReporter, currentOrigin, kiroModelID, tokenKey string) (<-chan cliproxyexecutor.StreamChunk, error) {
+func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, accessToken, profileArn string, kiroPayload, body []byte, from sdktranslator.Format, currentOrigin, kiroModelID, tokenKey string) (<-chan cliproxyexecutor.StreamChunk, error) {
 	maxRetries := 2 // Allow retries for token refresh + endpoint fallback
 	rateLimiter := kiroauth.GetGlobalRateLimiter()
 	cooldownMgr := kiroauth.GetGlobalCooldownManager()
@@ -1466,7 +1460,11 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 					}
 				}()
 
-				e.streamToChannel(ctx, resp.Body, out, from, payloadRequestedModel(opts, req.Model), opts.OriginalRequest, body, reporter)
+				requestPayload := opts.OriginalRequest
+				if len(bytes.TrimSpace(requestPayload)) == 0 {
+					requestPayload = req.Payload
+				}
+				e.streamToChannel(ctx, resp.Body, out, from, payloadRequestedModel(opts, req.Model), requestPayload, body)
 			}(httpResp)
 
 			return out, nil
@@ -2273,9 +2271,10 @@ func (e *KiroExecutor) extractEventTypeFromBytes(headers []byte) string {
 // Supports tool calling - emits tool_use content blocks when tools are used.
 // Buffers official toolUseEvent input fragments without repairing malformed JSON.
 // Extracts stop_reason from upstream events when available.
-func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out chan<- cliproxyexecutor.StreamChunk, targetFormat sdktranslator.Format, model string, originalReq, claudeBody []byte, reporter *usageReporter) {
+func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out chan<- cliproxyexecutor.StreamChunk, targetFormat sdktranslator.Format, model string, originalReq, claudeBody []byte) {
 	reader := bufio.NewReaderSize(body, 20*1024*1024) // 20MB buffer to match other providers
 	var totalUsage usage.Detail
+	var outputForUsage strings.Builder
 	var hasToolUses bool          // Track if any tool uses were emitted
 	var upstreamStopReason string // Track stop_reason from upstream events
 
@@ -2304,11 +2303,6 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 	contentBlockIndex := -1
 	messageStartSent := false
 	isTextBlockOpen := false
-
-	// Ensure usage is published even on early return
-	defer func() {
-		reporter.publish(ctx, totalUsage)
-	}()
 
 	for {
 		select {
@@ -2622,6 +2616,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 				pendingReasoning.Reset()
 			}
 			if contentDelta != "" {
+				outputForUsage.WriteString(contentDelta)
 				if !isTextBlockOpen {
 					contentBlockIndex++
 					isTextBlockOpen = true
@@ -2654,6 +2649,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 				processedIDs[toolUseID] = true
 
 				hasToolUses = true
+				outputForUsage.WriteString("\n")
+				outputForUsage.WriteString(toolName)
 				// Close text block if open before starting tool_use block
 				if isTextBlockOpen && contentBlockIndex >= 0 {
 					blockStop := kiroclaude.BuildClaudeContentBlockStopEvent(contentBlockIndex)
@@ -2684,6 +2681,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 						log.Debugf("kiro: failed to marshal tool input: %v", err)
 						// Don't continue - still need to close the block
 					} else {
+						outputForUsage.WriteString("\n")
+						outputForUsage.Write(inputJSON)
 						inputDelta := kiroclaude.BuildClaudeInputJsonDeltaEvent(string(inputJSON), contentBlockIndex)
 						sseData = sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, inputDelta, &translatorParam)
 						for _, chunk := range sseData {
@@ -2736,6 +2735,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 			}
 
 			if thinkingText != "" {
+				outputForUsage.WriteString(thinkingText)
 				if isThinkingBlockOpen {
 					thinkingEvent := kiroclaude.BuildClaudeThinkingDeltaEvent(thinkingText, thinkingBlockIndex)
 					sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, thinkingEvent, &translatorParam)
@@ -2854,6 +2854,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 			// Emit completed tool uses
 			for _, tu := range completedToolUses {
 				hasToolUses = true
+				outputForUsage.WriteString("\n")
+				outputForUsage.WriteString(tu.Name)
 
 				// Close text block if open
 				if isTextBlockOpen && contentBlockIndex >= 0 {
@@ -2882,6 +2884,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 					if err != nil {
 						log.Debugf("kiro: failed to marshal tool input in toolUseEvent: %v", err)
 					} else {
+						outputForUsage.WriteString("\n")
+						outputForUsage.Write(inputJSON)
 						inputDelta := kiroclaude.BuildClaudeInputJsonDeltaEvent(string(inputJSON), contentBlockIndex)
 						sseData = sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, inputDelta, &translatorParam)
 						for _, chunk := range sseData {
@@ -3101,9 +3105,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 		}
 	}
 
-	if totalUsage.TotalTokens == 0 {
-		totalUsage.TotalTokens = totalUsage.InputTokens + totalUsage.OutputTokens
-	}
+	totalUsage = completeKiroUsageFromText(totalUsage, originalReq, outputForUsage.String())
 
 	// Log upstream usage information if received
 	if hasUpstreamUsage {
@@ -3146,7 +3148,6 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 			out <- cliproxyexecutor.StreamChunk{Payload: append(bytes.Clone(chunk), '\n', '\n')}
 		}
 	}
-	// reporter.publish is called via defer
 }
 
 // NOTE: Claude SSE event builders moved to internal/translator/kiro/claude/kiro_claude_stream.go
