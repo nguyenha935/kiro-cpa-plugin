@@ -51,7 +51,7 @@ func TestStreamBuffersReasoningUntilSignatureAndKeepsItOutOfVisibleText(t *testi
 	)
 
 	out := make(chan cliproxyexecutor.StreamChunk, 32)
-	(&KiroExecutor{}).streamToChannel(context.Background(), bytes.NewReader(body), out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil, nil)
+	(&KiroExecutor{}).streamToChannel(context.Background(), bytes.NewReader(body), out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil)
 	close(out)
 
 	var eventTypes []string
@@ -98,7 +98,7 @@ func TestStreamDoesNotExposeUnsignedReasoning(t *testing.T) {
 		kiroEvent("assistantResponseEvent", `{"assistantResponseEvent":{"content":"visible"}}`),
 	)
 	out := make(chan cliproxyexecutor.StreamChunk, 32)
-	(&KiroExecutor{}).streamToChannel(context.Background(), bytes.NewReader(body), out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil, nil)
+	(&KiroExecutor{}).streamToChannel(context.Background(), bytes.NewReader(body), out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil)
 	close(out)
 
 	var visibleText strings.Builder
@@ -125,7 +125,7 @@ func TestStreamClosesSignedReasoningBeforeDedicatedToolUse(t *testing.T) {
 		kiroEvent("toolUseEvent", `{"toolUseEvent":{"toolUseId":"call_1","name":"read_file","input":{"path":"README.md"},"stop":true}}`),
 	)
 	out := make(chan cliproxyexecutor.StreamChunk, 32)
-	(&KiroExecutor{}).streamToChannel(context.Background(), bytes.NewReader(body), out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil, nil)
+	(&KiroExecutor{}).streamToChannel(context.Background(), bytes.NewReader(body), out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil)
 	close(out)
 
 	thinkingStopPosition := -1
