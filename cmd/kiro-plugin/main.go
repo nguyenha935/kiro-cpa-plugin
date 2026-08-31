@@ -76,7 +76,7 @@ const (
 	maxPages          = 10
 )
 
-var pluginVersion = "0.8.0-ha13"
+var pluginVersion = "dev"
 
 var (
 	hostAPI        *C.cliproxy_host_api

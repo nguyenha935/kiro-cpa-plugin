@@ -72,7 +72,7 @@ func TestBuilderIDUsesPublicProfileOnlyForGenerate(t *testing.T) {
 		t.Fatalf("Builder ID runtime credentials = %q/%q", token, profile)
 	}
 	apiKey := &cliproxyauth.Auth{Metadata: map[string]any{"auth_method": "api_key"}}
-	if got := effectiveGenerateProfileARN(apiKey, ""); got != "" {
-		t.Fatalf("API key inherited Builder ID profile %q", got)
+	if got := effectiveGenerateProfileARN(apiKey, ""); got != kiroBuilderIDProfileARN {
+		t.Fatalf("API key generate profile = %q", got)
 	}
 }

@@ -112,6 +112,7 @@ jobs:
             -ldflags "-X github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro.clientVersion=2.19.0 -X main.pluginVersion=$version" \
             -o package/kiro.so ./cmd/kiro-plugin
           strings package/kiro.so | grep -Fq "$version"
+          nm -D package/kiro.so | grep -Fq 'cliproxy_plugin_init'
           sha256sum package/kiro.so | sed 's#package/##' > package/kiro.so.sha256
           tar -C package -czf "kiro-linux-${GOARCH}.tar.gz" kiro.so kiro.h kiro.so.sha256
           sha256sum "kiro-linux-${GOARCH}.tar.gz" > "kiro-linux-${GOARCH}.tar.gz.sha256"

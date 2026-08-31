@@ -1580,7 +1580,7 @@ func effectiveGenerateProfileARN(auth *cliproxyauth.Auth, profileArn string) str
 		method, _ = auth.Metadata["auth_method"].(string)
 	}
 	switch strings.ToLower(strings.TrimSpace(method)) {
-	case "builder-id":
+	case "builder-id", "api_key":
 		return kiroBuilderIDProfileARN
 	case "social":
 		return kiroSocialProfileARN
@@ -2529,7 +2529,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 			}
 
 		case "invalidStateEvent":
-			// Handle invalid state events - log and continue (non-fatal)
+			// Invalid state means the upstream rejected this request. Do not emit a
+			// successful stream after it; surface a typed error to CPA.
 			errMsg := ""
 			if msg, ok := event["message"].(string); ok {
 				errMsg = msg
@@ -2538,8 +2539,9 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 					errMsg = msg
 				}
 			}
-			log.Warnf("kiro: streamToChannel received invalidStateEvent: %s, continuing", errMsg)
-			continue
+			log.Errorf("kiro: streamToChannel received invalidStateEvent: %s", errMsg)
+			out <- cliproxyexecutor.StreamChunk{Err: streamStatusError("invalid state", errMsg)}
+			return false
 
 		default:
 			// Check for upstream usage events from Kiro API
@@ -3298,7 +3300,51 @@ func (e *KiroExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
 
 	ssoClient := kiroauth.NewSSOOIDCClient(e.cfg)
 
-	if authMethod == "external_idp" {
+	if authMethod == "social" {
+		if region == "" {
+			region = "us-east-1"
+		}
+		if !awsRegionPattern.MatchString(region) {
+			return nil, statusErr{code: http.StatusBadRequest, msg: "kiro executor: invalid social region"}
+		}
+		endpoint := "https://prod." + region + ".auth.desktop.kiro.dev/refreshToken"
+		payload, marshalErr := json.Marshal(map[string]string{"refreshToken": refreshToken})
+		if marshalErr != nil {
+			return nil, marshalErr
+		}
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+		if reqErr != nil {
+			return nil, reqErr
+		}
+		req.Header.Set("Content-Type", "application/json")
+		response, doErr := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+		if doErr != nil {
+			return nil, normalizeTransportError(doErr)
+		}
+		defer response.Body.Close()
+		body, readErr := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+		if readErr != nil {
+			return nil, normalizeTransportError(readErr)
+		}
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			return nil, statusErr{code: response.StatusCode, msg: fmt.Sprintf("kiro social refresh returned HTTP %d", response.StatusCode)}
+		}
+		var payloadResp struct {
+			AccessToken string `json:"accessToken"`
+			RefreshToken string `json:"refreshToken"`
+			ExpiresIn int `json:"expiresIn"`
+		}
+		if json.Unmarshal(body, &payloadResp) != nil || payloadResp.AccessToken == "" {
+			return nil, statusErr{code: http.StatusBadGateway, msg: "kiro social refresh returned invalid token"}
+		}
+		if payloadResp.RefreshToken == "" {
+			payloadResp.RefreshToken = refreshToken
+		}
+		if payloadResp.ExpiresIn <= 0 {
+			payloadResp.ExpiresIn = 3600
+		}
+		tokenData = &kiroauth.KiroTokenData{AccessToken: payloadResp.AccessToken, RefreshToken: payloadResp.RefreshToken, ProfileArn: kiroSocialProfileARN, ExpiresAt: time.Now().UTC().Add(time.Duration(payloadResp.ExpiresIn) * time.Second).Format(time.RFC3339), AuthMethod: "social", Provider: "CLIProxyAPI", Region: region}
+	} else if authMethod == "external_idp" {
 		endpoint, _ := auth.Metadata["token_endpoint"].(string)
 		scopes, _ := auth.Metadata["scopes"].(string)
 		if endpoint == "" || clientID == "" || region == "" {
