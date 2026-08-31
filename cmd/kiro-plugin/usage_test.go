@@ -147,6 +147,9 @@ func TestBuilderIDUsageUsesProfilelessAmazonQContract(t *testing.T) {
 }
 
 func TestRefreshExternalIDPSendsConfidentialClientSecret(t *testing.T) {
+	previousValidator := externalIDPTokenEndpointValidator
+	externalIDPTokenEndpointValidator = func(raw string) (string, error) { return raw, nil }
+	defer func() { externalIDPTokenEndpointValidator = previousValidator }()
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if err := request.ParseForm(); err != nil {
 			t.Fatal(err)

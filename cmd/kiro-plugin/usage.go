@@ -257,7 +257,7 @@ func refreshExternalIDP(ctx context.Context, token *kiroauth.KiroTokenData) (*ki
 	if token == nil || token.RefreshToken == "" || token.ClientID == "" || token.TokenEndpoint == "" {
 		return nil, errors.New("Kiro external_idp refresh material is incomplete")
 	}
-	endpoint, err := validateMicrosoftTokenEndpoint(token.TokenEndpoint)
+	endpoint, err := externalIDPTokenEndpointValidator(token.TokenEndpoint)
 	if err != nil {
 		return nil, pluginStatusError{status: http.StatusBadRequest, message: err.Error()}
 	}

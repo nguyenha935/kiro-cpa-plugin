@@ -451,6 +451,10 @@ func validateMicrosoftTokenEndpoint(raw string) (string, error) {
 	return parsed.String(), nil
 }
 
+// Kept indirect so tests can exercise refresh transport with an in-process
+// server while production always uses the strict Microsoft allowlist above.
+var externalIDPTokenEndpointValidator = validateMicrosoftTokenEndpoint
+
 func validateAWSAuthorizationURL(raw string) error {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || parsed == nil || parsed.Scheme != "https" || parsed.User != nil || parsed.Hostname() == "" {
