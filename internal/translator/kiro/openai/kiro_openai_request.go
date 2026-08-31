@@ -377,14 +377,8 @@ func processOpenAIMessages(messages gjson.Result, modelID, origin string) ([]Kir
 			// These are typically followed by user or assistant messages
 			// Collect them as pending and attach to the next user message
 			toolCallID := msg.Get("tool_call_id").String()
-			content := msg.Get("content").String()
-
 			if toolCallID != "" {
-				toolResult := KiroToolResult{
-					ToolUseID: toolCallID,
-					Content:   []KiroTextContent{{Text: content}},
-					Status:    "success",
-				}
+				toolResult := buildOpenAIToolResult(toolCallID, msg.Get("content"), msg.Get("is_error").Bool())
 				// Collect pending tool results to attach to the next user message
 				pendingToolResults = append(pendingToolResults, toolResult)
 			}
@@ -420,6 +414,12 @@ func buildUserMessageFromOpenAI(msg gjson.Result, modelID, origin string) (KiroU
 			switch partType {
 			case "text":
 				contentBuilder.WriteString(part.Get("text").String())
+			case "tool_result":
+				toolCallID := firstOpenAIValue(part.Get("tool_use_id").String(), part.Get("tool_call_id").String())
+				if toolCallID != "" {
+					isError := part.Get("is_error").Bool() || strings.EqualFold(part.Get("status").String(), "error")
+					toolResults = append(toolResults, buildOpenAIToolResult(toolCallID, part.Get("content"), isError))
+				}
 			case "image_url":
 				imageURL := part.Get("image_url.url").String()
 				if strings.HasPrefix(imageURL, "data:") {
@@ -460,6 +460,40 @@ func buildUserMessageFromOpenAI(msg gjson.Result, modelID, origin string) (KiroU
 	}
 
 	return userMsg, toolResults
+}
+
+func buildOpenAIToolResult(toolCallID string, content gjson.Result, isError bool) KiroToolResult {
+	text := make([]KiroTextContent, 0, 1)
+	if content.Type == gjson.String {
+		text = append(text, KiroTextContent{Text: content.String()})
+	} else if content.IsArray() {
+		for _, item := range content.Array() {
+			if item.Type == gjson.String {
+				text = append(text, KiroTextContent{Text: item.String()})
+			} else if item.Get("type").String() == "text" {
+				text = append(text, KiroTextContent{Text: item.Get("text").String()})
+			}
+		}
+	} else if content.Exists() && content.Type != gjson.Null {
+		text = append(text, KiroTextContent{Text: content.Raw})
+	}
+	if len(text) == 0 {
+		text = append(text, KiroTextContent{Text: ""})
+	}
+	status := "success"
+	if isError {
+		status = "error"
+	}
+	return KiroToolResult{ToolUseID: toolCallID, Content: text, Status: status}
+}
+
+func firstOpenAIValue(values ...string) string {
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // buildAssistantMessageFromOpenAI builds an assistant message from OpenAI format

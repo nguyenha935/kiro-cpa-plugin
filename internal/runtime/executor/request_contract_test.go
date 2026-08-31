@@ -190,3 +190,17 @@ func TestNormalizeKiroRequestRejectsNonTextInlineSystemContent(t *testing.T) {
 		t.Fatal("non-text system content was accepted")
 	}
 }
+
+func TestValidateKiroRequestRejectsUnsupportedDocument(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":[{"type":"document","source":{"type":"text","data":"x"}}]}]}`)
+	if err := validateKiroRequest(body, body, sdktranslator.FormatClaude); err == nil {
+		t.Fatal("document content was accepted")
+	}
+}
+
+func TestValidateKiroRequestRejectsInvalidImageData(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":[{"type":"image","source":{"media_type":"image/png","data":"not-base64"}}]}]}`)
+	if err := validateKiroRequest(body, body, sdktranslator.FormatClaude); err == nil {
+		t.Fatal("invalid image data was accepted")
+	}
+}

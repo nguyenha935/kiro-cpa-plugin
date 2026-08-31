@@ -104,3 +104,17 @@ func TestMergeAdjacentMessages_ToolMessagesRemainUnmerged(t *testing.T) {
 		t.Fatalf("expected tool messages to remain separate, got %d", len(merged))
 	}
 }
+
+func TestMergeAdjacentMessages_PreservesAssistantMetadata(t *testing.T) {
+	messages := []gjson.Result{
+		gjson.Parse(`{"role":"assistant","content":"one","reasoning_content":"signed","name":"assistant"}`),
+		gjson.Parse(`{"role":"assistant","content":"two"}`),
+	}
+	merged := MergeAdjacentMessages(messages)
+	if len(merged) != 1 {
+		t.Fatalf("merged message count = %d, want 1", len(merged))
+	}
+	if merged[0].Get("reasoning_content").String() != "signed" || merged[0].Get("name").String() != "assistant" {
+		t.Fatalf("assistant metadata was lost: %s", merged[0].Raw)
+	}
+}

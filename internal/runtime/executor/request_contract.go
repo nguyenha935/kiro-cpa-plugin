@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -299,6 +300,9 @@ func validateClaudeConversation(body []byte, source string) error {
 	}
 	pendingToolUses := make(map[string]struct{})
 	for _, message := range messages {
+		if err := validateKiroContentBlocks(message.Get("content"), source); err != nil {
+			return requestValidationErr{msg: err.Error()}
+		}
 		role := message.Get("role").String()
 		if role == "assistant" {
 			if len(pendingToolUses) != 0 {
@@ -361,6 +365,9 @@ func validateOpenAIConversation(body []byte) error {
 	messages := gjson.GetBytes(body, "messages").Array()
 	firstRole := ""
 	for _, message := range messages {
+		if err := validateKiroContentBlocks(message.Get("content"), sdktranslator.FormatOpenAI.String()); err != nil {
+			return requestValidationErr{msg: err.Error()}
+		}
 		role := message.Get("role").String()
 		if role != "system" && role != "developer" {
 			firstRole = role
@@ -411,6 +418,51 @@ func validateOpenAIConversation(body []byte) error {
 	}
 	if len(pendingToolCalls) != 0 {
 		return requestValidationErr{msg: "Kiro requires one tool result for every preceding OpenAI tool call"}
+	}
+	return nil
+}
+
+const maxKiroImageBytes = 10 << 20
+
+func validateKiroContentBlocks(content gjson.Result, source string) error {
+	if !content.IsArray() {
+		return nil
+	}
+	for _, block := range content.Array() {
+		typeName := block.Get("type").String()
+		switch typeName {
+		case "document":
+			return fmt.Errorf("Kiro does not support document content blocks")
+		case "image":
+			mediaType := strings.ToLower(strings.TrimSpace(block.Get("source.media_type").String()))
+			data := strings.TrimSpace(block.Get("source.data").String())
+			if mediaType == "" || data == "" {
+				return fmt.Errorf("Kiro image blocks require media_type and base64 data")
+			}
+			if !strings.HasPrefix(mediaType, "image/") {
+				return fmt.Errorf("Kiro supports only image MIME types")
+			}
+			decoded, err := base64.StdEncoding.DecodeString(data)
+			if err != nil || len(decoded) == 0 || len(decoded) > maxKiroImageBytes {
+				return fmt.Errorf("Kiro image data must be valid base64 and no larger than 10 MiB")
+			}
+		case "image_url", "input_image":
+			value := block.Get("image_url.url").String()
+			if value == "" {
+				value = block.Get("image_url").String()
+			}
+			if !strings.HasPrefix(value, "data:image/") {
+				return fmt.Errorf("Kiro supports only data URL images; remote image URLs are not supported")
+			}
+			comma := strings.Index(value, ",")
+			if comma < 0 || !strings.Contains(strings.ToLower(value[:comma]), ";base64") {
+				return fmt.Errorf("Kiro image data URL must use base64 encoding")
+			}
+			decoded, err := base64.StdEncoding.DecodeString(value[comma+1:])
+			if err != nil || len(decoded) == 0 || len(decoded) > maxKiroImageBytes {
+				return fmt.Errorf("Kiro image data must be valid base64 and no larger than 10 MiB")
+			}
+		}
 	}
 	return nil
 }
