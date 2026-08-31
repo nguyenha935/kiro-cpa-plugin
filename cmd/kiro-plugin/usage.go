@@ -201,6 +201,9 @@ func credentialUsageLock(token *kiroauth.KiroTokenData, fallback string) *sync.M
 }
 
 func refreshKiroCredential(ctx context.Context, token *kiroauth.KiroTokenData) (*kiroauth.KiroTokenData, error) {
+	if token != nil && strings.EqualFold(token.AuthMethod, "social") {
+		return refreshSocialCredential(ctx, token)
+	}
 	if token != nil && strings.EqualFold(token.AuthMethod, "api_key") {
 		return token, nil
 	}
@@ -251,6 +254,66 @@ func refreshKiroCredential(ctx context.Context, token *kiroauth.KiroTokenData) (
 		}
 	}
 	return refreshed, nil
+}
+
+func refreshSocialCredential(ctx context.Context, token *kiroauth.KiroTokenData) (*kiroauth.KiroTokenData, error) {
+	if token == nil || strings.TrimSpace(token.RefreshToken) == "" {
+		return nil, pluginStatusError{status: http.StatusUnauthorized, message: "Kiro social refresh token is missing"}
+	}
+	region := strings.TrimSpace(token.Region)
+	if region == "" {
+		region = "us-east-1"
+	}
+	if err := validateRegion(region); err != nil {
+		return nil, err
+	}
+	payload, err := json.Marshal(map[string]string{"refreshToken": token.RefreshToken})
+	if err != nil {
+		return nil, err
+	}
+	endpoint := "https://prod." + region + ".auth.desktop.kiro.dev/refreshToken"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		return nil, pluginStatusError{status: http.StatusBadGateway, message: "refresh Kiro social token: " + err.Error()}
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, pluginStatusError{status: http.StatusBadGateway, message: "read Kiro social refresh response"}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		status := resp.StatusCode
+		if status == http.StatusBadRequest || status == http.StatusForbidden {
+			status = http.StatusUnauthorized
+		}
+		return nil, pluginStatusError{status: status, message: fmt.Sprintf("Kiro social refresh returned HTTP %d", resp.StatusCode)}
+	}
+	var result struct {
+		AccessToken string `json:"accessToken"`
+		RefreshToken string `json:"refreshToken"`
+		ExpiresIn int `json:"expiresIn"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil || strings.TrimSpace(result.AccessToken) == "" {
+		return nil, pluginStatusError{status: http.StatusBadGateway, message: "Kiro social refresh returned invalid token"}
+	}
+	if result.RefreshToken == "" {
+		result.RefreshToken = token.RefreshToken
+	}
+	if result.ExpiresIn <= 0 {
+		result.ExpiresIn = 3600
+	}
+	refreshed := *token
+	refreshed.AccessToken = result.AccessToken
+	refreshed.RefreshToken = result.RefreshToken
+	refreshed.ExpiresAt = time.Now().UTC().Add(time.Duration(result.ExpiresIn) * time.Second).Format(time.RFC3339)
+	refreshed.Region = region
+	refreshed.AuthMethod = "social"
+	return &refreshed, nil
 }
 
 func refreshExternalIDP(ctx context.Context, token *kiroauth.KiroTokenData) (*kiroauth.KiroTokenData, error) {
