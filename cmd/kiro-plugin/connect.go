@@ -269,8 +269,10 @@ func importRefreshToken(ctx context.Context, values url.Values) (*kiroauth.KiroT
 	token.AuthMethod, token.Provider = method, authProviderLabel(method)
 	hash := sha256.Sum256([]byte(clientID))
 	token.ClientIDHash = hex.EncodeToString(hash[:])
-	if !isBuilderIDCredential(token) {
-		reconcileProfileBestEffort(ctx, token, "after refresh-token import")
+	if profileRequired(token) && strings.TrimSpace(token.ProfileArn) == "" {
+		if err := reconcileProfile(ctx, token); err != nil {
+			return nil, fmt.Errorf("discover Kiro profile after refresh-token import: %w", err)
+		}
 	}
 	return token, nil
 }

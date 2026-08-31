@@ -25,10 +25,10 @@ func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) 
 
 func TestKiroEndpointOrderMatchesAuthSurface(t *testing.T) {
 	tests := map[string][]string{
-		"builder-id":   {"KiroRuntime"},
-		"idc":          {"CodeWhisperer"},
-		"external_idp": {"CodeWhisperer"},
-		"api_key":      {"AmazonQ"},
+		"builder-id":   {"KiroRuntime", "AmazonQ", "CodeWhisperer"},
+		"idc":          {"CodeWhisperer", "AmazonQ", "KiroRuntime"},
+		"external_idp": {"CodeWhisperer", "AmazonQ", "KiroRuntime"},
+		"api_key":      {"AmazonQ", "CodeWhisperer", "KiroRuntime"},
 	}
 	for method, want := range tests {
 		auth := &cliproxyauth.Auth{Metadata: map[string]any{"auth_method": method}}

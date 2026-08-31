@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -454,6 +455,20 @@ func TestOIDCModelCatalogRequestKeepsProfileContract(t *testing.T) {
 	}
 }
 
+func TestModelCatalogUsesProfileRegionInsteadOfOIDCRegion(t *testing.T) {
+	token := &kiroauth.KiroTokenData{
+		AccessToken: "access", AuthMethod: "idc", Region: "us-west-2",
+		ProfileArn: "arn:aws:codewhisperer:eu-central-1:1:profile/test",
+	}
+	req, err := newModelCatalogRequest(context.Background(), token, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.URL.Host != "q.eu-central-1.amazonaws.com" {
+		t.Fatalf("model catalog host = %q", req.URL.Host)
+	}
+}
+
 func TestExternalIDPModelCatalogUsesQContractAndTokenType(t *testing.T) {
 	token := &kiroauth.KiroTokenData{
 		AccessToken: "external-token", AuthMethod: "external_idp", Region: "us-east-1",
@@ -666,12 +681,20 @@ func TestParseDiscoversMissingProfile(t *testing.T) {
 }
 
 func TestParseKeepsCredentialWhenOptionalProfileDiscoveryFails(t *testing.T) {
-	token := &kiroauth.KiroTokenData{ExpiresAt: time.Now().UTC().Add(time.Hour).Format(time.RFC3339)}
+	token := &kiroauth.KiroTokenData{AuthMethod: "builder-id", ExpiresAt: time.Now().UTC().Add(time.Hour).Format(time.RFC3339)}
 	discover := func(context.Context, *kiroauth.KiroTokenData) error { return io.EOF }
 	if err := reconcileParsedProfile(context.Background(), token, discover); err != nil {
 		t.Fatalf("optional profile discovery rejected credential: %v", err)
 	}
 	if token.ProfileArn != "" {
 		t.Fatalf("failed discovery invented profile %q", token.ProfileArn)
+	}
+}
+
+func TestParseRejectsIDCWhenRequiredProfileDiscoveryFails(t *testing.T) {
+	token := &kiroauth.KiroTokenData{AccessToken: "access", AuthMethod: "idc", Region: "us-east-1"}
+	discover := func(context.Context, *kiroauth.KiroTokenData) error { return errors.New("forbidden") }
+	if err := reconcileParsedProfile(context.Background(), token, discover); err == nil {
+		t.Fatal("IDC credential without a discoverable profile was accepted")
 	}
 }

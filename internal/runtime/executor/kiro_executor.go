@@ -497,11 +497,18 @@ func getKiroEndpointConfigs(auth *cliproxyauth.Auth) []kiroEndpointConfig {
 
 func orderKiroEndpoints(configs []kiroEndpointConfig, names ...string) []kiroEndpointConfig {
 	ordered := make([]kiroEndpointConfig, 0, len(configs))
+	seen := make(map[string]struct{}, len(configs))
 	for _, name := range names {
 		for _, cfg := range configs {
 			if strings.EqualFold(cfg.Name, name) {
 				ordered = append(ordered, cfg)
+				seen[strings.ToLower(cfg.Name)] = struct{}{}
 			}
+		}
+	}
+	for _, cfg := range configs {
+		if _, ok := seen[strings.ToLower(cfg.Name)]; !ok {
+			ordered = append(ordered, cfg)
 		}
 	}
 	return ordered
@@ -779,6 +786,7 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 // tokenKey is used for rate limiting and cooldown tracking.
 func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, accessToken, profileArn string, kiroPayload, body []byte, from, to sdktranslator.Format, currentOrigin, kiroModelID, tokenKey string) (cliproxyexecutor.Response, error) {
 	var resp cliproxyexecutor.Response
+	var lastEndpointErr error
 	maxRetries := 2 // Allow retries for token refresh + endpoint fallback
 	rateLimiter := kiroauth.GetGlobalRateLimiter()
 	cooldownMgr := kiroauth.GetGlobalCooldownManager()
@@ -873,7 +881,8 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 					continue
 				}
 
-				return resp, normalizeTransportError(err)
+				lastEndpointErr = normalizeTransportError(err)
+				break
 			}
 			recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 
@@ -924,7 +933,22 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 					continue
 				}
 				log.Errorf("kiro: server error %d after %d retries", httpResp.StatusCode, maxRetries)
-				return resp, statusErr{code: httpResp.StatusCode, msg: string(respBody)}
+				lastEndpointErr = statusErr{code: httpResp.StatusCode, msg: string(respBody)}
+				break
+			}
+
+			if httpResp.StatusCode == http.StatusBadRequest {
+				respBody, _ := io.ReadAll(httpResp.Body)
+				_ = httpResp.Body.Close()
+				appendAPIResponseChunk(ctx, e.cfg, respBody)
+				if attempt == 0 && isThinkingSignatureInvalid(respBody) {
+					if stripped, ok := stripInvalidReasoningHistory(body); ok {
+						body = stripped
+						kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, from, opts.Metadata)
+						continue
+					}
+				}
+				return resp, statusErr{code: http.StatusBadRequest, msg: string(respBody)}
 			}
 
 			// Handle 401 errors with token refresh and retry
@@ -1083,6 +1107,9 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 	if last429Err != nil {
 		return resp, last429Err
 	}
+	if lastEndpointErr != nil {
+		return resp, lastEndpointErr
+	}
 	return resp, statusErr{code: http.StatusServiceUnavailable, msg: "kiro: all endpoints exhausted"}
 }
 
@@ -1178,6 +1205,7 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 // tokenKey is used for rate limiting and cooldown tracking.
 func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, accessToken, profileArn string, kiroPayload, body []byte, from sdktranslator.Format, currentOrigin, kiroModelID, tokenKey string) (<-chan cliproxyexecutor.StreamChunk, error) {
 	maxRetries := 2 // Allow retries for token refresh + endpoint fallback
+	var lastEndpointErr error
 	rateLimiter := kiroauth.GetGlobalRateLimiter()
 	cooldownMgr := kiroauth.GetGlobalCooldownManager()
 	endpointConfigs := getKiroEndpointConfigs(auth)
@@ -1258,7 +1286,8 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 					continue
 				}
 
-				return nil, normalizeTransportError(err)
+				lastEndpointErr = normalizeTransportError(err)
+				break
 			}
 			recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 
@@ -1309,7 +1338,8 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 					continue
 				}
 				log.Errorf("kiro: stream server error %d after %d retries", httpResp.StatusCode, maxRetries)
-				return nil, statusErr{code: httpResp.StatusCode, msg: string(respBody)}
+				lastEndpointErr = statusErr{code: httpResp.StatusCode, msg: string(respBody)}
+				break
 			}
 
 			// Handle 400 errors - Credential/Validation issues
@@ -1321,7 +1351,14 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 
 				log.Warnf("kiro: received 400 error (attempt %d/%d), body: %s", attempt+1, maxRetries+1, summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
 
-				// 400 errors indicate request validation issues - return immediately without retry
+				if attempt == 0 && isThinkingSignatureInvalid(respBody) {
+					if stripped, ok := stripInvalidReasoningHistory(body); ok {
+						body = stripped
+						kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, from, opts.Metadata)
+						continue
+					}
+				}
+				// Other 400 errors indicate request validation issues.
 				return nil, statusErr{code: httpResp.StatusCode, msg: string(respBody)}
 			}
 
@@ -1477,6 +1514,9 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 	// All endpoints exhausted
 	if last429Err != nil {
 		return nil, last429Err
+	}
+	if lastEndpointErr != nil {
+		return nil, lastEndpointErr
 	}
 	return nil, statusErr{code: http.StatusServiceUnavailable, msg: "kiro: stream all endpoints exhausted"}
 }

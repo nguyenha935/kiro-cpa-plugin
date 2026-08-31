@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"unicode/utf8"
@@ -9,6 +10,57 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+func stripInvalidReasoningHistory(body []byte) ([]byte, bool) {
+	var request map[string]any
+	if json.Unmarshal(body, &request) != nil {
+		return body, false
+	}
+	messages, ok := request["messages"].([]any)
+	if !ok {
+		return body, false
+	}
+	changed := false
+	for _, raw := range messages {
+		message, ok := raw.(map[string]any)
+		if !ok || message["role"] != "assistant" {
+			continue
+		}
+		for _, key := range []string{"reasoning_content", "reasoningContent"} {
+			if _, exists := message[key]; exists {
+				delete(message, key)
+				changed = true
+			}
+		}
+		content, ok := message["content"].([]any)
+		if !ok {
+			continue
+		}
+		kept := content[:0]
+		for _, block := range content {
+			item, _ := block.(map[string]any)
+			typeName, _ := item["type"].(string)
+			if typeName == "thinking" || typeName == "redacted_thinking" {
+				changed = true
+				continue
+			}
+			kept = append(kept, block)
+		}
+		message["content"] = kept
+	}
+	if !changed {
+		return body, false
+	}
+	stripped, err := json.Marshal(request)
+	if err != nil {
+		return body, false
+	}
+	return stripped, true
+}
+
+func isThinkingSignatureInvalid(body []byte) bool {
+	return strings.Contains(strings.ToUpper(string(body)), "THINKING_SIGNATURE_INVALID")
+}
 
 const maxKiroToolDescriptionBytes = 10240
 

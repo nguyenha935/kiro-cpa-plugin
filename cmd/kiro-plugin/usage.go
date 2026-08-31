@@ -245,8 +245,10 @@ func refreshKiroCredential(ctx context.Context, token *kiroauth.KiroTokenData) (
 	if strings.TrimSpace(refreshed.ProfileArn) == "" {
 		refreshed.ProfileArn = token.ProfileArn
 	}
-	if !isBuilderIDCredential(refreshed) {
-		reconcileProfileBestEffort(ctx, refreshed, "after refresh")
+	if profileRequired(refreshed) && strings.TrimSpace(refreshed.ProfileArn) == "" {
+		if err := reconcileProfile(ctx, refreshed); err != nil {
+			return nil, fmt.Errorf("discover Kiro profile after refresh: %w", err)
+		}
 	}
 	return refreshed, nil
 }
@@ -587,15 +589,16 @@ func requestUsageLimits(ctx context.Context, client httpDoer, token *kiroauth.Ki
 	if strings.EqualFold(token.AuthMethod, "external_idp") && token.ProfileArn == "" {
 		return nil, errors.New("usage is not available for this Kiro credential type")
 	}
-	if err := validateRegion(token.Region); err != nil {
+	region := kiroServiceRegion(token)
+	if err := validateRegion(region); err != nil {
 		return nil, err
 	}
 	query := url.Values{}
 	query.Set("origin", "AI_EDITOR")
 	query.Set("resourceType", "AGENTIC_REQUEST")
-	endpoint := managementEndpoint(token.Region, "getUsageLimits")
+	endpoint := managementEndpoint(region, "getUsageLimits")
 	if isBuilderIDCredential(token) || isAPIKeyCredential(token) {
-		endpoint = "https://q." + token.Region + ".amazonaws.com/getUsageLimits"
+		endpoint = "https://q." + region + ".amazonaws.com/getUsageLimits"
 	} else if profileARN := strings.TrimSpace(token.ProfileArn); profileARN != "" {
 		query.Set("profileArn", profileARN)
 	}
