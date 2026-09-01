@@ -550,6 +550,19 @@ func TestAPIKeyCredentialIdentityDoesNotCollapseAccounts(t *testing.T) {
 	}
 }
 
+func TestAPIKeyIdentityAndFilenameRemainStableAfterRoundTrip(t *testing.T) {
+	original := &kiroauth.KiroTokenData{AccessToken: "stable-key", AuthMethod: "api_key", Region: "us-east-1"}
+	first := authData(original, "")
+	decoded, err := decodeToken(first.StorageJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := authData(decoded, "")
+	if first.ID != second.ID || first.FileName != second.FileName {
+		t.Fatalf("API-key identity changed after round trip: first=%q/%q second=%q/%q", first.ID, first.FileName, second.ID, second.FileName)
+	}
+}
+
 func TestAuthDataUsesCPAClassificationForOAuthAndAPIKey(t *testing.T) {
 	for _, test := range []struct {
 		name       string
@@ -614,6 +627,25 @@ func TestDecodeTokenRejectsMissingCredential(t *testing.T) {
 	}
 }
 
+func TestAuthDataPreservesHostOwnedSettings(t *testing.T) {
+	raw := []byte(`{"type":"kiro","authMethod":"api_key","accessToken":"key","priority":9,"model-aliases":[{"name":"claude-opus-5","alias":"opus"}],"excluded-models":["*"]}`)
+	token, err := decodeToken(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := authData(token, "kiro-api.json")
+	var persisted map[string]any
+	if err := json.Unmarshal(data.StorageJSON, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted["priority"] != float64(9) || persisted["model-aliases"] == nil || persisted["excluded-models"] == nil {
+		t.Fatalf("host settings were dropped: %#v", persisted)
+	}
+	if data.Attributes["priority"] != "9" {
+		t.Fatalf("priority attribute = %q", data.Attributes["priority"])
+	}
+}
+
 func TestKiroAuthStoragePreservesCredentialSchemaOnRefresh(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "kiro-api_key-test.json")
@@ -634,6 +666,16 @@ func TestKiroAuthStoragePreservesCredentialSchemaOnRefresh(t *testing.T) {
 		if got := saved[key]; got != want {
 			t.Fatalf("saved[%q] = %#v, want %q", key, got, want)
 		}
+	}
+}
+
+func TestConfigurePluginMergesNestedAndPartialSettings(t *testing.T) {
+	original := pluginSettings
+	defer func() { pluginSettings = original }()
+	pluginSettings = pluginSettingsData{DailyMaxRequests: 777, MinTokenInterval: "3s", MaxTokenInterval: "5s", SuspendCooldown: "2h"}
+	configurePlugin([]byte(`{"config_yaml":"cGx1Z2luczoKICBjb25maWdzOgogICAga2lybzoKICAgICAgZGFpbHlfbWF4X3JlcXVlc3RzOiA4ODgK"}`))
+	if pluginSettings.DailyMaxRequests != 888 || pluginSettings.MinTokenInterval != "3s" || pluginSettings.MaxTokenInterval != "5s" || pluginSettings.SuspendCooldown != "2h" {
+		t.Fatalf("nested partial config reset existing settings: %#v", pluginSettings)
 	}
 }
 

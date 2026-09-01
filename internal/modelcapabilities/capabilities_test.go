@@ -43,3 +43,19 @@ func TestAdditionalFieldsUsesDeclaredPath(t *testing.T) {
 		t.Fatalf("fields = %#v, want %#v", got, want)
 	}
 }
+
+func TestNormalizeMaxTokensEnforcesKiroMinimumWithoutSchema(t *testing.T) {
+	if got := (Capability{}).NormalizeMaxTokens(64); got != DefaultMinimumOutputTokens {
+		t.Fatalf("normalized max tokens = %d, want %d", got, DefaultMinimumOutputTokens)
+	}
+}
+
+func TestNormalizeMaxTokensHonorsDiscoveredBounds(t *testing.T) {
+	c := Capability{SupportsMaxTokens: true, MinimumOutputTokens: 2048, MaximumOutputTokens: 4096}
+	if got := c.NormalizeMaxTokens(1024); got != 2048 {
+		t.Fatalf("minimum clamp = %d, want 2048", got)
+	}
+	if got := c.NormalizeMaxTokens(8192); got != 4096 {
+		t.Fatalf("maximum clamp = %d, want 4096", got)
+	}
+}

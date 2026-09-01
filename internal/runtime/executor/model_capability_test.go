@@ -55,6 +55,21 @@ func TestPrepareModelCapabilityRejectsUnsupportedEffort(t *testing.T) {
 	}
 }
 
+func TestPrepareModelCapabilityTreatsDisabledAsNoEffort(t *testing.T) {
+	auth := &cliproxyauth.Auth{ID: "auth-disabled-thinking"}
+	modelcapabilities.ReplaceForAuth(auth.ID, []modelcapabilities.Capability{{
+		ModelID: "claude-opus-5", EffortPath: modelcapabilities.EffortPathOutputConfig,
+		EffortLevels: []string{"low", "medium", "high"},
+	}})
+	opts := cliproxyexecutor.Options{Metadata: map[string]any{cliproxyexecutor.ReasoningEffortMetadataKey: "none"}}
+	if err := prepareModelCapability(auth, "claude-opus-5", &opts); err != nil {
+		t.Fatalf("disabled thinking was rejected: %v", err)
+	}
+	if _, exists := opts.Metadata[cliproxyexecutor.ReasoningEffortMetadataKey]; exists {
+		t.Fatal("disabled thinking should omit the effort metadata")
+	}
+}
+
 func TestIdentityCenterProfileIsSentUpstream(t *testing.T) {
 	const profile = "arn:aws:codewhisperer:us-east-1:123456789012:profile/test"
 	auth := &cliproxyauth.Auth{Metadata: map[string]any{"auth_method": "idc"}}

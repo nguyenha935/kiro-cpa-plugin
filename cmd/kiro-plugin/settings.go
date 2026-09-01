@@ -14,6 +14,10 @@ type pluginSettingsData struct {
 	SuspendCooldown  string `yaml:"suspend_cooldown"`
 }
 
+func (s pluginSettingsData) isZero() bool {
+	return s.DailyMaxRequests == 0 && s.MinTokenInterval == "" && s.MaxTokenInterval == "" && s.SuspendCooldown == ""
+}
+
 func defaultPluginSettings() pluginSettingsData {
 	return pluginSettingsData{
 		DailyMaxRequests: kiroauth.DefaultDailyMaxRequests,

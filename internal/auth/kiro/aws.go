@@ -53,6 +53,62 @@ type KiroTokenData struct {
 	TokenEndpoint string `json:"token_endpoint,omitempty"`
 	// Scopes contains the space-delimited scopes used by an external identity provider.
 	Scopes string `json:"scopes,omitempty"`
+	// Host-owned routing/settings fields are kept in the credential document so
+	// plugin refresh/model-discovery updates cannot silently erase CPA UI state.
+	Priority          int                        `json:"priority,omitempty"`
+	Weight            int                        `json:"weight,omitempty"`
+	Disabled          bool                       `json:"disabled,omitempty"`
+	DisableCooling    bool                       `json:"disable_cooling,omitempty"`
+	RequestRetry      int                        `json:"request_retry,omitempty"`
+	PreferredEndpoint string                     `json:"preferred_endpoint,omitempty"`
+	Extra             map[string]json.RawMessage `json:"-"`
+}
+
+// UnmarshalJSON retains host-owned fields unknown to this plugin (for example
+// model-aliases, excluded-models, note, custom headers and future CPA fields).
+// Model discovery and token refresh must never turn credential persistence into
+// a lossy schema conversion.
+func (k *KiroTokenData) UnmarshalJSON(data []byte) error {
+	type alias KiroTokenData
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var all map[string]json.RawMessage
+	if err := json.Unmarshal(data, &all); err != nil {
+		return err
+	}
+	known, _ := json.Marshal(decoded)
+	var knownFields map[string]json.RawMessage
+	_ = json.Unmarshal(known, &knownFields)
+	for key := range knownFields {
+		delete(all, key)
+	}
+	*k = KiroTokenData(decoded)
+	if len(all) > 0 {
+		k.Extra = all
+	}
+	return nil
+}
+
+// MarshalJSON overlays current credential fields on the original host-owned
+// settings, preserving settings even after rotating-token refreshes.
+func (k KiroTokenData) MarshalJSON() ([]byte, error) {
+	type alias KiroTokenData
+	known, err := json.Marshal(alias(k))
+	if err != nil {
+		return nil, err
+	}
+	var merged map[string]json.RawMessage
+	if err = json.Unmarshal(known, &merged); err != nil {
+		return nil, err
+	}
+	for key, value := range k.Extra {
+		if _, exists := merged[key]; !exists {
+			merged[key] = value
+		}
+	}
+	return json.Marshal(merged)
 }
 
 // KiroAuthBundle aggregates authentication data after OAuth flow completion
