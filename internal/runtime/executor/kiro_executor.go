@@ -3326,7 +3326,7 @@ func (e *KiroExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
 
 	ssoClient := kiroauth.NewSSOOIDCClient(e.cfg)
 
-	if authMethod == "social" {
+	if authMethod == "social" || authMethod == "imported" && clientID == "" && clientSecret == "" {
 		if region == "" {
 			region = "us-east-1"
 		}
@@ -3369,7 +3369,11 @@ func (e *KiroExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
 		if payloadResp.ExpiresIn <= 0 {
 			payloadResp.ExpiresIn = 3600
 		}
-		tokenData = &kiroauth.KiroTokenData{AccessToken: payloadResp.AccessToken, RefreshToken: payloadResp.RefreshToken, ProfileArn: kiroSocialProfileARN, ExpiresAt: time.Now().UTC().Add(time.Duration(payloadResp.ExpiresIn) * time.Second).Format(time.RFC3339), AuthMethod: "social", Provider: "CLIProxyAPI", Region: region}
+		profileArn, _ := auth.Metadata["profile_arn"].(string)
+		if authMethod == "social" && profileArn == "" {
+			profileArn = kiroSocialProfileARN
+		}
+		tokenData = &kiroauth.KiroTokenData{AccessToken: payloadResp.AccessToken, RefreshToken: payloadResp.RefreshToken, ProfileArn: profileArn, ExpiresAt: time.Now().UTC().Add(time.Duration(payloadResp.ExpiresIn) * time.Second).Format(time.RFC3339), AuthMethod: authMethod, Provider: "CLIProxyAPI", Region: region}
 	} else if authMethod == "external_idp" {
 		endpoint, _ := auth.Metadata["token_endpoint"].(string)
 		scopes, _ := auth.Metadata["scopes"].(string)

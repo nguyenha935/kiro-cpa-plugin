@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"testing"
 	"time"
 
@@ -118,6 +119,40 @@ func TestImportExternalIDPValidatesModelCatalogBeforePersisting(t *testing.T) {
 	}
 	if _, err := importExternalIDP(context.Background(), payload); err == nil {
 		t.Fatal("external_idp import persisted a credential rejected by Kiro")
+	}
+}
+
+func TestImportDesktopRefreshTokenDoesNotRequireOIDCClient(t *testing.T) {
+	originalRefresher := desktopTokenRefresher
+	desktopTokenRefresher = func(_ context.Context, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
+		if refreshToken != "aorAAAAAG-test" || region != "us-east-1" {
+			t.Fatalf("desktop refresh input = %q/%q", refreshToken, region)
+		}
+		return &kiroauth.KiroTokenData{
+			AccessToken: "access", RefreshToken: refreshToken,
+			ProfileArn: "arn:aws:codewhisperer:us-east-1:1:profile/test",
+			ExpiresAt:  time.Now().UTC().Add(time.Hour).Format(time.RFC3339),
+		}, nil
+	}
+	t.Cleanup(func() { desktopTokenRefresher = originalRefresher })
+
+	token, err := importRefreshToken(context.Background(), url.Values{
+		"refresh_token": {"aorAAAAAG-test"}, "region": {"us-east-1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token.AuthMethod != "imported" || token.Provider != "CLIProxyAPI" || token.ProfileArn == "" {
+		t.Fatalf("imported desktop token = %+v", token)
+	}
+}
+
+func TestImportAWSRefreshTokenStillRequiresClientRegistration(t *testing.T) {
+	_, err := importRefreshToken(context.Background(), url.Values{
+		"refresh_token": {"not-a-desktop-token"}, "region": {"us-east-1"},
+	})
+	if err == nil || err.Error() != "client ID and client secret are required for AWS refresh tokens" {
+		t.Fatalf("AWS refresh without client registration error = %v", err)
 	}
 }
 
