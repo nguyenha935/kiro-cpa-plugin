@@ -606,11 +606,19 @@ func authData(token *kiroauth.KiroTokenData, fileName string) pluginapi.AuthData
 	// diagnostics and fallback readers after a restart.
 	var storageMap map[string]any
 	if json.Unmarshal(storage, &storageMap) == nil {
+		for key, value := range token.HostMetadata {
+			// Host metadata is the authoritative source for CPA-managed fields
+			// changed from the UI (aliases, exclusions, priority, cooling, etc.).
+			// Persist it before rebuilding classification so a refresh cannot erase
+			// those settings.
+			storageMap[key] = value
+		}
 		storageMap["type"] = providerName
 		storageMap[coreauth.AttributeAuthKind] = coreauth.AuthKindOAuth
 		if isAPIKeyCredential(token) {
 			storageMap[coreauth.AttributeAuthKind] = coreauth.AuthKindAPIKey
 			storageMap[coreauth.AttributeAPIKey] = token.AccessToken
+			storageMap["access_token"] = token.AccessToken
 		}
 		if normalized, err := json.Marshal(storageMap); err == nil {
 			storage = normalized
@@ -625,17 +633,13 @@ func authData(token *kiroauth.KiroTokenData, fileName string) pluginapi.AuthData
 	if startURL, err := url.Parse(token.StartURL); err == nil && startURL.Hostname() != "" {
 		label += " - " + strings.ToLower(startURL.Hostname())
 	}
-	authID := fileName
-	if isAPIKeyCredential(token) {
-		// CPA's synthesized API-key credentials use a colon-delimited ID
-		// (provider:apikey:hash).  MKP and CPA both use that shape to distinguish
-		// an API key from a file-backed OAuth account.  FileName remains the safe
-		// on-disk name used by the auth store.
-		authID = stableAuthID(token)
-	}
 	return pluginapi.AuthData{
-		Provider:         providerName,
-		ID:               authID,
+		Provider: providerName,
+		// Kiro credentials are file-backed regardless of authentication method.
+		// Their host ID must therefore remain the auth filename, just like native
+		// OAuth credentials. AuthKind/AccountInfo classify API keys via attributes;
+		// a synthetic provider:apikey ID creates duplicate CPA/MKP accounts.
+		ID:               fileName,
 		FileName:         fileName,
 		Label:            label,
 		StorageJSON:      storage,
@@ -684,29 +688,27 @@ func kiroFileName(token *kiroauth.KiroTokenData) string {
 	return "kiro-" + method + "-" + id + ".json"
 }
 
-func stableAuthID(token *kiroauth.KiroTokenData) string {
-	method := strings.ToLower(strings.TrimSpace(token.AuthMethod))
-	if method == "" {
-		method = "imported"
-	}
-	if isAPIKeyCredential(token) && token.AccessToken != "" {
-		hash := sha256.Sum256([]byte(token.AccessToken))
-		return "kiro:apikey:" + hex.EncodeToString(hash[:6])
-	}
-	if token.Email != "" {
-		return "kiro-" + method + "-" + sanitize(token.Email)
-	}
-	if token.ClientIDHash != "" {
-		return "kiro-" + method + "-" + sanitize(token.ClientIDHash)
-	}
-	if token.ProfileArn != "" {
-		return "kiro-" + method + "-" + sanitize(token.ProfileArn)
-	}
-	return "kiro-" + method
-}
-
 func authMetadata(token *kiroauth.KiroTokenData) map[string]any {
-	metadata := map[string]any{"type": providerName, "auth_method": token.AuthMethod, "expires_at": token.ExpiresAt, "region": token.Region}
+	metadata := cloneAnyMap(token.HostMetadata)
+	if metadata == nil {
+		metadata = make(map[string]any)
+	}
+	// Unknown fields in the credential document are host-owned CPA settings or
+	// forward-compatible metadata. Promote them back into AuthData so refresh
+	// cannot replace a rich host record with a reduced plugin-only record.
+	for key, raw := range token.Extra {
+		if _, exists := metadata[key]; exists {
+			continue
+		}
+		var value any
+		if json.Unmarshal(raw, &value) == nil {
+			metadata[key] = value
+		}
+	}
+	metadata["type"] = providerName
+	metadata["auth_method"] = token.AuthMethod
+	metadata["expires_at"] = token.ExpiresAt
+	metadata["region"] = token.Region
 	if isAPIKeyCredential(token) {
 		metadata["auth_kind"] = coreauth.AuthKindAPIKey
 	} else {
@@ -756,7 +758,14 @@ func authMetadata(token *kiroauth.KiroTokenData) map[string]any {
 
 func authAttributes(token *kiroauth.KiroTokenData) map[string]string {
 	authKind := coreauth.AuthKindOAuth
-	attrs := map[string]string{"auth_method": token.AuthMethod, "region": token.Region, "start_url": token.StartURL, coreauth.AttributeAuthKind: authKind}
+	attrs := cloneStringMap(token.HostAttributes)
+	if attrs == nil {
+		attrs = make(map[string]string)
+	}
+	attrs["auth_method"] = token.AuthMethod
+	attrs["region"] = token.Region
+	attrs["start_url"] = token.StartURL
+	attrs[coreauth.AttributeAuthKind] = authKind
 	if isAPIKeyCredential(token) {
 		authKind = coreauth.AuthKindAPIKey
 		attrs[coreauth.AttributeAuthKind] = authKind
@@ -970,6 +979,7 @@ func applyHostOwnedSettings(token *kiroauth.KiroTokenData, metadata map[string]a
 		return
 	}
 	if metadata != nil {
+		token.HostMetadata = cloneAnyMap(metadata)
 		if value, ok := metadata["preferred_endpoint"].(string); ok && strings.TrimSpace(value) != "" {
 			token.PreferredEndpoint = strings.TrimSpace(value)
 		}
@@ -989,6 +999,7 @@ func applyHostOwnedSettings(token *kiroauth.KiroTokenData, metadata map[string]a
 	if attrs == nil {
 		return
 	}
+	token.HostAttributes = cloneStringMap(attrs)
 	if value := strings.TrimSpace(attrs["preferred_endpoint"]); value != "" {
 		token.PreferredEndpoint = value
 	}
@@ -1001,6 +1012,28 @@ func applyHostOwnedSettings(token *kiroauth.KiroTokenData, metadata map[string]a
 	if value := strings.TrimSpace(attrs["weight"]); value != "" {
 		token.Weight = intValue(value, token.Weight)
 	}
+}
+
+func cloneAnyMap(source map[string]any) map[string]any {
+	if source == nil {
+		return nil
+	}
+	cloned := make(map[string]any, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func cloneStringMap(source map[string]string) map[string]string {
+	if source == nil {
+		return nil
+	}
+	cloned := make(map[string]string, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 func intValue(value any, fallback int) int {

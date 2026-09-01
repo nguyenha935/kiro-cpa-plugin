@@ -62,6 +62,11 @@ type KiroTokenData struct {
 	RequestRetry      int                        `json:"request_retry,omitempty"`
 	PreferredEndpoint string                     `json:"preferred_endpoint,omitempty"`
 	Extra             map[string]json.RawMessage `json:"-"`
+	// HostMetadata and HostAttributes are runtime-only CPA state supplied to
+	// refresh/model-discovery calls. They must survive AuthData replacement but
+	// must never be written as nested provider credential fields.
+	HostMetadata   map[string]any    `json:"-"`
+	HostAttributes map[string]string `json:"-"`
 }
 
 // UnmarshalJSON retains host-owned fields unknown to this plugin (for example

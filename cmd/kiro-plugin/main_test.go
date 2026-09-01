@@ -542,10 +542,7 @@ func TestAPIKeyCredentialIdentityDoesNotCollapseAccounts(t *testing.T) {
 	if kiroFileName(one) == kiroFileName(two) {
 		t.Fatalf("API-key file names collided: %s", kiroFileName(one))
 	}
-	if stableAuthID(one) == stableAuthID(two) {
-		t.Fatalf("API-key auth IDs collided: %s", stableAuthID(one))
-	}
-	if strings.Contains(kiroFileName(one), one.AccessToken) || strings.Contains(stableAuthID(one), one.AccessToken) {
+	if strings.Contains(kiroFileName(one), one.AccessToken) {
 		t.Fatal("API-key secret leaked into credential identity")
 	}
 }
@@ -587,11 +584,8 @@ func TestAuthDataUsesCPAClassificationForOAuthAndAPIKey(t *testing.T) {
 				t.Fatalf("CPA API-key account = %q, want original key", account)
 			}
 			if test.name == "api key" {
-				if !strings.Contains(data.ID, ":apikey:") {
-					t.Fatalf("CPA API-key ID = %q, want colon-delimited synthesized ID", data.ID)
-				}
-				if data.FileName == data.ID || !strings.HasSuffix(data.FileName, ".json") {
-					t.Fatalf("API-key file identity must remain a filename: id=%q file=%q", data.ID, data.FileName)
+				if data.ID != data.FileName || !strings.HasSuffix(data.FileName, ".json") {
+					t.Fatalf("API-key file identity must be stable: id=%q file=%q", data.ID, data.FileName)
 				}
 				var persisted map[string]any
 				if err := json.Unmarshal(data.StorageJSON, &persisted); err != nil {
