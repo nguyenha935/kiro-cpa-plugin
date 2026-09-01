@@ -64,15 +64,30 @@ func TestIdentityCenterProfileIsSentUpstream(t *testing.T) {
 }
 
 func TestGenerateProfileContractMatchesCredentialType(t *testing.T) {
-	auth := &cliproxyauth.Auth{Metadata: map[string]any{"access_token": "token", "auth_method": "builder-id"}}
-	if got := effectiveGenerateProfileARN(auth, ""); got != kiroBuilderIDProfileARN {
-		t.Fatalf("Builder ID generate profile = %q", got)
+	const accountProfile = "arn:aws:codewhisperer:eu-west-1:123456789012:profile/account"
+	tests := []struct {
+		method   string
+		stored   string
+		expected string
+	}{
+		{method: "builder-id", expected: kiroBuilderIDProfileARN},
+		{method: "social", expected: kiroSocialProfileARN},
+		{method: "idc", stored: accountProfile, expected: accountProfile},
+		{method: "external_idp", stored: accountProfile, expected: accountProfile},
+		{method: "imported", stored: accountProfile, expected: accountProfile},
+		{method: "api_key", expected: ""},
+		{method: "api_key", stored: accountProfile, expected: ""},
 	}
-	if token, profile := kiroRuntimeCredentials(auth); token != "token" || profile != kiroBuilderIDProfileARN {
-		t.Fatalf("Builder ID runtime credentials = %q/%q", token, profile)
-	}
-	apiKey := &cliproxyauth.Auth{Metadata: map[string]any{"auth_method": "api_key"}}
-	if got := effectiveGenerateProfileARN(apiKey, ""); got != "" {
-		t.Fatalf("API key generate profile = %q, want omitted", got)
+	for _, test := range tests {
+		t.Run(test.method+"/"+test.stored, func(t *testing.T) {
+			auth := &cliproxyauth.Auth{Metadata: map[string]any{"access_token": "token", "auth_method": test.method, "profile_arn": test.stored}}
+			if got := effectiveGenerateProfileARN(auth, test.stored); got != test.expected {
+				t.Fatalf("generate profile = %q, want %q", got, test.expected)
+			}
+			token, profile := kiroRuntimeCredentials(auth)
+			if token != "token" || profile != test.expected {
+				t.Fatalf("runtime credentials = %q/%q, want token/%q", token, profile, test.expected)
+			}
+		})
 	}
 }

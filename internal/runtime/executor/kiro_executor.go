@@ -1609,22 +1609,23 @@ func kiroRuntimeCredentials(auth *cliproxyauth.Auth) (accessToken, profileArn st
 // generateAssistantResponse. Builder ID's control-plane APIs are profileless,
 // but its runtime payload still requires the public Builder ID profile.
 func effectiveGenerateProfileARN(auth *cliproxyauth.Auth, profileArn string) string {
-	profileArn = strings.TrimSpace(profileArn)
-	if profileArn != "" {
-		return profileArn
-	}
 	method := ""
 	if auth != nil && auth.Metadata != nil {
 		method, _ = auth.Metadata["auth_method"].(string)
 	}
-	switch strings.ToLower(strings.TrimSpace(method)) {
+	method = strings.ToLower(strings.TrimSpace(method))
+	if method == "api_key" {
+		// API-key requests are account-bound and the upstream Q surface rejects
+		// every profile ARN, including stale values imported from older files.
+		return ""
+	}
+	profileArn = strings.TrimSpace(profileArn)
+	if profileArn != "" {
+		return profileArn
+	}
+	switch method {
 	case "builder-id":
 		return kiroBuilderIDProfileARN
-	case "api_key":
-		// API-key requests are account-bound and the upstream Q surface rejects
-		// any synthetic/shared profile ARN. Keep profileArn omitted in both the
-		// generated payload and the request metadata.
-		return ""
 	case "social":
 		return kiroSocialProfileARN
 	default:
