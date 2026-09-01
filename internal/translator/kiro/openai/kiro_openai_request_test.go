@@ -121,7 +121,7 @@ func TestToolResultPreservesErrorStatusAndArrayContent(t *testing.T) {
 			{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","is_error":true,"content":[{"type":"text","text":"failed"}]}]}
 		]
 	}`)
-	result, _ := BuildKiroPayloadFromOpenAI(input, "kiro-model", "", "CLI", modelcapabilities.Capability{}, "")
+	result, _ := BuildKiroPayloadFromOpenAI(withDeclaredTestTools(t, input), "kiro-model", "", "CLI", modelcapabilities.Capability{}, "")
 	var payload KiroPayload
 	if err := json.Unmarshal(result, &payload); err != nil {
 		t.Fatal(err)

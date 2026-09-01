@@ -5,6 +5,7 @@ package openai
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"github.com/google/uuid"
@@ -142,6 +143,7 @@ func BuildKiroPayloadFromOpenAI(openaiBody []byte, modelID, profileArn, origin s
 
 	// Process messages and build history
 	history, currentUserMsg, currentToolResults := processOpenAIMessages(messages, modelID, origin)
+	history, currentToolResults = normalizeUnknownToolHistory(history, currentUserMsg, currentToolResults, kiroTools)
 	attachInstructionsToFirstUserMessage(history, currentUserMsg, systemPrompt)
 
 	// Attach tools and tool results to the current input.
@@ -188,6 +190,90 @@ func BuildKiroPayloadFromOpenAI(openaiBody []byte, modelID, profileArn, origin s
 	}
 
 	return result, thinkingEnabled
+}
+
+// normalizeUnknownToolHistory keeps structured tool replay only when every
+// historical tool is still declared by the current request. Kiro validates
+// history against the current tool catalogue and rejects an otherwise valid
+// conversation with REQUEST_BODY_INVALID when a client (notably Claude Code
+// during compaction) drops or renames a tool definition. In that case all
+// historical tool pairs are preserved as plain text so their meaning remains
+// available without sending an invalid structured replay.
+func normalizeUnknownToolHistory(history []KiroHistoryMessage, current *KiroUserInputMessage, currentResults []KiroToolResult, tools []KiroToolWrapper) ([]KiroHistoryMessage, []KiroToolResult) {
+	toolNames := make(map[string]struct{}, len(tools))
+	for _, tool := range tools {
+		toolNames[tool.ToolSpecification.Name] = struct{}{}
+	}
+
+	hasUnknownTool := false
+	for _, message := range history {
+		if message.AssistantResponseMessage == nil {
+			continue
+		}
+		for _, toolUse := range message.AssistantResponseMessage.ToolUses {
+			if _, ok := toolNames[toolUse.Name]; !ok {
+				hasUnknownTool = true
+				break
+			}
+		}
+		if hasUnknownTool {
+			break
+		}
+	}
+	if !hasUnknownTool {
+		return history, currentResults
+	}
+
+	for i := range history {
+		if assistant := history[i].AssistantResponseMessage; assistant != nil && len(assistant.ToolUses) > 0 {
+			assistant.Content = appendOpenAIHistoryText(assistant.Content, formatOpenAIToolUses(assistant.ToolUses))
+			assistant.ToolUses = nil
+		}
+		if user := history[i].UserInputMessage; user != nil && user.UserInputMessageContext != nil && len(user.UserInputMessageContext.ToolResults) > 0 {
+			user.Content = appendOpenAIHistoryText(user.Content, formatOpenAIToolResults(user.UserInputMessageContext.ToolResults))
+			user.UserInputMessageContext.ToolResults = nil
+			if len(user.UserInputMessageContext.Tools) == 0 {
+				user.UserInputMessageContext = nil
+			}
+		}
+	}
+	// Keep the active continuation structured: unlike stale history, its tool
+	// result is paired with the immediately preceding turn and Kiro requires
+	// that native context for the request being executed now.
+	return history, currentResults
+}
+
+func formatOpenAIToolUses(toolUses []KiroToolUse) string {
+	parts := make([]string, 0, len(toolUses))
+	for _, toolUse := range toolUses {
+		input, _ := json.Marshal(toolUse.Input)
+		parts = append(parts, fmt.Sprintf("<tool_use id=%q name=%q>\n%s\n</tool_use>", toolUse.ToolUseID, toolUse.Name, input))
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+func formatOpenAIToolResults(results []KiroToolResult) string {
+	parts := make([]string, 0, len(results))
+	for _, result := range results {
+		texts := make([]string, 0, len(result.Content))
+		for _, content := range result.Content {
+			texts = append(texts, content.Text)
+		}
+		parts = append(parts, fmt.Sprintf("<tool_result id=%q status=%q>\n%s\n</tool_result>", result.ToolUseID, result.Status, strings.Join(texts, "\n")))
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+func appendOpenAIHistoryText(content, extra string) string {
+	content = strings.TrimSpace(content)
+	extra = strings.TrimSpace(extra)
+	if content == "" {
+		return extra
+	}
+	if extra == "" {
+		return content
+	}
+	return content + "\n\n" + extra
 }
 
 // attachInstructionsToFirstUserMessage preserves system and developer

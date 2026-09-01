@@ -3,6 +3,7 @@ package openai
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/nguyenha935/kiro-cpa-plugin/internal/modelcapabilities"
@@ -23,7 +24,7 @@ func TestBuildKiroPayloadPreservesInstructionsAndCompleteHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	raw, _ := BuildKiroPayloadFromOpenAI(request, "claude-opus-5", "profile", "AI_EDITOR", modelcapabilities.Capability{}, "")
+	raw, _ := BuildKiroPayloadFromOpenAI(withDeclaredTestTools(t, request), "claude-opus-5", "profile", "AI_EDITOR", modelcapabilities.Capability{}, "")
 	var payload KiroPayload
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		t.Fatalf("invalid payload: %v", err)
@@ -60,7 +61,7 @@ func TestBuildKiroPayloadAnchorsSystemAndDeveloperBeforeToolContinuation(t *test
 		]
 	}`)
 
-	raw, _ := BuildKiroPayloadFromOpenAI(request, "claude-opus-5", "profile", "AI_EDITOR", modelcapabilities.Capability{}, "")
+	raw, _ := BuildKiroPayloadFromOpenAI(withDeclaredTestTools(t, request), "claude-opus-5", "profile", "AI_EDITOR", modelcapabilities.Capability{}, "")
 	var payload KiroPayload
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		t.Fatalf("invalid payload: %v", err)
@@ -87,5 +88,53 @@ func TestBuildKiroPayloadPreservesDeveloperInstructions(t *testing.T) {
 	}
 	if got := payload.ConversationState.CurrentMessage.UserInputMessage.Content; got != "Use the repository conventions.\n\nFix the test." {
 		t.Fatalf("developer instructions or current message were not mapped: %q", got)
+	}
+}
+
+func TestBuildKiroPayloadFlattensHistoryForUndeclaredTool(t *testing.T) {
+	request := []byte(`{
+		"messages":[
+			{"role":"user","content":"Read the file."},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"call_old","type":"function","function":{"name":"OldTool","arguments":"{\"path\":\"README.md\"}"}}]},
+			{"role":"tool","tool_call_id":"call_old","content":"contents"}
+		],
+		"tools":[{"type":"function","function":{"name":"NewTool","description":"A replacement tool","parameters":{"type":"object"}}}]
+	}`)
+
+	raw, _ := BuildKiroPayloadFromOpenAI(request, "claude-opus-5", "profile", "AI_EDITOR", modelcapabilities.Capability{}, "")
+	var payload KiroPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("invalid payload: %v", err)
+	}
+	assistant := payload.ConversationState.History[1].AssistantResponseMessage
+	if len(assistant.ToolUses) != 0 || !strings.Contains(assistant.Content, `<tool_use id="call_old" name="OldTool">`) {
+		t.Fatalf("undeclared tool use was not flattened: %#v", assistant)
+	}
+	current := payload.ConversationState.CurrentMessage.UserInputMessage
+	if current.UserInputMessageContext == nil || len(current.UserInputMessageContext.ToolResults) != 1 {
+		t.Fatalf("active structured tool result was not retained: %#v", current.UserInputMessageContext)
+	}
+}
+
+func TestBuildKiroPayloadKeepsHistoryForDeclaredTool(t *testing.T) {
+	request := []byte(`{
+		"messages":[
+			{"role":"user","content":"Read the file."},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"Read","arguments":"{\"path\":\"README.md\"}"}}]},
+			{"role":"tool","tool_call_id":"call_1","content":"contents"}
+		],
+		"tools":[{"type":"function","function":{"name":"Read","description":"Read a file","parameters":{"type":"object"}}}]
+	}`)
+
+	raw, _ := BuildKiroPayloadFromOpenAI(request, "claude-opus-5", "profile", "AI_EDITOR", modelcapabilities.Capability{}, "")
+	var payload KiroPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("invalid payload: %v", err)
+	}
+	if got := len(payload.ConversationState.History[1].AssistantResponseMessage.ToolUses); got != 1 {
+		t.Fatalf("declared tool uses = %d, want 1", got)
+	}
+	if got := len(payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.ToolResults); got != 1 {
+		t.Fatalf("declared tool results = %d, want 1", got)
 	}
 }

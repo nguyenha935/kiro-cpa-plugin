@@ -5,6 +5,7 @@ package claude
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"github.com/google/uuid"
@@ -158,6 +159,7 @@ func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, cap
 
 	// Process messages and build history
 	history, currentUserMsg, currentToolResults := processMessages(messages, modelID, origin)
+	history, currentToolResults = normalizeUnknownToolHistory(history, currentUserMsg, currentToolResults, kiroTools)
 	attachInstructionsToFirstUserMessage(history, currentUserMsg, systemPrompt)
 
 	// Build the current user content. Reasoning configuration remains a
@@ -201,6 +203,84 @@ func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, cap
 	}
 
 	return result, thinkingEnabled
+}
+
+// normalizeUnknownToolHistory prevents Kiro's REQUEST_BODY_INVALID response
+// when a long-running client compacts history and the current request no longer
+// declares a tool used by an older assistant turn. Structured replay is kept
+// for declared tools; unknown pairs are represented as text, preserving context
+// without violating Kiro's tool catalogue contract.
+func normalizeUnknownToolHistory(history []KiroHistoryMessage, current *KiroUserInputMessage, currentResults []KiroToolResult, tools []KiroToolWrapper) ([]KiroHistoryMessage, []KiroToolResult) {
+	toolNames := make(map[string]struct{}, len(tools))
+	for _, tool := range tools {
+		toolNames[tool.ToolSpecification.Name] = struct{}{}
+	}
+	hasUnknown := false
+	for _, message := range history {
+		if message.AssistantResponseMessage == nil {
+			continue
+		}
+		for _, toolUse := range message.AssistantResponseMessage.ToolUses {
+			if _, ok := toolNames[toolUse.Name]; !ok {
+				hasUnknown = true
+				break
+			}
+		}
+		if hasUnknown {
+			break
+		}
+	}
+	if !hasUnknown {
+		return history, currentResults
+	}
+	for i := range history {
+		if assistant := history[i].AssistantResponseMessage; assistant != nil && len(assistant.ToolUses) > 0 {
+			assistant.Content = appendHistoryText(assistant.Content, formatToolUses(assistant.ToolUses))
+			assistant.ToolUses = nil
+		}
+		if user := history[i].UserInputMessage; user != nil && user.UserInputMessageContext != nil && len(user.UserInputMessageContext.ToolResults) > 0 {
+			user.Content = appendHistoryText(user.Content, formatToolResults(user.UserInputMessageContext.ToolResults))
+			user.UserInputMessageContext.ToolResults = nil
+			if len(user.UserInputMessageContext.Tools) == 0 {
+				user.UserInputMessageContext = nil
+			}
+		}
+	}
+	// The active continuation remains native; only stale history is flattened.
+	return history, currentResults
+}
+
+func appendHistoryText(content, extra string) string {
+	content = strings.TrimSpace(content)
+	extra = strings.TrimSpace(extra)
+	if content == "" {
+		return extra
+	}
+	if extra == "" {
+		return content
+	}
+	return content + "\n\n" + extra
+}
+
+func formatToolUses(toolUses []KiroToolUse) string {
+	parts := make([]string, 0, len(toolUses))
+	for _, toolUse := range toolUses {
+		input, _ := json.Marshal(toolUse.Input)
+		parts = append(parts, fmt.Sprintf("<tool_use id=%q name=%q>\n%s\n</tool_use>", toolUse.ToolUseID, toolUse.Name, input))
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+func formatToolResults(results []KiroToolResult) string {
+	parts := make([]string, 0, len(results))
+	for _, result := range results {
+		texts := make([]string, 0, len(result.Content))
+		for _, content := range result.Content {
+			texts = append(texts, content.Text)
+		}
+		parts = append(parts, fmt.Sprintf("<tool_result id=%q status=%q>\n%s\n</tool_result>", result.ToolUseID, result.Status, strings.Join(texts, "\n")))
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 // attachInstructionsToFirstUserMessage preserves system instructions exactly
