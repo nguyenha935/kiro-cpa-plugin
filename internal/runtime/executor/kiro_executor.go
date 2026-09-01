@@ -36,7 +36,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
 )
 
 const (
@@ -615,30 +614,13 @@ func prepareModelCapability(auth *cliproxyauth.Auth, modelID string, opts *clipr
 	if effort != "" {
 		opts.Metadata[cliproxyexecutor.ReasoningEffortMetadataKey] = effort
 	}
-	maxTokens := requestedMaxTokens(opts.SourceFormat.String(), opts.OriginalRequest)
-	if maxTokens > 0 && capability.SupportsMaxTokens {
-		if capability.MinimumOutputTokens > 0 && maxTokens < capability.MinimumOutputTokens {
-			return requestValidationErr{msg: fmt.Sprintf("Kiro model %q requires max tokens of at least %d", modelID, capability.MinimumOutputTokens)}
-		}
-		if capability.MaximumOutputTokens > 0 && maxTokens > capability.MaximumOutputTokens {
-			return requestValidationErr{msg: fmt.Sprintf("Kiro model %q supports at most %d output tokens", modelID, capability.MaximumOutputTokens)}
-		}
-	}
+	// The control-plane schema describes model capabilities, but CPA clients are
+	// allowed to choose their own output budget. 9router passes max_tokens
+	// through without applying the schema's minimum (which is metadata for the
+	// Kiro IDE, not a transport invariant). Keep the value for payload building;
+	// let Kiro return a real upstream validation error if a particular model
+	// rejects it instead of inventing a plugin-only error.
 	return nil
-}
-
-func requestedMaxTokens(source string, body []byte) int64 {
-	switch source {
-	case "openai-response":
-		return gjson.GetBytes(body, "max_output_tokens").Int()
-	case "openai":
-		if value := gjson.GetBytes(body, "max_completion_tokens").Int(); value > 0 {
-			return value
-		}
-		return gjson.GetBytes(body, "max_tokens").Int()
-	default:
-		return gjson.GetBytes(body, "max_tokens").Int()
-	}
 }
 
 // NewKiroExecutor creates a new Kiro executor instance.
