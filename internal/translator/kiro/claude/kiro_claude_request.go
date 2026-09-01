@@ -246,8 +246,10 @@ func normalizeUnknownToolHistory(history []KiroHistoryMessage, current *KiroUser
 			}
 		}
 	}
-	// The active continuation remains native; only stale history is flattened.
-	return history, currentResults
+	if current != nil && len(currentResults) > 0 {
+		current.Content = appendHistoryText(current.Content, formatToolResults(currentResults))
+	}
+	return history, nil
 }
 
 func appendHistoryText(content, extra string) string {

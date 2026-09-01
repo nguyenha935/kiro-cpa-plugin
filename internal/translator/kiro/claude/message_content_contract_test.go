@@ -53,8 +53,11 @@ func TestBuildKiroPayloadFlattensUndeclaredHistoricalTool(t *testing.T) {
 		t.Fatalf("undeclared tool use was not flattened: %#v", assistant)
 	}
 	current := payload.ConversationState.CurrentMessage.UserInputMessage
-	if current.UserInputMessageContext == nil || len(current.UserInputMessageContext.ToolResults) != 1 {
-		t.Fatalf("active structured tool result was not retained: %#v", current.UserInputMessageContext)
+	if current.UserInputMessageContext == nil || len(current.UserInputMessageContext.ToolResults) != 0 {
+		t.Fatalf("structured tool results were retained: %#v", current.UserInputMessageContext)
+	}
+	if !strings.Contains(current.Content, `<tool_result id="call_old" status="success">`) {
+		t.Fatalf("tool result text was not preserved: %q", current.Content)
 	}
 }
 

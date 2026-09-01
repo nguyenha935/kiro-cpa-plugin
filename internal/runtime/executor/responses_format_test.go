@@ -55,7 +55,8 @@ func TestResponsesToolContinuationKeepsInstructionsOnFirstUserTurn(t *testing.T)
 			{"role":"user","content":[{"type":"input_text","text":"Run pwd"}]},
 			{"type":"function_call","id":"fc_1","call_id":"call_1","name":"exec_command","arguments":"{\"cmd\":\"pwd\"}"},
 			{"type":"function_call_output","call_id":"call_1","output":"ok"}
-		]
+		],
+		"tools":[{"type":"function","name":"exec_command","description":"Run a command","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}]
 	}`)
 	intermediate := sdktranslator.TranslateRequest(
 		sdktranslator.FormatOpenAIResponse,
