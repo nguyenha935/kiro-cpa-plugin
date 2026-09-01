@@ -288,7 +288,7 @@ func refreshSocialCredential(ctx context.Context, token *kiroauth.KiroTokenData)
 	if err != nil {
 		return nil, err
 	}
-	endpoint := "https://prod." + region + ".auth.desktop.kiro.dev/refreshToken"
+	endpoint := "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return nil, err

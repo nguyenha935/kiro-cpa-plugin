@@ -216,6 +216,7 @@ func listAvailableAPIKeyModels(ctx context.Context, accessToken, region string) 
 	request.Header.Set("TokenType", "API_KEY")
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("User-Agent", kiroauth.ClientUserAgent())
+	request.Header.Set("X-Amz-User-Agent", kiroauth.ClientAWSUserAgent("codewhisperer"))
 	response, err := (&http.Client{Timeout: 30 * time.Second}).Do(request)
 	if err != nil {
 		return nil, err
@@ -302,7 +303,9 @@ func refreshDesktopToken(ctx context.Context, refreshToken, region string) (*kir
 	if err != nil {
 		return nil, err
 	}
-	endpoint := "https://prod." + region + ".auth.desktop.kiro.dev/refreshToken"
+	// The desktop auth service is hosted in us-east-1 regardless of the
+	// account's IDC/API region (same contract used by the Kiro IDE and 9router).
+	endpoint := "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(payload)))
 	if err != nil {
 		return nil, err

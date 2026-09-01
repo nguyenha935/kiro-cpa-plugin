@@ -3333,7 +3333,7 @@ func (e *KiroExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
 		if !awsRegionPattern.MatchString(region) {
 			return nil, statusErr{code: http.StatusBadRequest, msg: "kiro executor: invalid social region"}
 		}
-		endpoint := "https://prod." + region + ".auth.desktop.kiro.dev/refreshToken"
+		endpoint := "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken"
 		payload, marshalErr := json.Marshal(map[string]string{"refreshToken": refreshToken})
 		if marshalErr != nil {
 			return nil, marshalErr
