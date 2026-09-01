@@ -640,6 +640,35 @@ func TestAuthDataPreservesHostOwnedSettings(t *testing.T) {
 	}
 }
 
+func TestBuildCoreAuthMergesHostExecutorSettings(t *testing.T) {
+	req := pluginapi.ExecutorRequest{
+		AuthID:      "kiro-api_key-test.json",
+		StorageJSON: []byte(`{"type":"kiro","authMethod":"api_key","accessToken":"key","region":"us-east-1"}`),
+		AuthMetadata: map[string]any{
+			"disable_cooling": true,
+			"priority":        float64(7),
+			"model-aliases":   []any{map[string]any{"name": "claude-opus-5", "alias": "opus"}},
+		},
+		AuthAttributes: map[string]string{"path": "/root/.cli-proxy-api/kiro-api_key-test.json"},
+	}
+	auth, err := buildCoreAuth(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := auth.Metadata["disable_cooling"].(bool); !ok || !got {
+		t.Fatalf("disable_cooling was not merged: %#v", auth.Metadata["disable_cooling"])
+	}
+	if got := auth.Metadata["priority"]; got != 7 {
+		t.Fatalf("priority was not merged: %#v", got)
+	}
+	if len(auth.Metadata["model-aliases"].([]any)) != 1 {
+		t.Fatalf("model aliases were not preserved: %#v", auth.Metadata["model-aliases"])
+	}
+	if kind, value := auth.AccountInfo(); kind != "api_key" || value != "key" {
+		t.Fatalf("AccountInfo() = %q, %q", kind, value)
+	}
+}
+
 func TestKiroAuthStoragePreservesCredentialSchemaOnRefresh(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "kiro-api_key-test.json")

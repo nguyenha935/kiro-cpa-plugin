@@ -1364,6 +1364,11 @@ func buildCoreAuth(req pluginapi.ExecutorRequest) (*coreauth.Auth, error) {
 	if err != nil {
 		return nil, err
 	}
+	// CPA sends mutable management settings separately from the provider-owned
+	// credential JSON on every executor call. Merge them before constructing the
+	// core Auth so routing/cooldown/alias settings selected in the panel are not
+	// silently lost during execution.
+	applyHostOwnedSettings(token, req.AuthMetadata, req.AuthAttributes)
 	metadata := authMetadata(token)
 	if token.TokenEndpoint != "" {
 		metadata["token_endpoint"] = token.TokenEndpoint
