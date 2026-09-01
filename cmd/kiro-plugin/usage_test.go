@@ -180,6 +180,29 @@ func TestRefreshExternalIDPSendsConfidentialClientSecret(t *testing.T) {
 	}
 }
 
+func TestRefreshImportedDesktopCredentialUsesKiroAuthService(t *testing.T) {
+	originalRefresher := desktopTokenRefresher
+	desktopTokenRefresher = func(_ context.Context, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
+		if refreshToken != "aorAAAAAG-imported" || region != "us-east-1" {
+			t.Fatalf("desktop refresh input = %q/%q", refreshToken, region)
+		}
+		return &kiroauth.KiroTokenData{AccessToken: "new-access", RefreshToken: refreshToken, ExpiresAt: time.Now().UTC().Add(time.Hour).Format(time.RFC3339)}, nil
+	}
+	t.Cleanup(func() { desktopTokenRefresher = originalRefresher })
+
+	token := &kiroauth.KiroTokenData{
+		AccessToken: "old-access", RefreshToken: "aorAAAAAG-imported", AuthMethod: "imported",
+		Provider: "CLIProxyAPI", Region: "us-east-1", ProfileArn: "profile",
+	}
+	refreshed, err := refreshKiroCredential(context.Background(), token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.AccessToken != "new-access" || refreshed.AuthMethod != "imported" || refreshed.ProfileArn != "profile" {
+		t.Fatalf("refreshed imported credential = %+v", refreshed)
+	}
+}
+
 func TestMergeRefreshedTokenPreservesHostMetadata(t *testing.T) {
 	original := []byte(`{"type":"kiro","priority":4,"disabled":true,"note":"keep","accessToken":"old","custom":{"value":1}}`)
 	refreshed := &kiroauth.KiroTokenData{

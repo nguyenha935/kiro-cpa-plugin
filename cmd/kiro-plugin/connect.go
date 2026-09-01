@@ -30,6 +30,7 @@ var supportedAuthMethods = map[string]struct{}{
 }
 
 var externalIDPModelCatalog = listAvailableModels
+var desktopTokenRefresher = refreshDesktopToken
 
 func cleanupLoginFlowsLocked(now time.Time) {
 	for state, flow := range loginFlows {
@@ -246,8 +247,8 @@ func importRefreshToken(ctx context.Context, values url.Values) (*kiroauth.KiroT
 	if method == "" {
 		method = "builder-id"
 	}
-	if refreshToken == "" || clientID == "" || clientSecret == "" {
-		return nil, errors.New("refresh token, client ID, and client secret are required")
+	if refreshToken == "" {
+		return nil, errors.New("refresh token is required")
 	}
 	if region == "" {
 		region = "us-east-1"
@@ -262,6 +263,25 @@ func importRefreshToken(ctx context.Context, values url.Values) (*kiroauth.KiroT
 	} else if method != "builder-id" {
 		return nil, errors.New("refresh auth method must be builder-id or idc")
 	}
+	// Kiro desktop refresh tokens (used by 9router and the Kiro IDE) are not
+	// AWS SSO OIDC tokens and do not have a client registration. They must be
+	// exchanged at the Kiro auth service directly.
+	if clientID == "" || clientSecret == "" {
+		if !strings.HasPrefix(refreshToken, "aorAAAAAG") {
+			return nil, errors.New("client ID and client secret are required for AWS refresh tokens")
+		}
+		token, err := desktopTokenRefresher(ctx, refreshToken, region)
+		if err != nil {
+			return nil, err
+		}
+		token.AuthMethod, token.Provider, token.Region = "imported", "CLIProxyAPI", region
+		if strings.TrimSpace(token.ProfileArn) == "" {
+			if err := reconcileProfile(ctx, token); err != nil {
+				return nil, fmt.Errorf("discover Kiro profile after refresh-token import: %w", err)
+			}
+		}
+		return token, nil
+	}
 	token, err := kiroauth.NewSSOOIDCClient(pluginConfig).RefreshTokenWithRegion(ctx, clientID, clientSecret, refreshToken, region, startURL)
 	if err != nil {
 		return nil, err
@@ -275,6 +295,56 @@ func importRefreshToken(ctx context.Context, values url.Values) (*kiroauth.KiroT
 		}
 	}
 	return token, nil
+}
+
+func refreshDesktopToken(ctx context.Context, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
+	payload, err := json.Marshal(map[string]string{"refreshToken": refreshToken})
+	if err != nil {
+		return nil, err
+	}
+	endpoint := "https://prod." + region + ".auth.desktop.kiro.dev/refreshToken"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(payload)))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		return nil, pluginStatusError{status: http.StatusBadGateway, message: "refresh Kiro desktop token: " + err.Error()}
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, pluginStatusError{status: http.StatusBadGateway, message: "read Kiro desktop refresh response"}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		status := resp.StatusCode
+		if status == http.StatusBadRequest || status == http.StatusForbidden {
+			status = http.StatusUnauthorized
+		}
+		return nil, pluginStatusError{status: status, message: fmt.Sprintf("Kiro desktop refresh returned HTTP %d", resp.StatusCode)}
+	}
+	var result struct {
+		AccessToken  string `json:"accessToken"`
+		RefreshToken string `json:"refreshToken"`
+		ProfileArn   string `json:"profileArn"`
+		ExpiresIn    int    `json:"expiresIn"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil || strings.TrimSpace(result.AccessToken) == "" {
+		return nil, pluginStatusError{status: http.StatusBadGateway, message: "Kiro desktop refresh returned invalid token"}
+	}
+	if result.RefreshToken == "" {
+		result.RefreshToken = refreshToken
+	}
+	if result.ExpiresIn <= 0 {
+		result.ExpiresIn = 3600
+	}
+	return &kiroauth.KiroTokenData{
+		AccessToken: result.AccessToken, RefreshToken: result.RefreshToken, ProfileArn: result.ProfileArn,
+		ExpiresAt: time.Now().UTC().Add(time.Duration(result.ExpiresIn) * time.Second).Format(time.RFC3339),
+		Region:    region,
+	}, nil
 }
 
 type externalIDPJSON struct {

@@ -204,6 +204,17 @@ func refreshKiroCredential(ctx context.Context, token *kiroauth.KiroTokenData) (
 	if token != nil && strings.EqualFold(token.AuthMethod, "social") {
 		return refreshSocialCredential(ctx, token)
 	}
+	if isDesktopImportedCredential(token) {
+		refreshed, err := desktopTokenRefresher(ctx, token.RefreshToken, token.Region)
+		if err != nil {
+			return nil, err
+		}
+		refreshed.AuthMethod, refreshed.Provider = "imported", token.Provider
+		if refreshed.ProfileArn == "" {
+			refreshed.ProfileArn = token.ProfileArn
+		}
+		return refreshed, nil
+	}
 	if token != nil && strings.EqualFold(token.AuthMethod, "api_key") {
 		return token, nil
 	}
@@ -254,6 +265,12 @@ func refreshKiroCredential(ctx context.Context, token *kiroauth.KiroTokenData) (
 		}
 	}
 	return refreshed, nil
+}
+
+func isDesktopImportedCredential(token *kiroauth.KiroTokenData) bool {
+	return token != nil && strings.EqualFold(strings.TrimSpace(token.AuthMethod), "imported") &&
+		strings.TrimSpace(token.RefreshToken) != "" && strings.TrimSpace(token.ClientID) == "" &&
+		strings.TrimSpace(token.ClientSecret) == ""
 }
 
 func refreshSocialCredential(ctx context.Context, token *kiroauth.KiroTokenData) (*kiroauth.KiroTokenData, error) {
