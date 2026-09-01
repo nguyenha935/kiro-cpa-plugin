@@ -26,3 +26,11 @@ func TestBuildKiroPayloadUsesClaudeEffortContract(t *testing.T) {
 		t.Fatalf("system prompt contains a legacy control tag: %s", payload)
 	}
 }
+
+func TestBuildKiroPayloadClampsSmallMaxTokens(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"Reply briefly"}],"max_tokens":64}`)
+	payload, _ := BuildKiroPayload(body, "claude-opus-5", "profile", "AI_EDITOR", modelcapabilities.Capability{}, "")
+	if got := gjson.GetBytes(payload, "additionalModelRequestFields.max_tokens").Int(); got != modelcapabilities.DefaultMinimumOutputTokens {
+		t.Fatalf("max_tokens = %d, want %d", got, modelcapabilities.DefaultMinimumOutputTokens)
+	}
+}

@@ -585,12 +585,37 @@ func buildKiroPayloadForFormat(body []byte, modelID, profileArn, origin string, 
 	case "kiro":
 		// Body is already in Kiro format — pass through directly
 		log.Debugf("kiro: body already in Kiro format, passing through directly")
-		return body, false
+		return normalizeKiroPayloadMaxTokens(body, capability), false
 	default:
 		// Default to Claude format
 		log.Debugf("kiro: using Claude payload builder for source format: %s", sourceFormat.String())
 		return kiroclaude.BuildKiroPayload(body, modelID, profileArn, origin, capability, effort)
 	}
+}
+
+func normalizeKiroPayloadMaxTokens(payload []byte, capability modelcapabilities.Capability) []byte {
+	var root map[string]any
+	if json.Unmarshal(payload, &root) != nil {
+		return payload
+	}
+	fields, ok := root["additionalModelRequestFields"].(map[string]any)
+	if !ok {
+		return payload
+	}
+	value, ok := fields["max_tokens"].(float64)
+	if !ok || value <= 0 {
+		return payload
+	}
+	normalized := capability.NormalizeMaxTokens(int64(value))
+	if int64(value) == normalized {
+		return payload
+	}
+	fields["max_tokens"] = normalized
+	updated, err := json.Marshal(root)
+	if err != nil {
+		return payload
+	}
+	return updated
 }
 
 func prepareModelCapability(auth *cliproxyauth.Auth, modelID string, opts *cliproxyexecutor.Options) error {
@@ -605,6 +630,13 @@ func prepareModelCapability(auth *cliproxyauth.Auth, modelID string, opts *clipr
 	effort, _ := opts.Metadata[cliproxyexecutor.ReasoningEffortMetadataKey].(string)
 	effort = strings.ToLower(strings.TrimSpace(effort))
 	capability, ok := modelcapabilities.ForAuth(authID, modelID)
+	// CPA represents Anthropic thinking.type=disabled as effort "none". Claude
+	// Kiro schemas often omit "none" entirely; in that case disabled means omit
+	// the reasoning field, not reject the request.
+	if effort == "none" && ok && !capability.SupportsEffort(effort) {
+		effort = ""
+		delete(opts.Metadata, cliproxyexecutor.ReasoningEffortMetadataKey)
+	}
 	if !ok && effort != "" {
 		return requestValidationErr{msg: fmt.Sprintf("Kiro capabilities are unavailable for model %q and the selected account", modelID)}
 	}
@@ -614,12 +646,9 @@ func prepareModelCapability(auth *cliproxyauth.Auth, modelID string, opts *clipr
 	if effort != "" {
 		opts.Metadata[cliproxyexecutor.ReasoningEffortMetadataKey] = effort
 	}
-	// The control-plane schema describes model capabilities, but CPA clients are
-	// allowed to choose their own output budget. 9router passes max_tokens
-	// through without applying the schema's minimum (which is metadata for the
-	// Kiro IDE, not a transport invariant). Keep the value for payload building;
-	// let Kiro return a real upstream validation error if a particular model
-	// rejects it instead of inventing a plugin-only error.
+	// Output budgets are normalized while building the final Kiro payload. This
+	// keeps every input protocol on the same transport contract without changing
+	// the client-visible request.
 	return nil
 }
 

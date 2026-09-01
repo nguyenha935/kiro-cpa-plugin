@@ -25,6 +25,32 @@ type Capability struct {
 	MaximumOutputTokens int64      `json:"maximum_output_tokens,omitempty"`
 }
 
+// DefaultMinimumOutputTokens is enforced by the Kiro transport.  Kiro
+// rejects additionalModelRequestFields.max_tokens values below 1024 with
+// REQUEST_BODY_INVALID, even when the client-facing schema is unavailable.
+const DefaultMinimumOutputTokens int64 = 1024
+
+// NormalizeMaxTokens returns a transport-safe output budget. A zero/negative
+// value means the caller did not request a budget and is left unset. Kiro's
+// minimum is applied for every model; discovered schemas may additionally
+// provide a stricter minimum or maximum.
+func (c Capability) NormalizeMaxTokens(value int64) int64 {
+	if value <= 0 {
+		return 0
+	}
+	minimum := c.MinimumOutputTokens
+	if minimum < DefaultMinimumOutputTokens {
+		minimum = DefaultMinimumOutputTokens
+	}
+	if value < minimum {
+		value = minimum
+	}
+	if c.MaximumOutputTokens > 0 && value > c.MaximumOutputTokens {
+		value = c.MaximumOutputTokens
+	}
+	return value
+}
+
 func (c Capability) SupportsEffort(effort string) bool {
 	effort = strings.ToLower(strings.TrimSpace(effort))
 	if effort == "" {
@@ -48,13 +74,13 @@ func (c Capability) AdditionalFields(effort string) map[string]any {
 
 func (c Capability) AdditionalFieldsForRequest(effort string, maxTokens int64) map[string]any {
 	fields := c.AdditionalFields(effort)
-	if !c.SupportsMaxTokens || maxTokens <= 0 {
+	if maxTokens <= 0 {
 		return fields
 	}
 	if fields == nil {
 		fields = make(map[string]any)
 	}
-	fields["max_tokens"] = maxTokens
+	fields["max_tokens"] = c.NormalizeMaxTokens(maxTokens)
 	return fields
 }
 

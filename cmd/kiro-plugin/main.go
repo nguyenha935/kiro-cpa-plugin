@@ -53,6 +53,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -258,14 +259,79 @@ func configurePlugin(raw []byte) {
 	clearUsageCache()
 	var req lifecycleRequest
 	if json.Unmarshal(raw, &req) != nil || len(req.ConfigYAML) == 0 {
+		kiroauth.ConfigureGlobalRateLimiter(pluginSettings.rateLimiterConfig())
 		return
 	}
-	next := defaultPluginSettings()
-	if yaml.Unmarshal(req.ConfigYAML, &next) != nil {
-		return
+	// CPA may send either the plugin subsection or the complete config.yaml.
+	// Merge only keys that are actually present; rebuilding from defaults here
+	// used to erase settings whenever a lifecycle reconfigure omitted them.
+	next := pluginSettings
+	if next.isZero() {
+		next = defaultPluginSettings()
+	}
+	var direct pluginSettingsData
+	if yaml.Unmarshal(req.ConfigYAML, &direct) == nil && !direct.isZero() {
+		next = mergePluginSettings(next, direct)
+	} else {
+		var full struct {
+			Plugins struct {
+				Configs map[string]pluginSettingsData `yaml:"configs"`
+			} `yaml:"plugins"`
+		}
+		if yaml.Unmarshal(req.ConfigYAML, &full) == nil {
+			if configured, ok := full.Plugins.Configs[providerName]; ok && !configured.isZero() {
+				next = mergePluginSettings(next, configured)
+			}
+		}
+		var root map[string]any
+		if yaml.Unmarshal(req.ConfigYAML, &root) == nil {
+			if nested, ok := findKiroConfig(root); ok {
+				var configured pluginSettingsData
+				if encoded, err := yaml.Marshal(nested); err == nil && yaml.Unmarshal(encoded, &configured) == nil && !configured.isZero() {
+					next = mergePluginSettings(next, configured)
+				}
+			}
+		}
 	}
 	pluginSettings = next.normalized()
 	kiroauth.ConfigureGlobalRateLimiter(pluginSettings.rateLimiterConfig())
+}
+
+func mergePluginSettings(base, update pluginSettingsData) pluginSettingsData {
+	if update.DailyMaxRequests != 0 {
+		base.DailyMaxRequests = update.DailyMaxRequests
+	}
+	if update.MinTokenInterval != "" {
+		base.MinTokenInterval = update.MinTokenInterval
+	}
+	if update.MaxTokenInterval != "" {
+		base.MaxTokenInterval = update.MaxTokenInterval
+	}
+	if update.SuspendCooldown != "" {
+		base.SuspendCooldown = update.SuspendCooldown
+	}
+	return base
+}
+
+func findKiroConfig(value any) (map[string]any, bool) {
+	if object, ok := value.(map[string]any); ok {
+		if kiro, ok := object["kiro"].(map[string]any); ok {
+			return kiro, true
+		}
+		for _, child := range object {
+			if found, ok := findKiroConfig(child); ok {
+				return found, true
+			}
+		}
+	}
+	if list, ok := value.([]any); ok {
+		for _, child := range list {
+			if found, ok := findKiroConfig(child); ok {
+				return found, true
+			}
+		}
+	}
+	return nil, false
 }
 
 func handleLoginStart(raw []byte) ([]byte, error) {
@@ -444,6 +510,26 @@ func decodeKiroCredential(raw []byte) (*kiroauth.KiroTokenData, error) {
 	decodeFallback("scopes", &token.Scopes)
 	decodeFallback("region", &token.Region)
 	decodeFallback("email", &token.Email)
+	decodeFallback("preferred_endpoint", &token.PreferredEndpoint)
+	decodeFallback("preferred-endpoint", &token.PreferredEndpoint)
+	if value, ok := shape["priority"]; ok {
+		_ = json.Unmarshal(value, &token.Priority)
+	}
+	if value, ok := shape["weight"]; ok {
+		_ = json.Unmarshal(value, &token.Weight)
+	}
+	if value, ok := shape["disabled"]; ok {
+		_ = json.Unmarshal(value, &token.Disabled)
+	}
+	if value, ok := shape["disable_cooling"]; ok {
+		_ = json.Unmarshal(value, &token.DisableCooling)
+	}
+	if value, ok := shape["disable-cooling"]; ok {
+		_ = json.Unmarshal(value, &token.DisableCooling)
+	}
+	if value, ok := shape["request_retry"]; ok {
+		_ = json.Unmarshal(value, &token.RequestRetry)
+	}
 	if token.AuthMethod == "" {
 		var authKind string
 		decodeFallback("auth_kind", &authKind)
@@ -555,6 +641,7 @@ func authData(token *kiroauth.KiroTokenData, fileName string) pluginapi.AuthData
 		StorageJSON:      storage,
 		Metadata:         authMetadata(token),
 		Attributes:       authAttributes(token),
+		Disabled:         token.Disabled,
 		NextRefreshAfter: nextRefreshAfter(token, expiresAt),
 	}
 }
@@ -564,16 +651,22 @@ func kiroFileName(token *kiroauth.KiroTokenData) string {
 	if method == "" {
 		method = "imported"
 	}
-	id := sanitize(token.Email)
+	id := ""
+	// API-key identities must always derive from the secret hash. The persisted
+	// display email is intentionally synthetic and would otherwise change the
+	// auth filename after the first restart.
+	if isAPIKeyCredential(token) && token.AccessToken != "" {
+		hash := sha256.Sum256([]byte(token.AccessToken))
+		id = hex.EncodeToString(hash[:])
+	}
+	if id == "" {
+		id = sanitize(token.Email)
+	}
 	if id == "" {
 		id = sanitize(token.ClientIDHash)
 	}
 	if id == "" && token.ClientID != "" {
 		hash := sha256.Sum256([]byte(token.ClientID))
-		id = hex.EncodeToString(hash[:])
-	}
-	if id == "" && isAPIKeyCredential(token) && token.AccessToken != "" {
-		hash := sha256.Sum256([]byte(token.AccessToken))
 		id = hex.EncodeToString(hash[:])
 	}
 	if len(id) > 12 {
@@ -596,6 +689,10 @@ func stableAuthID(token *kiroauth.KiroTokenData) string {
 	if method == "" {
 		method = "imported"
 	}
+	if isAPIKeyCredential(token) && token.AccessToken != "" {
+		hash := sha256.Sum256([]byte(token.AccessToken))
+		return "kiro:apikey:" + hex.EncodeToString(hash[:6])
+	}
 	if token.Email != "" {
 		return "kiro-" + method + "-" + sanitize(token.Email)
 	}
@@ -604,10 +701,6 @@ func stableAuthID(token *kiroauth.KiroTokenData) string {
 	}
 	if token.ProfileArn != "" {
 		return "kiro-" + method + "-" + sanitize(token.ProfileArn)
-	}
-	if isAPIKeyCredential(token) && token.AccessToken != "" {
-		hash := sha256.Sum256([]byte(token.AccessToken))
-		return "kiro:apikey:" + hex.EncodeToString(hash[:6])
 	}
 	return "kiro-" + method
 }
@@ -643,6 +736,21 @@ func authMetadata(token *kiroauth.KiroTokenData) map[string]any {
 	if token.Scopes != "" {
 		metadata["scopes"] = token.Scopes
 	}
+	if token.PreferredEndpoint != "" {
+		metadata["preferred_endpoint"] = token.PreferredEndpoint
+	}
+	if token.Priority != 0 {
+		metadata["priority"] = token.Priority
+	}
+	if token.Weight != 0 {
+		metadata["weight"] = token.Weight
+	}
+	if token.Disabled {
+		metadata["disabled"] = true
+	}
+	if token.DisableCooling {
+		metadata["disable_cooling"] = true
+	}
 	return metadata
 }
 
@@ -662,6 +770,15 @@ func authAttributes(token *kiroauth.KiroTokenData) map[string]string {
 	}
 	if token.ProfileArn != "" {
 		attrs["profile_arn"] = token.ProfileArn
+	}
+	if token.PreferredEndpoint != "" {
+		attrs["preferred_endpoint"] = token.PreferredEndpoint
+	}
+	if token.Priority != 0 {
+		attrs["priority"] = strconv.Itoa(token.Priority)
+	}
+	if token.Weight != 0 {
+		attrs[coreauth.AttributeWeight] = strconv.Itoa(token.Weight)
 	}
 	return attrs
 }
@@ -760,6 +877,7 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	applyHostOwnedSettings(token, req.Metadata, req.Attributes)
 	lock := credentialUsageLock(token, req.AuthID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -787,6 +905,7 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	applyHostOwnedSettings(token, req.Metadata, req.Attributes)
 	ctx := context.Background()
 	// CPA's generic file synthesizer applies OAuth defaults after plugin parsing.
 	// Returning AuthUpdate during model discovery restores the API-key kind and
@@ -844,6 +963,60 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 		response.AuthUpdate = authData(token, fileName)
 	}
 	return okEnvelope(response)
+}
+
+func applyHostOwnedSettings(token *kiroauth.KiroTokenData, metadata map[string]any, attrs map[string]string) {
+	if token == nil {
+		return
+	}
+	if metadata != nil {
+		if value, ok := metadata["preferred_endpoint"].(string); ok && strings.TrimSpace(value) != "" {
+			token.PreferredEndpoint = strings.TrimSpace(value)
+		}
+		if value, ok := metadata["priority"]; ok {
+			token.Priority = intValue(value, token.Priority)
+		}
+		if value, ok := metadata["weight"]; ok {
+			token.Weight = intValue(value, token.Weight)
+		}
+		if value, ok := metadata["disabled"].(bool); ok {
+			token.Disabled = value
+		}
+		if value, ok := metadata["disable_cooling"].(bool); ok {
+			token.DisableCooling = value
+		}
+	}
+	if attrs == nil {
+		return
+	}
+	if value := strings.TrimSpace(attrs["preferred_endpoint"]); value != "" {
+		token.PreferredEndpoint = value
+	}
+	if value := strings.TrimSpace(attrs["preferred-endpoint"]); value != "" {
+		token.PreferredEndpoint = value
+	}
+	if value := strings.TrimSpace(attrs["priority"]); value != "" {
+		token.Priority = intValue(value, token.Priority)
+	}
+	if value := strings.TrimSpace(attrs["weight"]); value != "" {
+		token.Weight = intValue(value, token.Weight)
+	}
+}
+
+func intValue(value any, fallback int) int {
+	switch v := value.(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	case string:
+		if parsed, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			return parsed
+		}
+	}
+	return fallback
 }
 
 func isKiroAuthorizationError(err error) bool {

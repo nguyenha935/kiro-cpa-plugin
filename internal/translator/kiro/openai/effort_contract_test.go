@@ -22,3 +22,11 @@ func TestBuildKiroPayloadUsesGPTEffortContract(t *testing.T) {
 		t.Fatalf("effort = %q; payload=%s", got, payload)
 	}
 }
+
+func TestBuildKiroPayloadClampsSmallCompletionTokens(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"Reply briefly"}],"max_completion_tokens":64}`)
+	payload, _ := BuildKiroPayloadFromOpenAI(body, "claude-opus-5", "profile", "AI_EDITOR", modelcapabilities.Capability{}, "")
+	if got := gjson.GetBytes(payload, "additionalModelRequestFields.max_tokens").Int(); got != modelcapabilities.DefaultMinimumOutputTokens {
+		t.Fatalf("max_tokens = %d, want %d", got, modelcapabilities.DefaultMinimumOutputTokens)
+	}
+}
