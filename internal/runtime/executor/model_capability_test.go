@@ -24,7 +24,7 @@ func TestMapModelToKiroNeverSubstitutesAnotherModel(t *testing.T) {
 	}
 }
 
-func TestPrepareModelCapabilityRejectsOutOfRangeMaxTokens(t *testing.T) {
+func TestPrepareModelCapabilityAllowsClientMaxTokens(t *testing.T) {
 	auth := &cliproxyauth.Auth{ID: "auth-max-tokens-test"}
 	modelcapabilities.ReplaceForAuth(auth.ID, []modelcapabilities.Capability{{
 		ModelID: "claude-opus-5", SupportsMaxTokens: true,
@@ -34,8 +34,8 @@ func TestPrepareModelCapabilityRejectsOutOfRangeMaxTokens(t *testing.T) {
 		SourceFormat:    sdktranslator.FromString("openai-response"),
 		OriginalRequest: []byte(`{"max_output_tokens":512}`),
 	}
-	if err := prepareModelCapability(auth, "claude-opus-5", &opts); err == nil {
-		t.Fatal("expected an out-of-range max_output_tokens error")
+	if err := prepareModelCapability(auth, "claude-opus-5", &opts); err != nil {
+		t.Fatalf("client max_output_tokens was rejected by plugin: %v", err)
 	}
 }
 
