@@ -153,8 +153,10 @@ func summarizeErrorBody(contentType string, body []byte) string {
 		}
 		return "[html body omitted]"
 	}
-	if message := strings.TrimSpace(gjson.GetBytes(trimmed, "error.message").String()); message != "" {
-		return message
+	for _, path := range []string{"error.message", "message", "reason", "code"} {
+		if message := strings.TrimSpace(gjson.GetBytes(trimmed, path).String()); message != "" {
+			return truncateUTF8(message, 512)
+		}
 	}
-	return string(trimmed)
+	return truncateUTF8(strings.Join(strings.Fields(string(trimmed)), " "), 512)
 }

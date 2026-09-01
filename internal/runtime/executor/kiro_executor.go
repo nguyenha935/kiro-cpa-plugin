@@ -929,7 +929,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				log.Warnf("kiro: rate limit hit (429), token %s set to cooldown for %v", tokenKey, cooldownDuration)
 
 				// Preserve last 429 so callers can correctly backoff when all endpoints are exhausted
-				last429Err = statusErr{code: httpResp.StatusCode, msg: string(respBody)}
+				last429Err = statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody), retryAfter: &cooldownDuration}
 
 				log.Warnf("kiro: %s endpoint quota exhausted (429), returning credential cooldown to CPA, body: %s",
 					endpointConfig.Name, summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
@@ -962,7 +962,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 					continue
 				}
 				log.Errorf("kiro: server error %d after %d retries", httpResp.StatusCode, maxRetries)
-				lastEndpointErr = statusErr{code: httpResp.StatusCode, msg: string(respBody)}
+				lastEndpointErr = statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 				break
 			}
 
@@ -977,7 +977,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 						continue
 					}
 				}
-				return resp, statusErr{code: http.StatusBadRequest, msg: string(respBody)}
+				return resp, statusErr{code: http.StatusBadRequest, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 			}
 
 			// Handle 401 errors with token refresh and retry
@@ -988,14 +988,14 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				appendAPIResponseChunk(ctx, e.cfg, respBody)
 				if isAPIKeyAuth(auth) {
 					log.Warnf("kiro: API key rejected with HTTP 401; returning without OAuth refresh")
-					return resp, statusErr{code: http.StatusUnauthorized, msg: string(respBody)}
+					return resp, statusErr{code: http.StatusUnauthorized, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 				}
 
 				log.Warnf("kiro: received 401 error, attempting token refresh")
 				refreshedAuth, refreshErr := e.Refresh(ctx, auth)
 				if refreshErr != nil {
 					log.Errorf("kiro: token refresh failed: %v", refreshErr)
-					return resp, statusErr{code: httpResp.StatusCode, msg: string(respBody)}
+					return resp, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 				}
 
 				if refreshedAuth != nil {
@@ -1016,7 +1016,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				}
 
 				log.Warnf("kiro request error, status: 401, body: %s", summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
-				return resp, statusErr{code: httpResp.StatusCode, msg: string(respBody)}
+				return resp, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 			}
 
 			// Handle 402 errors - Monthly Limit Reached. CPA needs a 429 to
@@ -1026,12 +1026,12 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				_ = httpResp.Body.Close()
 				appendAPIResponseChunk(ctx, e.cfg, respBody)
 
-				log.Warnf("kiro: received 402 (monthly limit). Upstream body: %s", string(respBody))
+				log.Warnf("kiro: received 402 (monthly limit). Upstream body: %s", summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
 
 				// Return upstream error body directly
 				remaining := kiroauth.CalculateCooldownUntilNextDay()
 				cooldownMgr.SetCooldown(tokenKey, remaining, kiroauth.CooldownReasonQuotaExhausted)
-				return resp, statusErr{code: http.StatusTooManyRequests, msg: string(respBody), retryAfter: &remaining}
+				return resp, statusErr{code: http.StatusTooManyRequests, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody), retryAfter: &remaining}
 			}
 
 			// Handle 403 errors - Access Denied / Token Expired
@@ -1052,7 +1052,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 					rateLimiter.CheckAndMarkSuspended(tokenKey, respBodyStr)
 					cooldownMgr.SetCooldown(tokenKey, kiroauth.LongCooldown, kiroauth.CooldownReasonSuspended)
 					log.Errorf("kiro: account is suspended, token %s set to cooldown for %v", tokenKey, kiroauth.LongCooldown)
-					return resp, statusErr{code: httpResp.StatusCode, msg: "account suspended: " + string(respBody)}
+					return resp, statusErr{code: httpResp.StatusCode, msg: "account suspended: " + summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 				}
 
 				// API keys are long-lived and cannot be refreshed. In particular, do not
@@ -1060,7 +1060,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				// error that used to hide the real upstream response.
 				if isAPIKeyAuth(auth) {
 					log.Warnf("kiro: API key rejected with HTTP 403; returning without OAuth refresh")
-					return resp, statusErr{code: http.StatusForbidden, msg: string(respBody)}
+					return resp, statusErr{code: http.StatusForbidden, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 				}
 
 				// Check if this looks like a token-related 403 (some APIs return 403 for expired tokens)
@@ -1075,7 +1075,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 					if refreshErr != nil {
 						log.Errorf("kiro: token refresh failed: %v", refreshErr)
 						// Token refresh failed - return error immediately
-						return resp, statusErr{code: httpResp.StatusCode, msg: string(respBody)}
+						return resp, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 					}
 					if refreshedAuth != nil {
 						auth = refreshedAuth
@@ -1094,7 +1094,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				// For non-token 403 or after max retries, return error immediately
 				// Do NOT switch endpoints for 403 errors
 				log.Warnf("kiro: 403 error, returning immediately (no endpoint switch)")
-				return resp, statusErr{code: httpResp.StatusCode, msg: string(respBody)}
+				return resp, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 			}
 
 			if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
@@ -1346,7 +1346,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 				log.Warnf("kiro: stream rate limit hit (429), token %s set to cooldown for %v", tokenKey, cooldownDuration)
 
 				// Preserve last 429 so callers can correctly backoff when all endpoints are exhausted
-				last429Err = statusErr{code: httpResp.StatusCode, msg: string(respBody)}
+				last429Err = statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody), retryAfter: &cooldownDuration}
 
 				log.Warnf("kiro: stream %s endpoint quota exhausted (429), returning credential cooldown to CPA, body: %s",
 					endpointConfig.Name, summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
@@ -1379,7 +1379,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 					continue
 				}
 				log.Errorf("kiro: stream server error %d after %d retries", httpResp.StatusCode, maxRetries)
-				lastEndpointErr = statusErr{code: httpResp.StatusCode, msg: string(respBody)}
+				lastEndpointErr = statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 				break
 			}
 
@@ -1400,7 +1400,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 					}
 				}
 				// Other 400 errors indicate request validation issues.
-				return nil, statusErr{code: httpResp.StatusCode, msg: string(respBody)}
+				return nil, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 			}
 
 			// Handle 401 errors with token refresh and retry
@@ -1411,14 +1411,14 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 				appendAPIResponseChunk(ctx, e.cfg, respBody)
 				if isAPIKeyAuth(auth) {
 					log.Warnf("kiro: stream API key rejected with HTTP 401; returning without OAuth refresh")
-					return nil, statusErr{code: http.StatusUnauthorized, msg: string(respBody)}
+					return nil, statusErr{code: http.StatusUnauthorized, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 				}
 
 				log.Warnf("kiro: stream received 401 error, attempting token refresh")
 				refreshedAuth, refreshErr := e.Refresh(ctx, auth)
 				if refreshErr != nil {
 					log.Errorf("kiro: token refresh failed: %v", refreshErr)
-					return nil, statusErr{code: httpResp.StatusCode, msg: string(respBody)}
+					return nil, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 				}
 
 				if refreshedAuth != nil {
@@ -1438,8 +1438,8 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 					log.Infof("kiro: token refreshed successfully, no retries remaining")
 				}
 
-				log.Warnf("kiro stream error, status: 401, body: %s", string(respBody))
-				return nil, statusErr{code: httpResp.StatusCode, msg: string(respBody)}
+				log.Warnf("kiro stream error, status: 401, body: %s", summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
+				return nil, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 			}
 
 			// Handle 402 errors - Monthly Limit Reached.
@@ -1448,12 +1448,12 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 				_ = httpResp.Body.Close()
 				appendAPIResponseChunk(ctx, e.cfg, respBody)
 
-				log.Warnf("kiro: stream received 402 (monthly limit). Upstream body: %s", string(respBody))
+				log.Warnf("kiro: stream received 402 (monthly limit). Upstream body: %s", summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
 
 				// Return upstream error body directly
 				remaining := kiroauth.CalculateCooldownUntilNextDay()
 				cooldownMgr.SetCooldown(tokenKey, remaining, kiroauth.CooldownReasonQuotaExhausted)
-				return nil, statusErr{code: http.StatusTooManyRequests, msg: string(respBody), retryAfter: &remaining}
+				return nil, statusErr{code: http.StatusTooManyRequests, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody), retryAfter: &remaining}
 			}
 
 			// Handle 403 errors - Access Denied / Token Expired
@@ -1464,7 +1464,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 				appendAPIResponseChunk(ctx, e.cfg, respBody)
 
 				// Log the 403 error details for debugging
-				log.Warnf("kiro: stream received 403 error (attempt %d/%d), body: %s", attempt+1, maxRetries+1, string(respBody))
+				log.Warnf("kiro: stream received 403 error (attempt %d/%d), body: %s", attempt+1, maxRetries+1, summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
 
 				respBodyStr := string(respBody)
 
@@ -1474,14 +1474,14 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 					rateLimiter.CheckAndMarkSuspended(tokenKey, respBodyStr)
 					cooldownMgr.SetCooldown(tokenKey, kiroauth.LongCooldown, kiroauth.CooldownReasonSuspended)
 					log.Errorf("kiro: stream account is suspended, token %s set to cooldown for %v", tokenKey, kiroauth.LongCooldown)
-					return nil, statusErr{code: httpResp.StatusCode, msg: "account suspended: " + string(respBody)}
+					return nil, statusErr{code: httpResp.StatusCode, msg: "account suspended: " + summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 				}
 
 				// API keys are long-lived and cannot be refreshed. Return the actual
 				// upstream rejection instead of attempting an impossible OAuth refresh.
 				if isAPIKeyAuth(auth) {
 					log.Warnf("kiro: stream API key rejected with HTTP 403; returning without OAuth refresh")
-					return nil, statusErr{code: http.StatusForbidden, msg: string(respBody)}
+					return nil, statusErr{code: http.StatusForbidden, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 				}
 
 				// Check if this looks like a token-related 403 (some APIs return 403 for expired tokens)
@@ -1496,7 +1496,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 					if refreshErr != nil {
 						log.Errorf("kiro: token refresh failed: %v", refreshErr)
 						// Token refresh failed - return error immediately
-						return nil, statusErr{code: httpResp.StatusCode, msg: string(respBody)}
+						return nil, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 					}
 					if refreshedAuth != nil {
 						auth = refreshedAuth
@@ -1515,7 +1515,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 				// For non-token 403 or after max retries, return error immediately
 				// Do NOT switch endpoints for 403 errors
 				log.Warnf("kiro: 403 error, returning immediately (no endpoint switch)")
-				return nil, statusErr{code: httpResp.StatusCode, msg: string(respBody)}
+				return nil, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 			}
 
 			if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
