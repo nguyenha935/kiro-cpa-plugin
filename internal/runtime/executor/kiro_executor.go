@@ -726,6 +726,25 @@ func getTokenKey(auth *cliproxyauth.Auth) string {
 	return "token-" + hex.EncodeToString(hash[:6])
 }
 
+// isCoolingDisabled mirrors CPA's per-credential override. Kiro's historical
+// local limiter must not silently override the setting shown in the CPA UI.
+// Upstream errors are still returned to CPA; this only disables plugin-owned
+// waiting, counting and cooldown state.
+func isCoolingDisabled(auth *cliproxyauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if disabled, present := auth.DisableCoolingOverride(); present {
+		return disabled
+	}
+	for _, key := range []string{"disable_cooling", "disable-cooling"} {
+		if value, ok := auth.Attributes[key]; ok && strings.EqualFold(strings.TrimSpace(value), "true") {
+			return true
+		}
+	}
+	return false
+}
+
 // Execute sends the request to Kiro API and returns the response.
 // Supports automatic token refresh on 401/403 errors.
 func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
@@ -736,24 +755,29 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 
 	// Rate limiting: get token key for tracking
 	tokenKey := getTokenKey(auth)
+	coolingDisabled := isCoolingDisabled(auth)
 	rateLimiter := kiroauth.GetGlobalRateLimiter()
 	cooldownMgr := kiroauth.GetGlobalCooldownManager()
 
 	// Check if token is in cooldown period
-	if cooldownMgr.IsInCooldown(tokenKey) {
+	if !coolingDisabled && cooldownMgr.IsInCooldown(tokenKey) {
 		remaining := cooldownMgr.GetRemainingCooldown(tokenKey)
 		reason := cooldownMgr.GetCooldownReason(tokenKey)
 		log.Warnf("kiro: token %s is in cooldown (reason: %s), remaining: %v", tokenKey, reason, remaining)
 		return resp, statusErr{code: http.StatusTooManyRequests, msg: fmt.Sprintf("kiro: token is in cooldown for %v (reason: %s)", remaining, reason), retryAfter: &remaining}
 	}
-	if reason, remaining, unavailable := rateLimiter.TokenUnavailable(tokenKey); unavailable {
-		return resp, statusErr{code: http.StatusTooManyRequests, msg: fmt.Sprintf("kiro: token unavailable for %v (%s)", remaining, reason), retryAfter: &remaining}
+	if !coolingDisabled {
+		if reason, remaining, unavailable := rateLimiter.TokenUnavailable(tokenKey); unavailable {
+			return resp, statusErr{code: http.StatusTooManyRequests, msg: fmt.Sprintf("kiro: token unavailable for %v (%s)", remaining, reason), retryAfter: &remaining}
+		}
 	}
 
 	// Wait for rate limiter before proceeding
-	log.Debugf("kiro: waiting for rate limiter for token %s", tokenKey)
-	rateLimiter.WaitForToken(tokenKey)
-	log.Debugf("kiro: rate limiter cleared for token %s", tokenKey)
+	if !coolingDisabled {
+		log.Debugf("kiro: waiting for rate limiter for token %s", tokenKey)
+		rateLimiter.WaitForToken(tokenKey)
+		log.Debugf("kiro: rate limiter cleared for token %s", tokenKey)
+	}
 
 	// Check if token is expired before making the request.
 	if e.isTokenExpired(accessToken) {
@@ -819,6 +843,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 	maxRetries := 2 // Allow retries for token refresh + endpoint fallback
 	rateLimiter := kiroauth.GetGlobalRateLimiter()
 	cooldownMgr := kiroauth.GetGlobalCooldownManager()
+	coolingDisabled := isCoolingDisabled(auth)
 	endpointConfigs := getKiroEndpointConfigs(auth)
 	var last429Err error
 
@@ -921,12 +946,14 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				respBody, _ := io.ReadAll(httpResp.Body)
 				_ = httpResp.Body.Close()
 				appendAPIResponseChunk(ctx, e.cfg, respBody)
+				cooldownDuration := kiroauth.CalculateCooldownFor429(attempt)
 
 				// Record failure and set cooldown for 429
-				rateLimiter.MarkTokenFailed(tokenKey)
-				cooldownDuration := kiroauth.CalculateCooldownFor429(attempt)
-				cooldownMgr.SetCooldown(tokenKey, cooldownDuration, kiroauth.CooldownReason429)
-				log.Warnf("kiro: rate limit hit (429), token %s set to cooldown for %v", tokenKey, cooldownDuration)
+				if !coolingDisabled {
+					rateLimiter.MarkTokenFailed(tokenKey)
+					cooldownMgr.SetCooldown(tokenKey, cooldownDuration, kiroauth.CooldownReason429)
+					log.Warnf("kiro: rate limit hit (429), token %s set to cooldown for %v", tokenKey, cooldownDuration)
+				}
 
 				// Preserve last 429 so callers can correctly backoff when all endpoints are exhausted
 				last429Err = statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody), retryAfter: &cooldownDuration}
@@ -1030,7 +1057,9 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 
 				// Return upstream error body directly
 				remaining := kiroauth.CalculateCooldownUntilNextDay()
-				cooldownMgr.SetCooldown(tokenKey, remaining, kiroauth.CooldownReasonQuotaExhausted)
+				if !coolingDisabled {
+					cooldownMgr.SetCooldown(tokenKey, remaining, kiroauth.CooldownReasonQuotaExhausted)
+				}
 				return resp, statusErr{code: http.StatusTooManyRequests, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody), retryAfter: &remaining}
 			}
 
@@ -1049,9 +1078,11 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				// Check for SUSPENDED status - return immediately without retry
 				if strings.Contains(respBodyStr, "SUSPENDED") || strings.Contains(respBodyStr, "TEMPORARILY_SUSPENDED") {
 					// Set long cooldown for suspended accounts
-					rateLimiter.CheckAndMarkSuspended(tokenKey, respBodyStr)
-					cooldownMgr.SetCooldown(tokenKey, kiroauth.LongCooldown, kiroauth.CooldownReasonSuspended)
-					log.Errorf("kiro: account is suspended, token %s set to cooldown for %v", tokenKey, kiroauth.LongCooldown)
+					if !coolingDisabled {
+						rateLimiter.CheckAndMarkSuspended(tokenKey, respBodyStr)
+						cooldownMgr.SetCooldown(tokenKey, kiroauth.LongCooldown, kiroauth.CooldownReasonSuspended)
+						log.Errorf("kiro: account is suspended, token %s set to cooldown for %v", tokenKey, kiroauth.LongCooldown)
+					}
 					return resp, statusErr{code: httpResp.StatusCode, msg: "account suspended: " + summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 				}
 
@@ -1128,7 +1159,9 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 			usageInfo = completeKiroUsage(usageInfo, requestPayload, content, reasoning, toolUses)
 
 			// Record success for rate limiting
-			rateLimiter.MarkTokenSuccess(tokenKey)
+			if !coolingDisabled {
+				rateLimiter.MarkTokenSuccess(tokenKey)
+			}
 			log.Debugf("kiro: request successful, token %s marked as success", tokenKey)
 
 			// Build response in Claude format for Kiro translator
@@ -1164,24 +1197,29 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 
 	// Rate limiting: get token key for tracking
 	tokenKey := getTokenKey(auth)
+	coolingDisabled := isCoolingDisabled(auth)
 	rateLimiter := kiroauth.GetGlobalRateLimiter()
 	cooldownMgr := kiroauth.GetGlobalCooldownManager()
 
 	// Check if token is in cooldown period
-	if cooldownMgr.IsInCooldown(tokenKey) {
+	if !coolingDisabled && cooldownMgr.IsInCooldown(tokenKey) {
 		remaining := cooldownMgr.GetRemainingCooldown(tokenKey)
 		reason := cooldownMgr.GetCooldownReason(tokenKey)
 		log.Warnf("kiro: token %s is in cooldown (reason: %s), remaining: %v", tokenKey, reason, remaining)
 		return nil, statusErr{code: http.StatusTooManyRequests, msg: fmt.Sprintf("kiro: token is in cooldown for %v (reason: %s)", remaining, reason), retryAfter: &remaining}
 	}
-	if reason, remaining, unavailable := rateLimiter.TokenUnavailable(tokenKey); unavailable {
-		return nil, statusErr{code: http.StatusTooManyRequests, msg: fmt.Sprintf("kiro: token unavailable for %v (%s)", remaining, reason), retryAfter: &remaining}
+	if !coolingDisabled {
+		if reason, remaining, unavailable := rateLimiter.TokenUnavailable(tokenKey); unavailable {
+			return nil, statusErr{code: http.StatusTooManyRequests, msg: fmt.Sprintf("kiro: token unavailable for %v (%s)", remaining, reason), retryAfter: &remaining}
+		}
 	}
 
 	// Wait for rate limiter before proceeding
-	log.Debugf("kiro: stream waiting for rate limiter for token %s", tokenKey)
-	rateLimiter.WaitForToken(tokenKey)
-	log.Debugf("kiro: stream rate limiter cleared for token %s", tokenKey)
+	if !coolingDisabled {
+		log.Debugf("kiro: stream waiting for rate limiter for token %s", tokenKey)
+		rateLimiter.WaitForToken(tokenKey)
+		log.Debugf("kiro: stream rate limiter cleared for token %s", tokenKey)
+	}
 
 	// Check if token is expired before making the request.
 	if e.isTokenExpired(accessToken) {
@@ -1249,6 +1287,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 	var lastEndpointErr error
 	rateLimiter := kiroauth.GetGlobalRateLimiter()
 	cooldownMgr := kiroauth.GetGlobalCooldownManager()
+	coolingDisabled := isCoolingDisabled(auth)
 	endpointConfigs := getKiroEndpointConfigs(auth)
 	var last429Err error
 
@@ -1338,12 +1377,14 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 				respBody, _ := io.ReadAll(httpResp.Body)
 				_ = httpResp.Body.Close()
 				appendAPIResponseChunk(ctx, e.cfg, respBody)
+				cooldownDuration := kiroauth.CalculateCooldownFor429(attempt)
 
 				// Record failure and set cooldown for 429
-				rateLimiter.MarkTokenFailed(tokenKey)
-				cooldownDuration := kiroauth.CalculateCooldownFor429(attempt)
-				cooldownMgr.SetCooldown(tokenKey, cooldownDuration, kiroauth.CooldownReason429)
-				log.Warnf("kiro: stream rate limit hit (429), token %s set to cooldown for %v", tokenKey, cooldownDuration)
+				if !coolingDisabled {
+					rateLimiter.MarkTokenFailed(tokenKey)
+					cooldownMgr.SetCooldown(tokenKey, cooldownDuration, kiroauth.CooldownReason429)
+					log.Warnf("kiro: stream rate limit hit (429), token %s set to cooldown for %v", tokenKey, cooldownDuration)
+				}
 
 				// Preserve last 429 so callers can correctly backoff when all endpoints are exhausted
 				last429Err = statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody), retryAfter: &cooldownDuration}
@@ -1452,7 +1493,9 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 
 				// Return upstream error body directly
 				remaining := kiroauth.CalculateCooldownUntilNextDay()
-				cooldownMgr.SetCooldown(tokenKey, remaining, kiroauth.CooldownReasonQuotaExhausted)
+				if !coolingDisabled {
+					cooldownMgr.SetCooldown(tokenKey, remaining, kiroauth.CooldownReasonQuotaExhausted)
+				}
 				return nil, statusErr{code: http.StatusTooManyRequests, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody), retryAfter: &remaining}
 			}
 
@@ -1471,9 +1514,11 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 				// Check for SUSPENDED status - return immediately without retry
 				if strings.Contains(respBodyStr, "SUSPENDED") || strings.Contains(respBodyStr, "TEMPORARILY_SUSPENDED") {
 					// Set long cooldown for suspended accounts
-					rateLimiter.CheckAndMarkSuspended(tokenKey, respBodyStr)
-					cooldownMgr.SetCooldown(tokenKey, kiroauth.LongCooldown, kiroauth.CooldownReasonSuspended)
-					log.Errorf("kiro: stream account is suspended, token %s set to cooldown for %v", tokenKey, kiroauth.LongCooldown)
+					if !coolingDisabled {
+						rateLimiter.CheckAndMarkSuspended(tokenKey, respBodyStr)
+						cooldownMgr.SetCooldown(tokenKey, kiroauth.LongCooldown, kiroauth.CooldownReasonSuspended)
+						log.Errorf("kiro: stream account is suspended, token %s set to cooldown for %v", tokenKey, kiroauth.LongCooldown)
+					}
 					return nil, statusErr{code: httpResp.StatusCode, msg: "account suspended: " + summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 				}
 
@@ -1550,7 +1595,9 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 					requestPayload = req.Payload
 				}
 				if e.streamToChannel(ctx, resp.Body, out, from, payloadRequestedModel(opts, req.Model), requestPayload, body) {
-					rateLimiter.MarkTokenSuccess(tokenKey)
+					if !coolingDisabled {
+						rateLimiter.MarkTokenSuccess(tokenKey)
+					}
 					log.Debugf("kiro: stream completed successfully, token %s marked as success", tokenKey)
 				}
 			}(httpResp)

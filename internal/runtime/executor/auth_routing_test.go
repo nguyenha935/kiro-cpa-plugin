@@ -44,6 +44,18 @@ func TestKiroEndpointOrderMatchesAuthSurface(t *testing.T) {
 	}
 }
 
+func TestIsCoolingDisabledUsesCredentialOverride(t *testing.T) {
+	if !isCoolingDisabled(&cliproxyauth.Auth{Metadata: map[string]any{"disable_cooling": true}}) {
+		t.Fatal("credential disable_cooling=true was not honored")
+	}
+	if isCoolingDisabled(&cliproxyauth.Auth{Metadata: map[string]any{"disable_cooling": false}}) {
+		t.Fatal("credential disable_cooling=false incorrectly disabled plugin limiter")
+	}
+	if !isCoolingDisabled(&cliproxyauth.Auth{Attributes: map[string]string{"disable-cooling": "true"}}) {
+		t.Fatal("legacy disable-cooling attribute was not honored")
+	}
+}
+
 func TestAPIKeyUsesConfiguredRegion(t *testing.T) {
 	auth := &cliproxyauth.Auth{Metadata: map[string]any{"auth_method": "api_key", "region": "eu-west-1"}}
 	if got := resolveKiroAPIRegion(auth); got != "eu-west-1" {
