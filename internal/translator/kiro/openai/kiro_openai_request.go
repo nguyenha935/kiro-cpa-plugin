@@ -237,10 +237,10 @@ func normalizeUnknownToolHistory(history []KiroHistoryMessage, current *KiroUser
 			}
 		}
 	}
-	// Keep the active continuation structured: unlike stale history, its tool
-	// result is paired with the immediately preceding turn and Kiro requires
-	// that native context for the request being executed now.
-	return history, currentResults
+	if current != nil && len(currentResults) > 0 {
+		current.Content = appendOpenAIHistoryText(current.Content, formatOpenAIToolResults(currentResults))
+	}
+	return history, nil
 }
 
 func formatOpenAIToolUses(toolUses []KiroToolUse) string {
