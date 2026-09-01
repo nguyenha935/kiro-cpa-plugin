@@ -921,30 +921,53 @@ func listAvailableModels(ctx context.Context, token *kiroauth.KiroTokenData) ([]
 }
 
 func newModelCatalogRequest(ctx context.Context, token *kiroauth.KiroTokenData, nextToken string) (*http.Request, error) {
-	query := url.Values{"origin": {"AI_EDITOR"}}
+	if token == nil {
+		return nil, pluginStatusError{status: http.StatusUnauthorized, message: "Kiro credential is missing"}
+	}
 	region := kiroServiceRegion(token)
-	endpoint := "https://q." + region + ".amazonaws.com/ListAvailableModels"
-	if !isAPIKeyCredential(token) && !isBuilderIDCredential(token) {
-		profileARN := strings.TrimSpace(token.ProfileArn)
-		if profileARN == "" {
-			return nil, pluginStatusError{status: http.StatusUnauthorized, message: "Kiro profile ARN is required for this credential type"}
+	if isAPIKeyCredential(token) || isBuilderIDCredential(token) {
+		query := url.Values{"origin": {"AI_EDITOR"}}
+		if nextToken != "" {
+			query.Set("nextToken", nextToken)
 		}
-		query.Set("profileArn", profileARN)
+		endpoint := "https://q." + region + ".amazonaws.com/ListAvailableModels?" + query.Encode()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+token.AccessToken)
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("User-Agent", kiroauth.ClientUserAgent())
+		req.Header.Set("X-Amz-User-Agent", kiroauth.ClientAWSUserAgent("codewhisperer"))
+		if isAPIKeyCredential(token) {
+			req.Header.Set("TokenType", "API_KEY")
+		}
+		return req, nil
 	}
+
+	profileARN := strings.TrimSpace(token.ProfileArn)
+	if profileARN == "" {
+		return nil, pluginStatusError{status: http.StatusUnauthorized, message: "Kiro profile ARN is required for this credential type"}
+	}
+	payload := map[string]any{"origin": "AI_EDITOR", "profileArn": profileARN}
 	if nextToken != "" {
-		query.Set("nextToken", nextToken)
+		payload["nextToken"] = nextToken
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"?"+query.Encode(), nil)
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, codeWhispererEndpoint(region), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token.AccessToken)
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+	req.Header.Set("X-Amz-Target", "AmazonCodeWhispererService.ListAvailableModels")
 	req.Header.Set("User-Agent", kiroauth.ClientUserAgent())
 	req.Header.Set("X-Amz-User-Agent", kiroauth.ClientAWSUserAgent("codewhisperer"))
-	if isAPIKeyCredential(token) {
-		req.Header.Set("TokenType", "API_KEY")
-	} else if strings.EqualFold(strings.TrimSpace(token.AuthMethod), "external_idp") {
+	if strings.EqualFold(strings.TrimSpace(token.AuthMethod), "external_idp") {
 		req.Header.Set("TokenType", "EXTERNAL_IDP")
 	}
 	return req, nil
@@ -1062,7 +1085,8 @@ func listAvailableProfiles(ctx context.Context, client *http.Client, endpoint, a
 		}
 		req.Header.Set("Authorization", "Bearer "+accessToken)
 		req.Header.Set("Accept", "application/json")
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+		req.Header.Set("X-Amz-Target", "AmazonCodeWhispererService.ListAvailableProfiles")
 		req.Header.Set("User-Agent", kiroauth.ClientUserAgent())
 		req.Header.Set("X-Amz-User-Agent", kiroauth.ClientAWSUserAgent("codewhisperer"))
 		resp, err := client.Do(req)
@@ -1102,7 +1126,7 @@ func codeWhispererEndpoint(region string) string {
 }
 
 func codeWhispererProfilesEndpoint(region string) string {
-	return codeWhispererEndpoint(region) + "/ListAvailableProfiles"
+	return codeWhispererEndpoint(region)
 }
 
 func profileDiscoveryHTTPError(resp *http.Response, body []byte) error {

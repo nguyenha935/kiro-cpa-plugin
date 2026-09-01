@@ -454,8 +454,18 @@ func TestOIDCModelCatalogRequestKeepsProfileContract(t *testing.T) {
 	if req.Header.Get("TokenType") != "" {
 		t.Fatalf("OIDC request inherited API-key token type: %q", req.Header.Get("TokenType"))
 	}
-	if req.URL.Query().Get("profileArn") != token.ProfileArn {
-		t.Fatalf("OIDC model query lost profile ARN: %v", req.URL.Query())
+	if req.Method != http.MethodPost || req.URL.Host != "codewhisperer.us-east-1.amazonaws.com" || req.URL.Path != "" {
+		t.Fatalf("OIDC model request used %s %s", req.Method, req.URL)
+	}
+	if req.Header.Get("Content-Type") != "application/x-amz-json-1.0" || req.Header.Get("X-Amz-Target") != "AmazonCodeWhispererService.ListAvailableModels" {
+		t.Fatalf("OIDC model headers = Content-Type %q Target %q", req.Header.Get("Content-Type"), req.Header.Get("X-Amz-Target"))
+	}
+	var payload map[string]any
+	if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["profileArn"] != token.ProfileArn || payload["origin"] != "AI_EDITOR" {
+		t.Fatalf("OIDC model payload = %#v", payload)
 	}
 }
 
@@ -468,12 +478,12 @@ func TestModelCatalogUsesProfileRegionInsteadOfOIDCRegion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if req.URL.Host != "q.eu-central-1.amazonaws.com" {
+	if req.URL.Host != "codewhisperer.eu-central-1.amazonaws.com" {
 		t.Fatalf("model catalog host = %q", req.URL.Host)
 	}
 }
 
-func TestExternalIDPModelCatalogUsesQContractAndTokenType(t *testing.T) {
+func TestExternalIDPModelCatalogUsesCodeWhispererContractAndTokenType(t *testing.T) {
 	token := &kiroauth.KiroTokenData{
 		AccessToken: "external-token", AuthMethod: "external_idp", Region: "us-east-1",
 		ProfileArn: "arn:aws:codewhisperer:us-east-1:1:profile/test",
@@ -482,8 +492,32 @@ func TestExternalIDPModelCatalogUsesQContractAndTokenType(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if req.URL.Host != "q.us-east-1.amazonaws.com" || req.Header.Get("TokenType") != "EXTERNAL_IDP" {
+	if req.Method != http.MethodPost || req.URL.Host != "codewhisperer.us-east-1.amazonaws.com" || req.Header.Get("TokenType") != "EXTERNAL_IDP" {
 		t.Fatalf("external_idp model contract = %s TokenType=%q", req.URL, req.Header.Get("TokenType"))
+	}
+	if req.Header.Get("X-Amz-Target") != "AmazonCodeWhispererService.ListAvailableModels" {
+		t.Fatalf("external_idp target = %q", req.Header.Get("X-Amz-Target"))
+	}
+}
+
+func TestImportedModelCatalogUsesCodeWhispererContract(t *testing.T) {
+	token := &kiroauth.KiroTokenData{
+		AccessToken: "imported-token", AuthMethod: "imported", Region: "us-east-1",
+		ProfileArn: "arn:aws:codewhisperer:us-east-1:1:profile/test",
+	}
+	req, err := newModelCatalogRequest(context.Background(), token, "page-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Method != http.MethodPost || req.URL.Host != "codewhisperer.us-east-1.amazonaws.com" || req.Header.Get("TokenType") != "" {
+		t.Fatalf("imported model contract = %s %s TokenType=%q", req.Method, req.URL, req.Header.Get("TokenType"))
+	}
+	var payload map[string]any
+	if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["nextToken"] != "page-2" || payload["profileArn"] != token.ProfileArn {
+		t.Fatalf("imported model payload = %#v", payload)
 	}
 }
 
@@ -610,14 +644,14 @@ func TestListAvailableProfilesPaginatesAndKeepsAccountsIsolated(t *testing.T) {
 		if r.Method != http.MethodPost {
 			t.Fatalf("profile request method = %s, want POST", r.Method)
 		}
-		if r.URL.Path != "/ListAvailableProfiles" {
-			t.Fatalf("profile request path = %q, want /ListAvailableProfiles", r.URL.Path)
+		if r.URL.Path != "/" {
+			t.Fatalf("profile request path = %q, want /", r.URL.Path)
 		}
-		if r.Header.Get("Content-Type") != "application/json" {
+		if r.Header.Get("Content-Type") != "application/x-amz-json-1.0" {
 			t.Fatalf("profile content type = %q", r.Header.Get("Content-Type"))
 		}
-		if r.Header.Get("X-Amz-Target") != "" {
-			t.Fatalf("profile request must not use JSON-RPC target: %q", r.Header.Get("X-Amz-Target"))
+		if r.Header.Get("X-Amz-Target") != "AmazonCodeWhispererService.ListAvailableProfiles" {
+			t.Fatalf("profile request target = %q", r.Header.Get("X-Amz-Target"))
 		}
 		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		body, err := io.ReadAll(r.Body)
@@ -648,7 +682,7 @@ func TestListAvailableProfilesPaginatesAndKeepsAccountsIsolated(t *testing.T) {
 	}))
 	defer server.Close()
 
-	endpoint := server.URL + "/ListAvailableProfiles"
+	endpoint := server.URL
 	profilesA, err := listAvailableProfiles(context.Background(), server.Client(), endpoint, "account-a")
 	if err != nil {
 		t.Fatalf("list account A profiles: %v", err)
@@ -676,9 +710,9 @@ func TestListAvailableProfilesPaginatesAndKeepsAccountsIsolated(t *testing.T) {
 	}
 }
 
-func TestCodeWhispererProfilesEndpointUsesRESTOperationPath(t *testing.T) {
+func TestCodeWhispererProfilesEndpointUsesAWSJSONRoot(t *testing.T) {
 	got := codeWhispererProfilesEndpoint("us-east-1")
-	want := "https://codewhisperer.us-east-1.amazonaws.com/ListAvailableProfiles"
+	want := "https://codewhisperer.us-east-1.amazonaws.com"
 	if got != want {
 		t.Fatalf("profile endpoint = %q, want %q", got, want)
 	}
