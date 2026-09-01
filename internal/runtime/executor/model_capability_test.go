@@ -63,7 +63,7 @@ func TestIdentityCenterProfileIsSentUpstream(t *testing.T) {
 	}
 }
 
-func TestBuilderIDUsesPublicProfileOnlyForGenerate(t *testing.T) {
+func TestGenerateProfileContractMatchesCredentialType(t *testing.T) {
 	auth := &cliproxyauth.Auth{Metadata: map[string]any{"access_token": "token", "auth_method": "builder-id"}}
 	if got := effectiveGenerateProfileARN(auth, ""); got != kiroBuilderIDProfileARN {
 		t.Fatalf("Builder ID generate profile = %q", got)
@@ -72,7 +72,7 @@ func TestBuilderIDUsesPublicProfileOnlyForGenerate(t *testing.T) {
 		t.Fatalf("Builder ID runtime credentials = %q/%q", token, profile)
 	}
 	apiKey := &cliproxyauth.Auth{Metadata: map[string]any{"auth_method": "api_key"}}
-	if got := effectiveGenerateProfileARN(apiKey, ""); got != kiroBuilderIDProfileARN {
-		t.Fatalf("API key generate profile = %q", got)
+	if got := effectiveGenerateProfileARN(apiKey, ""); got != "" {
+		t.Fatalf("API key generate profile = %q, want omitted", got)
 	}
 }

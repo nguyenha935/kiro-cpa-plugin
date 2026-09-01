@@ -540,6 +540,21 @@ func setKiroAuthorization(req *http.Request, auth *cliproxyauth.Auth, accessToke
 	}
 }
 
+// isAPIKeyAuth reports whether the live CPA auth record is a Kiro API-key
+// credential. API keys are bearer credentials with TokenType=API_KEY, but they
+// have no refresh token and must never enter the OAuth refresh path.
+func isAPIKeyAuth(auth *cliproxyauth.Auth) bool {
+	if auth == nil || auth.Metadata == nil {
+		return false
+	}
+	method, _ := auth.Metadata["auth_method"].(string)
+	if strings.EqualFold(strings.TrimSpace(method), "api_key") {
+		return true
+	}
+	kind, _ := auth.Metadata["auth_kind"].(string)
+	return strings.EqualFold(strings.TrimSpace(kind), "apikey") || strings.EqualFold(strings.TrimSpace(kind), "api_key")
+}
+
 // isIDCAuth checks if the auth uses IDC (Identity Center) authentication method.
 func isIDCAuth(auth *cliproxyauth.Auth) bool {
 	if auth == nil || auth.Metadata == nil {
@@ -960,6 +975,10 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				respBody, _ := io.ReadAll(httpResp.Body)
 				_ = httpResp.Body.Close()
 				appendAPIResponseChunk(ctx, e.cfg, respBody)
+				if isAPIKeyAuth(auth) {
+					log.Warnf("kiro: API key rejected with HTTP 401; returning without OAuth refresh")
+					return resp, statusErr{code: http.StatusUnauthorized, msg: string(respBody)}
+				}
 
 				log.Warnf("kiro: received 401 error, attempting token refresh")
 				refreshedAuth, refreshErr := e.Refresh(ctx, auth)
@@ -1023,6 +1042,14 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 					cooldownMgr.SetCooldown(tokenKey, kiroauth.LongCooldown, kiroauth.CooldownReasonSuspended)
 					log.Errorf("kiro: account is suspended, token %s set to cooldown for %v", tokenKey, kiroauth.LongCooldown)
 					return resp, statusErr{code: httpResp.StatusCode, msg: "account suspended: " + string(respBody)}
+				}
+
+				// API keys are long-lived and cannot be refreshed. In particular, do not
+				// turn an invalid API key into the misleading "refresh token not found"
+				// error that used to hide the real upstream response.
+				if isAPIKeyAuth(auth) {
+					log.Warnf("kiro: API key rejected with HTTP 403; returning without OAuth refresh")
+					return resp, statusErr{code: http.StatusForbidden, msg: string(respBody)}
 				}
 
 				// Check if this looks like a token-related 403 (some APIs return 403 for expired tokens)
@@ -1371,6 +1398,10 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 				respBody, _ := io.ReadAll(httpResp.Body)
 				_ = httpResp.Body.Close()
 				appendAPIResponseChunk(ctx, e.cfg, respBody)
+				if isAPIKeyAuth(auth) {
+					log.Warnf("kiro: stream API key rejected with HTTP 401; returning without OAuth refresh")
+					return nil, statusErr{code: http.StatusUnauthorized, msg: string(respBody)}
+				}
 
 				log.Warnf("kiro: stream received 401 error, attempting token refresh")
 				refreshedAuth, refreshErr := e.Refresh(ctx, auth)
@@ -1433,6 +1464,13 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 					cooldownMgr.SetCooldown(tokenKey, kiroauth.LongCooldown, kiroauth.CooldownReasonSuspended)
 					log.Errorf("kiro: stream account is suspended, token %s set to cooldown for %v", tokenKey, kiroauth.LongCooldown)
 					return nil, statusErr{code: httpResp.StatusCode, msg: "account suspended: " + string(respBody)}
+				}
+
+				// API keys are long-lived and cannot be refreshed. Return the actual
+				// upstream rejection instead of attempting an impossible OAuth refresh.
+				if isAPIKeyAuth(auth) {
+					log.Warnf("kiro: stream API key rejected with HTTP 403; returning without OAuth refresh")
+					return nil, statusErr{code: http.StatusForbidden, msg: string(respBody)}
 				}
 
 				// Check if this looks like a token-related 403 (some APIs return 403 for expired tokens)
@@ -1580,8 +1618,13 @@ func effectiveGenerateProfileARN(auth *cliproxyauth.Auth, profileArn string) str
 		method, _ = auth.Metadata["auth_method"].(string)
 	}
 	switch strings.ToLower(strings.TrimSpace(method)) {
-	case "builder-id", "api_key":
+	case "builder-id":
 		return kiroBuilderIDProfileARN
+	case "api_key":
+		// API-key requests are account-bound and the upstream Q surface rejects
+		// any synthetic/shared profile ARN. Keep profileArn omitted in both the
+		// generated payload and the request metadata.
+		return ""
 	case "social":
 		return kiroSocialProfileARN
 	default:

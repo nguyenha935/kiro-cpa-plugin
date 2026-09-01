@@ -148,3 +148,54 @@ func TestKiroAuthorizationTokenTypeMatchesCredential(t *testing.T) {
 		}
 	}
 }
+
+func TestAPIKeyAuthErrorsDoNotEnterOAuthRefresh(t *testing.T) {
+	originalClient := kiroHTTPClientFor
+	t.Cleanup(func() { kiroHTTPClientFor = originalClient })
+	body := []byte("{\"model\":\"claude-haiku-4.5\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply OK.\"}],\"max_tokens\":16}")
+
+	for _, test := range []struct {
+		name   string
+		status int
+		stream bool
+	}{
+		{name: "non-stream 401", status: http.StatusUnauthorized},
+		{name: "stream 401", status: http.StatusUnauthorized, stream: true},
+		{name: "non-stream 403", status: http.StatusForbidden},
+		{name: "stream 403", status: http.StatusForbidden, stream: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			requests := 0
+			kiroHTTPClientFor = func(context.Context, *config.Config, *cliproxyauth.Auth, time.Duration) *http.Client {
+				return &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+					requests++
+					if request.Header.Get("TokenType") != "API_KEY" {
+						t.Fatalf("API-key request TokenType = %q", request.Header.Get("TokenType"))
+					}
+					return &http.Response{
+						StatusCode: test.status, Header: make(http.Header),
+						Body: io.NopCloser(strings.NewReader("{\"message\":\"invalid API key\"}")),
+					}, nil
+				})}
+			}
+			auth := &cliproxyauth.Auth{ID: strings.ReplaceAll(test.name, " ", "-"), Metadata: map[string]any{
+				"access_token": "ksk-test", "auth_method": "api_key", "auth_kind": "apikey", "region": "us-east-1",
+			}}
+			request := cliproxyexecutor.Request{Model: "claude-haiku-4.5", Payload: body, Format: sdktranslator.FromString("openai")}
+			options := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai"), OriginalRequest: body}
+			var err error
+			if test.stream {
+				_, err = NewKiroExecutor(nil).ExecuteStream(t.Context(), auth, request, options)
+			} else {
+				_, err = NewKiroExecutor(nil).Execute(t.Context(), auth, request, options)
+			}
+			statusError, ok := err.(interface{ StatusCode() int })
+			if !ok || statusError.StatusCode() != test.status {
+				t.Fatalf("API-key auth error = %T %v, want HTTP %d", err, err, test.status)
+			}
+			if requests != 1 {
+				t.Fatalf("API-key auth error made %d upstream requests, want 1", requests)
+			}
+		})
+	}
+}
