@@ -200,7 +200,68 @@ func credentialUsageLock(token *kiroauth.KiroTokenData, fallback string) *sync.M
 	return value.(*sync.Mutex)
 }
 
+// refreshKiroCredential renews a credential and guarantees that host-owned
+// state survives the renewal.
+//
+// Every transport branch below builds its result from the provider's response
+// rather than from the stored credential, so the CPA-managed fields
+// (priority, weight, disabled, cooling, retry, endpoint, the unknown keys held
+// in Extra, and the runtime HostMetadata/HostAttributes) would be absent from
+// the returned struct. handleRefreshAuth publishes that struct as AuthData
+// without merging it onto the stored document, so anything missing here is
+// erased from the credential file.
 func refreshKiroCredential(ctx context.Context, token *kiroauth.KiroTokenData) (*kiroauth.KiroTokenData, error) {
+	refreshed, err := refreshKiroCredentialTransport(ctx, token)
+	if err != nil {
+		return nil, err
+	}
+	carryHostOwnedFields(token, refreshed)
+	return refreshed, nil
+}
+
+// carryHostOwnedFields fills host-owned fields on a freshly built credential
+// from the stored one. It only fills gaps: a value the transport already set
+// wins, so a genuine change (a rotated region, a discovered profile) is kept.
+func carryHostOwnedFields(from *kiroauth.KiroTokenData, to *kiroauth.KiroTokenData) {
+	if from == nil || to == nil || from == to {
+		return
+	}
+	if to.Email == "" {
+		to.Email = from.Email
+	}
+	if to.Provider == "" {
+		to.Provider = from.Provider
+	}
+	if to.Priority == 0 {
+		to.Priority = from.Priority
+	}
+	if to.Weight == 0 {
+		to.Weight = from.Weight
+	}
+	if !to.Disabled {
+		to.Disabled = from.Disabled
+	}
+	if !to.DisableCooling {
+		to.DisableCooling = from.DisableCooling
+	}
+	if to.RequestRetry == 0 {
+		to.RequestRetry = from.RequestRetry
+	}
+	if to.PreferredEndpoint == "" {
+		to.PreferredEndpoint = from.PreferredEndpoint
+	}
+	if to.Extra == nil {
+		to.Extra = from.Extra
+	}
+	if to.HostMetadata == nil {
+		to.HostMetadata = from.HostMetadata
+	}
+	if to.HostAttributes == nil {
+		to.HostAttributes = from.HostAttributes
+	}
+}
+
+func refreshKiroCredentialTransport(ctx context.Context, token *kiroauth.KiroTokenData) (*kiroauth.KiroTokenData, error) {
 	if token != nil && strings.EqualFold(token.AuthMethod, "social") {
 		return refreshSocialCredential(ctx, token)
 	}

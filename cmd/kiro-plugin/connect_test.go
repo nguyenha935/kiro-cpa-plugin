@@ -188,3 +188,31 @@ func TestConnectAPIRejectsResourceStyleGET(t *testing.T) {
 		t.Fatalf("GET connect status = %d, want 405", management.StatusCode)
 	}
 }
+
+func TestImportDesktopRefreshTokenKeepsSubmittedStartURL(t *testing.T) {
+	originalRefresher := desktopTokenRefresher
+	desktopTokenRefresher = func(_ context.Context, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
+		return &kiroauth.KiroTokenData{
+			AccessToken: "access", RefreshToken: refreshToken,
+			ProfileArn: "arn:aws:codewhisperer:us-east-1:1:profile/test",
+			ExpiresAt:  time.Now().UTC().Add(time.Hour).Format(time.RFC3339),
+		}, nil
+	}
+	t.Cleanup(func() { desktopTokenRefresher = originalRefresher })
+
+	token, err := importRefreshToken(context.Background(), url.Values{
+		"refresh_token": {"aorAAAAAG-test"}, "region": {"us-east-1"},
+		"refresh_auth_method": {"idc"}, "start_url": {"https://tenant.awsapps.com/start"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The desktop transport owns the refresh, so auth_method must stay "imported",
+	// but the submitted origin must not vanish.
+	if token.AuthMethod != "imported" {
+		t.Fatalf("desktop token auth method = %q", token.AuthMethod)
+	}
+	if token.StartURL != "https://tenant.awsapps.com/start" {
+		t.Fatalf("submitted start URL was discarded: %q", token.StartURL)
+	}
+}

@@ -199,6 +199,10 @@ func BuildKiroPayloadFromOpenAI(openaiBody []byte, modelID, profileArn, origin s
 // during compaction) drops or renames a tool definition. In that case all
 // historical tool pairs are preserved as plain text so their meaning remains
 // available without sending an invalid structured replay.
+//
+// This mirrors the claude translator's function of the same name; see the note
+// there. Any change here must be made in both packages until the shared Kiro
+// request types move into internal/translator/kiro/common.
 func normalizeUnknownToolHistory(history []KiroHistoryMessage, current *KiroUserInputMessage, currentResults []KiroToolResult, tools []KiroToolWrapper) ([]KiroHistoryMessage, []KiroToolResult) {
 	toolNames := make(map[string]struct{}, len(tools))
 	for _, tool := range tools {

@@ -210,6 +210,11 @@ func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, cap
 // declares a tool used by an older assistant turn. Structured replay is kept
 // for declared tools; unknown pairs are represented as text, preserving context
 // without violating Kiro's tool catalogue contract.
+//
+// The openai translator carries a byte-equivalent copy. The two are not shared
+// because each package declares its own KiroHistoryMessage/KiroToolResult/
+// KiroToolWrapper types; unifying them means moving that whole type set into
+// internal/translator/kiro/common. Keep the two in step until then.
 func normalizeUnknownToolHistory(history []KiroHistoryMessage, current *KiroUserInputMessage, currentResults []KiroToolResult, tools []KiroToolWrapper) ([]KiroHistoryMessage, []KiroToolResult) {
 	toolNames := make(map[string]struct{}, len(tools))
 	for _, tool := range tools {

@@ -275,7 +275,15 @@ func importRefreshToken(ctx context.Context, values url.Values) (*kiroauth.KiroT
 		if err != nil {
 			return nil, err
 		}
+		// auth_method must stay "imported": that value plus the absent client
+		// registration is what routes every later refresh to the Kiro auth
+		// service instead of AWS SSO OIDC. The submitted start_url is kept
+		// because it was already validated above and is the only record of which
+		// IdC portal the credential came from.
 		token.AuthMethod, token.Provider, token.Region = "imported", "CLIProxyAPI", region
+		if startURL != "" {
+			token.StartURL = startURL
+		}
 		if strings.TrimSpace(token.ProfileArn) == "" {
 			if err := reconcileProfile(ctx, token); err != nil {
 				return nil, fmt.Errorf("discover Kiro profile after refresh-token import: %w", err)

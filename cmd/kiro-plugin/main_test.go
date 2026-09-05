@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"image/png"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -836,5 +839,96 @@ func TestParseRejectsIDCWhenRequiredProfileDiscoveryFails(t *testing.T) {
 	discover := func(context.Context, *kiroauth.KiroTokenData) error { return errors.New("forbidden") }
 	if err := reconcileParsedProfile(context.Background(), token, discover); err == nil {
 		t.Fatal("IDC credential without a discoverable profile was accepted")
+	}
+}
+
+func TestConfigurePluginIgnoresNonSettingsKiroKeys(t *testing.T) {
+	// A real config.yaml holds two "kiro" keys: plugins.configs.kiro and the
+	// oauth-excluded-models list. The settings must come from the former.
+	original := pluginSettings
+	defer func() { pluginSettings = original }()
+	pluginSettings = pluginSettingsData{DailyMaxRequests: 777, MinTokenInterval: "3s", MaxTokenInterval: "5s", SuspendCooldown: "2h"}
+	configurePlugin([]byte(`{"config_yaml":"b2F1dGgtZXhjbHVkZWQtbW9kZWxzOgogIGtpcm86CiAgICAtIGNsYXVkZS1zb25uZXQtNAogICAgLSBraXJvL2F1dG8KcGx1Z2luczoKICBjb25maWdzOgogICAga2lybzoKICAgICAgZGFpbHlfbWF4X3JlcXVlc3RzOiA4ODgK"}`))
+	if pluginSettings.DailyMaxRequests != 888 || pluginSettings.SuspendCooldown != "2h" {
+		t.Fatalf("excluded-models list interfered with settings: %#v", pluginSettings)
+	}
+}
+
+func TestFindKiroConfigIsDeterministicAcrossCompetingKeys(t *testing.T) {
+	// Go randomises map iteration, so two competing "kiro" maps must still
+	// resolve to the same one on every call.
+	original := pluginSettings
+	defer func() { pluginSettings = original }()
+	const payload = `{"config_yaml":"YWFhLWRlY295OgogIGtpcm86CiAgICBzdXNwZW5kX2Nvb2xkb3duOiA5aAp6enotZGVjb3k6CiAga2lybzoKICAgIHN1c3BlbmRfY29vbGRvd246IDRoCg=="}`
+	first := ""
+	for i := 0; i < 40; i++ {
+		pluginSettings = pluginSettingsData{DailyMaxRequests: 777, MinTokenInterval: "3s", MaxTokenInterval: "5s", SuspendCooldown: "2h"}
+		configurePlugin([]byte(payload))
+		if i == 0 {
+			first = pluginSettings.SuspendCooldown
+			continue
+		}
+		if pluginSettings.SuspendCooldown != first {
+			t.Fatalf("iteration %d picked %q, first call picked %q", i, pluginSettings.SuspendCooldown, first)
+		}
+	}
+	if first != "9h" {
+		t.Fatalf("sorted-key order should select aaa-decoy, got %q", first)
+	}
+}
+
+func TestAPIKeyKindWinsOverMislabelledAuthMethod(t *testing.T) {
+	// The executor short-circuits OAuth refresh on auth_kind, so the identity
+	// helpers must agree or the filename reverts to the synthetic email.
+	raw := []byte(`{"type":"kiro","auth_kind":"api-key","authMethod":"imported","accessToken":"secret-key","email":"kiro-api-synthetic"}`)
+	token, err := decodeToken(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !isAPIKeyCredential(token) {
+		t.Fatalf("auth_kind api-key was not recognised: %+v", token)
+	}
+	if token.AuthMethod != "api_key" {
+		t.Fatalf("auth method = %q, want api_key", token.AuthMethod)
+	}
+	if strings.Contains(kiroFileName(token), "synthetic") {
+		t.Fatalf("file name still derives from the display email: %q", kiroFileName(token))
+	}
+}
+
+func TestAPIKeyKindDoesNotHijackARefreshableCredential(t *testing.T) {
+	raw := []byte(`{"type":"kiro","auth_kind":"api-key","authMethod":"idc","accessToken":"access","refreshToken":"refresh","clientId":"id","clientSecret":"secret"}`)
+	token, err := decodeToken(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if isAPIKeyCredential(token) || token.AuthMethod != "idc" {
+		t.Fatalf("a refreshable credential was reclassified: %+v", token)
+	}
+}
+
+func TestPluginRegistrationCarriesAProviderLogo(t *testing.T) {
+	t.Parallel()
+
+	// Kiro is not a built-in CPA provider, so management clients have no bundled
+	// icon for it and fall back to the plugin's own metadata.
+	logo := pluginRegistration().Metadata.Logo
+	const prefix = "data:image/png;base64,"
+	if !strings.HasPrefix(logo, prefix) {
+		t.Fatalf("logo is not an inline PNG data URI: %.40q", logo)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(logo, prefix))
+	if err != nil {
+		t.Fatalf("logo payload is not valid base64: %v", err)
+	}
+	if !bytes.HasPrefix(decoded, []byte("\x89PNG\r\n\x1a\n")) {
+		t.Fatalf("logo payload is not a PNG, first bytes = %x", decoded[:min(8, len(decoded))])
+	}
+	image, err := png.Decode(bytes.NewReader(decoded))
+	if err != nil {
+		t.Fatalf("decode logo: %v", err)
+	}
+	if bounds := image.Bounds(); bounds.Dx() < 64 || bounds.Dy() < 64 {
+		t.Fatalf("logo is too small for a provider tile: %v", bounds)
 	}
 }
