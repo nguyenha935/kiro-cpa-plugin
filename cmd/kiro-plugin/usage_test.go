@@ -500,3 +500,136 @@ func resetUsageState() {
 	usageState.lastRefresh = make(map[string]time.Time)
 	usageState.Unlock()
 }
+
+func TestDesktopRefreshPreservesHostOwnedFields(t *testing.T) {
+	originalRefresher := desktopTokenRefresher
+	desktopTokenRefresher = func(_ context.Context, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
+		// The Kiro auth service answers with token material only.
+		return &kiroauth.KiroTokenData{
+			AccessToken:  "rotated-access",
+			RefreshToken: "rotated-refresh",
+			ExpiresAt:    time.Now().UTC().Add(time.Hour).Format(time.RFC3339),
+			Region:       region,
+		}, nil
+	}
+	t.Cleanup(func() { desktopTokenRefresher = originalRefresher })
+
+	raw := []byte(`{"type":"kiro","authMethod":"imported","provider":"CLIProxyAPI","accessToken":"old-access","refreshToken":"aorAAAAAG-imported","profileArn":"arn:profile","region":"us-east-1","email":"owner@example.test","priority":7,"weight":3,"disabled":true,"disable_cooling":true,"request_retry":2,"preferred_endpoint":"https://alt.example.test","model-aliases":[{"name":"claude-opus-5","alias":"opus"}],"excluded-models":["kiro/auto"],"note":"keep me"}`)
+	token, err := decodeToken(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshed, err := refreshKiroCredential(context.Background(), token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.AccessToken != "rotated-access" || refreshed.RefreshToken != "rotated-refresh" {
+		t.Fatalf("token material was not rotated: %+v", refreshed)
+	}
+	if refreshed.AuthMethod != "imported" || refreshed.ProfileArn != "arn:profile" || refreshed.Provider != "CLIProxyAPI" {
+		t.Fatalf("routing fields were lost: %+v", refreshed)
+	}
+	if refreshed.Email != "owner@example.test" {
+		t.Fatalf("display identity was lost: %q", refreshed.Email)
+	}
+	if refreshed.Priority != 7 || refreshed.Weight != 3 || !refreshed.Disabled || !refreshed.DisableCooling || refreshed.RequestRetry != 2 {
+		t.Fatalf("host-owned routing fields were lost: %+v", refreshed)
+	}
+	if refreshed.PreferredEndpoint != "https://alt.example.test" {
+		t.Fatalf("preferred endpoint was lost: %q", refreshed.PreferredEndpoint)
+	}
+	persisted, err := json.Marshal(refreshed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored map[string]any
+	if err := json.Unmarshal(persisted, &stored); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"model-aliases", "excluded-models", "note"} {
+		if _, exists := stored[key]; !exists {
+			t.Fatalf("unknown host-owned key %q was erased: %#v", key, stored)
+		}
+	}
+}
+
+func TestCarryHostOwnedFieldsRestoresARebuiltCredential(t *testing.T) {
+	stored, err := decodeToken([]byte(`{"type":"kiro","authMethod":"idc","accessToken":"stored-access","email":"idc@example.test","priority":5,"weight":2,"disabled":true,"disable_cooling":true,"request_retry":4,"preferred_endpoint":"https://idc.example.test","note":"idc note"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// This is the shape an OIDC refresh returns: token material only.
+	rebuilt := &kiroauth.KiroTokenData{AccessToken: "new", RefreshToken: "new-refresh", AuthMethod: "idc"}
+	carryHostOwnedFields(stored, rebuilt)
+	if rebuilt.Email != "idc@example.test" || rebuilt.Priority != 5 || rebuilt.Weight != 2 {
+		t.Fatalf("carry dropped identity or routing: %+v", rebuilt)
+	}
+	if !rebuilt.Disabled || !rebuilt.DisableCooling || rebuilt.RequestRetry != 4 || rebuilt.PreferredEndpoint != "https://idc.example.test" {
+		t.Fatalf("carry dropped host settings: %+v", rebuilt)
+	}
+	encoded, err := json.Marshal(rebuilt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"note":"idc note"`) {
+		t.Fatalf("carry dropped unknown host keys: %s", encoded)
+	}
+}
+
+func TestHostDisabledFalseStillOverridesTheStoredValue(t *testing.T) {
+	// carryHostOwnedFields is a fallback only; an explicit host value wins.
+	stored, err := decodeToken([]byte(`{"type":"kiro","authMethod":"idc","accessToken":"stored-access","disabled":true,"priority":9}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebuilt := &kiroauth.KiroTokenData{AccessToken: "new", AuthMethod: "idc"}
+	carryHostOwnedFields(stored, rebuilt)
+	applyHostOwnedSettings(rebuilt, map[string]any{"disabled": false, "priority": 1}, nil)
+	if rebuilt.Disabled || rebuilt.Priority != 1 {
+		t.Fatalf("host settings did not win over the carried values: %+v", rebuilt)
+	}
+}
+
+func TestRefreshKeepsHostRuntimeStateForAuthData(t *testing.T) {
+	// handleRefreshAuth publishes the refreshed struct as AuthData without
+	// merging it onto the stored document, and authData() reads HostMetadata to
+	// rebuild the persisted CPA fields. A transport branch that returns a fresh
+	// struct must therefore not drop the runtime host state.
+	originalRefresher := desktopTokenRefresher
+	desktopTokenRefresher = func(_ context.Context, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
+		return &kiroauth.KiroTokenData{
+			AccessToken:  "rotated-access",
+			RefreshToken: refreshToken,
+			ExpiresAt:    time.Now().UTC().Add(time.Hour).Format(time.RFC3339),
+			Region:       region,
+		}, nil
+	}
+	t.Cleanup(func() { desktopTokenRefresher = originalRefresher })
+
+	token, err := decodeToken([]byte(`{"type":"kiro","authMethod":"imported","accessToken":"old","refreshToken":"aorAAAAAG-imported","profileArn":"arn:profile","region":"us-east-1"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyHostOwnedSettings(token, map[string]any{"priority": 6, "model-aliases": []any{"opus"}}, map[string]string{"preferred-endpoint": "https://host.example.test"})
+	if len(token.HostMetadata) == 0 || len(token.HostAttributes) == 0 {
+		t.Fatalf("host runtime state was not captured: metadata=%#v attributes=%#v", token.HostMetadata, token.HostAttributes)
+	}
+	refreshed, err := refreshKiroCredential(context.Background(), token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.HostMetadata["model-aliases"] == nil {
+		t.Fatalf("host metadata did not survive the refresh: %#v", refreshed.HostMetadata)
+	}
+	if len(refreshed.HostAttributes) == 0 {
+		t.Fatalf("host attributes did not survive the refresh: %#v", refreshed.HostAttributes)
+	}
+	published := authData(refreshed, "kiro-imported.json")
+	var stored map[string]any
+	if err := json.Unmarshal(published.StorageJSON, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := stored["model-aliases"]; !exists {
+		t.Fatalf("AuthData erased a CPA-managed field: %#v", stored)
+	}
+}

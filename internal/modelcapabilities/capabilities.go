@@ -23,6 +23,10 @@ type Capability struct {
 	SupportsMaxTokens   bool       `json:"supports_max_tokens,omitempty"`
 	MinimumOutputTokens int64      `json:"minimum_output_tokens,omitempty"`
 	MaximumOutputTokens int64      `json:"maximum_output_tokens,omitempty"`
+	// SchemaObserved records that a request-fields schema was actually read for
+	// this model. It separates "the schema is unavailable" from "the schema was
+	// read and declares no max_tokens", which SupportsMaxTokens alone cannot do.
+	SchemaObserved bool `json:"schema_observed,omitempty"`
 }
 
 // DefaultMinimumOutputTokens is enforced by the Kiro transport.  Kiro
@@ -72,9 +76,19 @@ func (c Capability) AdditionalFields(effort string) map[string]any {
 	return map[string]any{string(c.EffortPath): map[string]any{"effort": effort}}
 }
 
+// AcceptsMaxTokens reports whether an output budget may be forwarded through
+// additionalModelRequestFields. A schema that was actually read is
+// authoritative: if it declares no max_tokens the field is omitted. When no
+// schema was observed the field is still forwarded, because Kiro rejects
+// requests carrying a budget below DefaultMinimumOutputTokens on exactly those
+// models whose schema is unavailable.
+func (c Capability) AcceptsMaxTokens() bool {
+	return c.SupportsMaxTokens || !c.SchemaObserved
+}
+
 func (c Capability) AdditionalFieldsForRequest(effort string, maxTokens int64) map[string]any {
 	fields := c.AdditionalFields(effort)
-	if maxTokens <= 0 {
+	if maxTokens <= 0 || !c.AcceptsMaxTokens() {
 		return fields
 	}
 	if fields == nil {
@@ -96,6 +110,7 @@ func Parse(modelID string, schema json.RawMessage) Capability {
 			return capability
 		}
 	}
+	capability.SchemaObserved = true
 	for _, candidate := range []EffortPath{EffortPathOutputConfig, EffortPathReasoning} {
 		effort, ok := nestedObject(root, "properties", string(candidate), "properties", "effort")
 		if !ok {
@@ -224,6 +239,10 @@ func Snapshot() []Capability {
 				current.DefaultEffort = ""
 			}
 			current.InputTokenLimit = minimumPositive(current.InputTokenLimit, next.InputTokenLimit)
+			// Observation unions while support intersects: one credential having
+			// read the schema is enough to know it exists, but the forwarded
+			// field must be safe for every credential in the snapshot.
+			current.SchemaObserved = current.SchemaObserved || next.SchemaObserved
 			if !current.SupportsMaxTokens || !next.SupportsMaxTokens {
 				current.SupportsMaxTokens = false
 				current.MinimumOutputTokens = 0

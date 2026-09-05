@@ -297,6 +297,11 @@ func configurePlugin(raw []byte) {
 	kiroauth.ConfigureGlobalRateLimiter(pluginSettings.rateLimiterConfig())
 }
 
+// mergePluginSettings overlays only the fields the host actually set, treating
+// a zero value as "not configured". Two consequences are deliberate:
+// daily_max_requests cannot be set to 0 through config (0 means unlimited via
+// the default), and removing a key from config.yaml does not revert the setting
+// until the process restarts, because nothing in the update says to clear it.
 func mergePluginSettings(base, update pluginSettingsData) pluginSettingsData {
 	if update.DailyMaxRequests != 0 {
 		base.DailyMaxRequests = update.DailyMaxRequests
@@ -313,13 +318,26 @@ func mergePluginSettings(base, update pluginSettingsData) pluginSettingsData {
 	return base
 }
 
+// findKiroConfig locates this plugin's settings inside an arbitrarily shaped
+// host config document.
+//
+// A live CPA config genuinely holds more than one "kiro" key —
+// plugins.configs.kiro carries the settings, and oauth-excluded-models.kiro
+// carries a model list — so the walk order decides which one is found. Go
+// randomises map iteration, which would make the answer differ between
+// restarts; the child keys are therefore visited in sorted order.
 func findKiroConfig(value any) (map[string]any, bool) {
 	if object, ok := value.(map[string]any); ok {
 		if kiro, ok := object["kiro"].(map[string]any); ok {
 			return kiro, true
 		}
-		for _, child := range object {
-			if found, ok := findKiroConfig(child); ok {
+		keys := make([]string, 0, len(object))
+		for key := range object {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			if found, ok := findKiroConfig(object[key]); ok {
 				return found, true
 			}
 		}
@@ -416,6 +434,7 @@ func pluginRegistration() registration {
 			Version:          pluginVersion,
 			Author:           "nguyenha935",
 			GitHubRepository: "https://github.com/nguyenha935/kiro-cpa-plugin",
+			Logo:             pluginLogoDataURI(),
 			ConfigFields:     pluginConfigFields(),
 		},
 		Capabilities: registrationCapabilities{
@@ -530,12 +549,18 @@ func decodeKiroCredential(raw []byte) (*kiroauth.KiroTokenData, error) {
 	if value, ok := shape["request_retry"]; ok {
 		_ = json.Unmarshal(value, &token.RequestRetry)
 	}
-	if token.AuthMethod == "" {
-		var authKind string
-		decodeFallback("auth_kind", &authKind)
-		if strings.EqualFold(authKind, coreauth.AuthKindAPIKey) || strings.EqualFold(authKind, "api_key") || strings.EqualFold(authKind, "api-key") {
-			token.AuthMethod = "api_key"
-		}
+	// auth_kind is host-owned and survives CPA's generic file synthesizer, while
+	// auth_method can be overwritten with an OAuth default. Let an api-key kind
+	// win over a mislabelled method, but only for a credential that genuinely
+	// cannot refresh: no refresh token and no device registration. Otherwise a
+	// refreshable credential would be routed to the bearer path and never renew.
+	var authKind string
+	decodeFallback("auth_kind", &authKind)
+	isAPIKeyKind := strings.EqualFold(authKind, coreauth.AuthKindAPIKey) ||
+		strings.EqualFold(authKind, "api_key") ||
+		strings.EqualFold(authKind, "api-key")
+	if isAPIKeyKind && token.RefreshToken == "" && token.ClientID == "" && token.ClientSecret == "" {
+		token.AuthMethod = "api_key"
 	}
 	if token.AuthMethod == "" && token.AccessToken != "" {
 		token.AuthMethod = "imported"

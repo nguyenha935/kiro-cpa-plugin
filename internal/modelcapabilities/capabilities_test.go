@@ -59,3 +59,62 @@ func TestNormalizeMaxTokensHonorsDiscoveredBounds(t *testing.T) {
 		t.Fatalf("maximum clamp = %d, want 4096", got)
 	}
 }
+
+func TestObservedSchemaWithoutMaxTokensOmitsTheField(t *testing.T) {
+	// A schema that was really read and declares no max_tokens is authoritative.
+	observed := Parse("claude-sonnet-4", json.RawMessage(`{"properties":{"output_config":{"properties":{"effort":{"enum":["low","high"]}}}}}`))
+	if !observed.SchemaObserved || observed.SupportsMaxTokens {
+		t.Fatalf("observed schema = %+v", observed)
+	}
+	if observed.AcceptsMaxTokens() {
+		t.Fatal("a schema without max_tokens must not accept a budget")
+	}
+	fields := observed.AdditionalFieldsForRequest("high", 4096)
+	if _, exists := fields["max_tokens"]; exists {
+		t.Fatalf("max_tokens was forwarded anyway: %#v", fields)
+	}
+	if _, exists := fields["output_config"]; !exists {
+		t.Fatalf("the declared effort path was dropped: %#v", fields)
+	}
+}
+
+func TestUnobservedSchemaStillForwardsClampedMaxTokens(t *testing.T) {
+	// No schema means the transport minimum still has to be enforced.
+	unobserved := Parse("kiro/auto", nil)
+	if unobserved.SchemaObserved || !unobserved.AcceptsMaxTokens() {
+		t.Fatalf("unobserved schema = %+v", unobserved)
+	}
+	fields := unobserved.AdditionalFieldsForRequest("", 16)
+	if fields["max_tokens"] != DefaultMinimumOutputTokens {
+		t.Fatalf("max_tokens = %#v, want %d", fields["max_tokens"], DefaultMinimumOutputTokens)
+	}
+}
+
+func TestDeclaredMaxTokensSchemaKeepsForwardingTheField(t *testing.T) {
+	declared := Parse("claude-opus-5", json.RawMessage(`{"properties":{"max_tokens":{"minimum":1024,"maximum":128000}}}`))
+	if !declared.SchemaObserved || !declared.AcceptsMaxTokens() {
+		t.Fatalf("declared schema = %+v", declared)
+	}
+	if got := declared.AdditionalFieldsForRequest("", 200000)["max_tokens"]; got != int64(128000) {
+		t.Fatalf("max_tokens = %#v, want 128000", got)
+	}
+}
+
+func TestSnapshotUnionsSchemaObservation(t *testing.T) {
+	t.Cleanup(func() {
+		ReplaceForAuth("auth-observed", nil)
+		ReplaceForAuth("auth-blind", nil)
+	})
+	ReplaceForAuth("auth-observed", []Capability{{ModelID: "m", SchemaObserved: true}})
+	ReplaceForAuth("auth-blind", []Capability{{ModelID: "m"}})
+	for _, capability := range Snapshot() {
+		if capability.ModelID != "m" {
+			continue
+		}
+		if !capability.SchemaObserved || capability.AcceptsMaxTokens() {
+			t.Fatalf("intersected capability = %+v", capability)
+		}
+		return
+	}
+	t.Fatal("model m disappeared from the snapshot")
+}

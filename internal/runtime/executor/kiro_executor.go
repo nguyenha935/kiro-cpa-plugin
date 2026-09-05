@@ -606,6 +606,16 @@ func normalizeKiroPayloadMaxTokens(payload []byte, capability modelcapabilities.
 	if !ok || value <= 0 {
 		return payload
 	}
+	if !capability.AcceptsMaxTokens() {
+		// The discovered schema does not declare max_tokens, so an already-Kiro
+		// body must not smuggle it through.
+		delete(fields, "max_tokens")
+		updated, err := json.Marshal(root)
+		if err != nil {
+			return payload
+		}
+		return updated
+	}
 	normalized := capability.NormalizeMaxTokens(int64(value))
 	if int64(value) == normalized {
 		return payload
@@ -3402,7 +3412,10 @@ func (e *KiroExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
 
 	ssoClient := kiroauth.NewSSOOIDCClient(e.cfg)
 
-	if authMethod == "social" || authMethod == "imported" && clientID == "" && clientSecret == "" {
+	// Kiro desktop credentials: social always, and imported only when it carries
+	// no AWS device registration. Parenthesised because the two arms are not
+	// interchangeable and precedence alone is easy to misread.
+	if authMethod == "social" || (authMethod == "imported" && clientID == "" && clientSecret == "") {
 		if region == "" {
 			region = "us-east-1"
 		}

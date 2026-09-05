@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/nguyenha935/kiro-cpa-plugin/internal/modelcapabilities"
@@ -104,5 +105,35 @@ func TestGenerateProfileContractMatchesCredentialType(t *testing.T) {
 				t.Fatalf("runtime credentials = %q/%q, want token/%q", token, profile, test.expected)
 			}
 		})
+	}
+}
+
+func TestNormalizeKiroPayloadDropsMaxTokensWhenSchemaOmitsIt(t *testing.T) {
+	payload := []byte(`{"additionalModelRequestFields":{"max_tokens":64,"output_config":{"effort":"high"}}}`)
+	observed := modelcapabilities.Capability{ModelID: "m", SchemaObserved: true}
+	updated := normalizeKiroPayloadMaxTokens(payload, observed)
+	var root map[string]any
+	if err := json.Unmarshal(updated, &root); err != nil {
+		t.Fatal(err)
+	}
+	fields, _ := root["additionalModelRequestFields"].(map[string]any)
+	if _, exists := fields["max_tokens"]; exists {
+		t.Fatalf("max_tokens survived an observed schema without it: %s", updated)
+	}
+	if _, exists := fields["output_config"]; !exists {
+		t.Fatalf("the effort field was collateral damage: %s", updated)
+	}
+}
+
+func TestNormalizeKiroPayloadClampsWhenNoSchemaWasObserved(t *testing.T) {
+	payload := []byte(`{"additionalModelRequestFields":{"max_tokens":64}}`)
+	updated := normalizeKiroPayloadMaxTokens(payload, modelcapabilities.Capability{ModelID: "m"})
+	var root map[string]any
+	if err := json.Unmarshal(updated, &root); err != nil {
+		t.Fatal(err)
+	}
+	fields, _ := root["additionalModelRequestFields"].(map[string]any)
+	if fields["max_tokens"] != float64(modelcapabilities.DefaultMinimumOutputTokens) {
+		t.Fatalf("max_tokens = %#v, want %d", fields["max_tokens"], modelcapabilities.DefaultMinimumOutputTokens)
 	}
 }
