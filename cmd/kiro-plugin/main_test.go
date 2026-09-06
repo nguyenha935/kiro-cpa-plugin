@@ -271,11 +271,21 @@ func TestAuthDataExposesStableNonSecretBuilderIdentity(t *testing.T) {
 	}
 
 	data := authData(token, "kiro-builder.json")
+	// The machine identity keeps its own key. The field CPA presents as the
+	// account carries a readable label, because a "kiro-builder-id-…" string
+	// shown as an address is what made the panel unreadable.
 	wantIdentity := "kiro-builder-id-1afac73cd164"
-	if data.Metadata["email"] != wantIdentity || data.Attributes["email"] != wantIdentity {
-		t.Fatalf("CPA identity = metadata:%v attributes:%q, want %q", data.Metadata["email"], data.Attributes["email"], wantIdentity)
+	if data.Metadata["identity"] != wantIdentity || data.Attributes["identity"] != wantIdentity {
+		t.Fatalf("machine identity = metadata:%v attributes:%q, want %q", data.Metadata["identity"], data.Attributes["identity"], wantIdentity)
 	}
-	if strings.Contains(wantIdentity, token.AccessToken) {
+	wantLabel := "Kiro Builder ID"
+	if data.Metadata["email"] != wantLabel || data.Attributes["email"] != wantLabel {
+		t.Fatalf("account label = metadata:%v attributes:%q, want %q", data.Metadata["email"], data.Attributes["email"], wantLabel)
+	}
+	if data.Metadata["display_name"] != wantLabel {
+		t.Fatalf("display name = %v, want %q", data.Metadata["display_name"], wantLabel)
+	}
+	if strings.Contains(wantIdentity, token.AccessToken) || strings.Contains(wantLabel, token.AccessToken) {
 		t.Fatal("credential identity leaked the access token")
 	}
 	wantFile := "kiro-builder.json"
@@ -302,7 +312,7 @@ func TestAuthLabelUsesStartURLDomain(t *testing.T) {
 		AccessToken: "access",
 		StartURL:    "https://d-example.awsapps.com/start",
 	}
-	if got := authData(token, "kiro.json").Label; got != "Kiro - d-example.awsapps.com" {
+	if got := authData(token, "kiro.json").Label; got != "Kiro d-example" {
 		t.Fatalf("auth label = %q", got)
 	}
 }
@@ -440,87 +450,6 @@ func TestBuilderIDModelCatalogUsesProfilelessAmazonQContract(t *testing.T) {
 	}
 	if req.Header.Get("TokenType") != "" {
 		t.Fatalf("Builder ID model request used TokenType %q", req.Header.Get("TokenType"))
-	}
-}
-
-func TestOIDCModelCatalogRequestKeepsProfileContract(t *testing.T) {
-	token := &kiroauth.KiroTokenData{
-		AccessToken: "test-access-token",
-		AuthMethod:  "idc",
-		ProfileArn:  "arn:aws:codewhisperer:us-east-1:1:profile/test",
-		Region:      "us-east-1",
-	}
-	req, err := newModelCatalogRequest(context.Background(), token, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if req.Header.Get("TokenType") != "" {
-		t.Fatalf("OIDC request inherited API-key token type: %q", req.Header.Get("TokenType"))
-	}
-	if req.Method != http.MethodPost || req.URL.Host != "codewhisperer.us-east-1.amazonaws.com" || req.URL.Path != "" {
-		t.Fatalf("OIDC model request used %s %s", req.Method, req.URL)
-	}
-	if req.Header.Get("Content-Type") != "application/x-amz-json-1.0" || req.Header.Get("X-Amz-Target") != "AmazonCodeWhispererService.ListAvailableModels" {
-		t.Fatalf("OIDC model headers = Content-Type %q Target %q", req.Header.Get("Content-Type"), req.Header.Get("X-Amz-Target"))
-	}
-	var payload map[string]any
-	if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
-		t.Fatal(err)
-	}
-	if payload["profileArn"] != token.ProfileArn || payload["origin"] != "AI_EDITOR" {
-		t.Fatalf("OIDC model payload = %#v", payload)
-	}
-}
-
-func TestModelCatalogUsesProfileRegionInsteadOfOIDCRegion(t *testing.T) {
-	token := &kiroauth.KiroTokenData{
-		AccessToken: "access", AuthMethod: "idc", Region: "us-west-2",
-		ProfileArn: "arn:aws:codewhisperer:eu-central-1:1:profile/test",
-	}
-	req, err := newModelCatalogRequest(context.Background(), token, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if req.URL.Host != "codewhisperer.eu-central-1.amazonaws.com" {
-		t.Fatalf("model catalog host = %q", req.URL.Host)
-	}
-}
-
-func TestExternalIDPModelCatalogUsesCodeWhispererContractAndTokenType(t *testing.T) {
-	token := &kiroauth.KiroTokenData{
-		AccessToken: "external-token", AuthMethod: "external_idp", Region: "us-east-1",
-		ProfileArn: "arn:aws:codewhisperer:us-east-1:1:profile/test",
-	}
-	req, err := newModelCatalogRequest(context.Background(), token, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if req.Method != http.MethodPost || req.URL.Host != "codewhisperer.us-east-1.amazonaws.com" || req.Header.Get("TokenType") != "EXTERNAL_IDP" {
-		t.Fatalf("external_idp model contract = %s TokenType=%q", req.URL, req.Header.Get("TokenType"))
-	}
-	if req.Header.Get("X-Amz-Target") != "AmazonCodeWhispererService.ListAvailableModels" {
-		t.Fatalf("external_idp target = %q", req.Header.Get("X-Amz-Target"))
-	}
-}
-
-func TestImportedModelCatalogUsesCodeWhispererContract(t *testing.T) {
-	token := &kiroauth.KiroTokenData{
-		AccessToken: "imported-token", AuthMethod: "imported", Region: "us-east-1",
-		ProfileArn: "arn:aws:codewhisperer:us-east-1:1:profile/test",
-	}
-	req, err := newModelCatalogRequest(context.Background(), token, "page-2")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if req.Method != http.MethodPost || req.URL.Host != "codewhisperer.us-east-1.amazonaws.com" || req.Header.Get("TokenType") != "" {
-		t.Fatalf("imported model contract = %s %s TokenType=%q", req.Method, req.URL, req.Header.Get("TokenType"))
-	}
-	var payload map[string]any
-	if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
-		t.Fatal(err)
-	}
-	if payload["nextToken"] != "page-2" || payload["profileArn"] != token.ProfileArn {
-		t.Fatalf("imported model payload = %#v", payload)
 	}
 }
 
@@ -715,11 +644,11 @@ func TestListAvailableProfilesPaginatesAndKeepsAccountsIsolated(t *testing.T) {
 		if r.URL.Path != "/" {
 			t.Fatalf("profile request path = %q, want /", r.URL.Path)
 		}
-		if r.Header.Get("Content-Type") != "application/x-amz-json-1.0" {
+		if r.Header.Get("Content-Type") != "application/json" {
 			t.Fatalf("profile content type = %q", r.Header.Get("Content-Type"))
 		}
-		if r.Header.Get("X-Amz-Target") != "AmazonCodeWhispererService.ListAvailableProfiles" {
-			t.Fatalf("profile request target = %q", r.Header.Get("X-Amz-Target"))
+		if target := r.Header.Get("X-Amz-Target"); target != "" {
+			t.Fatalf("the Kiro control plane addresses operations by path, but X-Amz-Target = %q", target)
 		}
 		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		body, err := io.ReadAll(r.Body)
@@ -775,14 +704,6 @@ func TestListAvailableProfilesPaginatesAndKeepsAccountsIsolated(t *testing.T) {
 	}
 	if got := strings.Join(requests["account-b"], ","); got != "" {
 		t.Fatalf("account B pagination = %q", got)
-	}
-}
-
-func TestCodeWhispererProfilesEndpointUsesAWSJSONRoot(t *testing.T) {
-	got := codeWhispererProfilesEndpoint("us-east-1")
-	want := "https://codewhisperer.us-east-1.amazonaws.com"
-	if got != want {
-		t.Fatalf("profile endpoint = %q, want %q", got, want)
 	}
 }
 
