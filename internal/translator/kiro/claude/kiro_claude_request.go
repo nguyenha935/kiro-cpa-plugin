@@ -17,10 +17,18 @@ import (
 
 // Kiro API request structs - field order determines JSON key order
 
-// KiroPayload is the top-level request structure for Kiro API
+// KiroPayload is the top-level request structure for Kiro API.
+//
+// agentMode is a real top-level field, not just the x-amzn-kiro-agent-mode
+// header. Probed against runtime.eu-central-1.kiro.dev on 2026-09-06: the
+// runtime rejects unknown top-level fields with 400 REQUEST_BODY_INVALID (a
+// top-level systemPrompt is refused that way), while agentMode is accepted with
+// 200. It was previously sent only as a header, so the body omitted a field Kiro
+// CLI includes.
 type KiroPayload struct {
 	ConversationState            KiroConversationState `json:"conversationState"`
 	ProfileArn                   string                `json:"profileArn,omitempty"`
+	AgentMode                    string                `json:"agentMode,omitempty"`
 	AdditionalModelRequestFields map[string]any        `json:"additionalModelRequestFields,omitempty"`
 }
 
@@ -193,6 +201,7 @@ func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, cap
 			History:         history,
 		},
 		ProfileArn:                   profileArn,
+		AgentMode:                    kirocommon.AgentModeVibe,
 		AdditionalModelRequestFields: capability.AdditionalFieldsForRequest(effort, gjson.GetBytes(claudeBody, "max_tokens").Int()),
 	}
 
@@ -313,16 +322,34 @@ func attachInstructionsToFirstUserMessage(history []KiroHistoryMessage, current 
 }
 
 // normalizeOrigin normalizes origin value for Kiro API compatibility
+// normalizeOrigin maps a client-supplied origin onto a value the Kiro runtime
+// accepts.
+//
+// It used to rewrite KIRO_CLI and AMAZON_Q to a bare "CLI". Measured against
+// runtime.eu-central-1.kiro.dev on 2026-09-06, that silently changes what the
+// service sends back:
+//
+//	origin=AI_EDITOR -> assistantResponseEvent, metadataEvent, meteringEvent, contextUsageEvent
+//	origin=KIRO_CLI  -> assistantResponseEvent, metadataEvent, meteringEvent, contextUsageEvent
+//	origin=CLI       -> assistantResponseEvent, metadataEvent          (no metering, no context usage)
+//
+// All three answer HTTP 200 with the same completion, so the downgrade looked
+// harmless while quietly removing the metering and context-usage events the
+// plugin relies on to report credit spend and context consumption. A caller that
+// identified itself as Kiro CLI therefore lost its own usage accounting.
+//
+// KIRO_CLI is passed through because the service accepts it verbatim and it is
+// the origin Kiro CLI itself reports.
 func normalizeOrigin(origin string) string {
 	switch origin {
 	case "KIRO_CLI":
-		return "CLI"
-	case "KIRO_AI_EDITOR":
+		return "KIRO_CLI"
+	case "KIRO_AI_EDITOR", "KIRO_IDE":
 		return "AI_EDITOR"
 	case "AMAZON_Q":
-		return "CLI"
-	case "KIRO_IDE":
-		return "AI_EDITOR"
+		// Amazon Q is not part of Kiro's origin enum. Map it onto the Kiro CLI
+		// origin rather than "CLI" so metering survives.
+		return "KIRO_CLI"
 	default:
 		return origin
 	}

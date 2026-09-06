@@ -31,8 +31,16 @@ func TestResponsesRequestBuildsValidKiroPayload(t *testing.T) {
 	if got := parsed.Get("conversationState.currentMessage.userInputMessage.content").String(); got != "Be concise.\n\nRun pwd" {
 		t.Fatalf("current message = %q; payload=%s", got, payload)
 	}
-	if parsed.Get("systemPrompt").Exists() || parsed.Get("agentMode").Exists() {
-		t.Fatalf("payload contains feature-gated fields: %s", payload)
+	// systemPrompt and agentMode were previously both treated as feature gated.
+	// Probed against runtime.eu-central-1.kiro.dev on 2026-09-06 they behave
+	// differently: the runtime rejects unknown top-level fields, and a top-level
+	// systemPrompt is refused with 400 REQUEST_BODY_INVALID, while agentMode is
+	// accepted with 200. So systemPrompt must stay out and agentMode must be sent.
+	if parsed.Get("systemPrompt").Exists() {
+		t.Fatalf("systemPrompt is rejected by the runtime and must not be sent: %s", payload)
+	}
+	if got := parsed.Get("agentMode").String(); got != "VIBE" {
+		t.Fatalf("agentMode = %q, want VIBE; payload=%s", got, payload)
 	}
 	if got := parsed.Get("conversationState.currentMessage.userInputMessage.userInputMessageContext.tools.0.toolSpecification.name").String(); got != "exec_command" {
 		t.Fatalf("tool name = %q; payload=%s", got, payload)
@@ -138,8 +146,14 @@ func TestAnthropicSystemInstructionsArePreservedWithoutFeatureGatedFields(t *tes
 	)
 
 	parsed := gjson.ParseBytes(payload)
-	if parsed.Get("systemPrompt").Exists() || parsed.Get("agentMode").Exists() {
-		t.Fatalf("payload contains feature-gated fields: %s", payload)
+	// Instructions are folded into the first user turn because the runtime has no
+	// usable systemPrompt field, not because agentMode is unsafe. Verified: a
+	// top-level systemPrompt is refused with 400, agentMode is accepted with 200.
+	if parsed.Get("systemPrompt").Exists() {
+		t.Fatalf("systemPrompt is rejected by the runtime and must not be sent: %s", payload)
+	}
+	if got := parsed.Get("agentMode").String(); got != "VIBE" {
+		t.Fatalf("agentMode = %q, want VIBE; payload=%s", got, payload)
 	}
 	if got := parsed.Get("conversationState.currentMessage.userInputMessage.content").String(); got != "Base instructions.\n\nSession instructions.\n\nReply exactly OK." {
 		t.Fatalf("current user content = %q", got)

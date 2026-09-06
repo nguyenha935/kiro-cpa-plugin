@@ -8,8 +8,12 @@ import (
 
 func TestKiroClientRegistrationMatchesSupportedOIDCContract(t *testing.T) {
 	payload := kiroClientRegistrationPayload()
-	if payload["clientName"] != "kiro-oauth-client" {
-		t.Fatalf("clientName = %#v", payload["clientName"])
+	// The name is deliberately not pinned to a literal here. It is what the AWS
+	// access portal displays, a release build can override it with -ldflags -X,
+	// and registration_test.go owns the rule that it must name the Kiro client
+	// rather than the proxy.
+	if payload["clientName"] != ClientName() {
+		t.Fatalf("clientName = %#v, want %q", payload["clientName"], ClientName())
 	}
 	if payload["issuerUrl"] != "https://identitycenter.amazonaws.com/ssoins-722374e8c3c8e6c6" {
 		t.Fatalf("issuerUrl = %#v", payload["issuerUrl"])

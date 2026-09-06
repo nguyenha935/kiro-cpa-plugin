@@ -78,15 +78,33 @@ func TestObservedSchemaWithoutMaxTokensOmitsTheField(t *testing.T) {
 	}
 }
 
-func TestUnobservedSchemaStillForwardsClampedMaxTokens(t *testing.T) {
-	// No schema means the transport minimum still has to be enforced.
-	unobserved := Parse("kiro/auto", nil)
-	if unobserved.SchemaObserved || !unobserved.AcceptsMaxTokens() {
+func TestUnobservedSchemaForwardsNothing(t *testing.T) {
+	// A model whose catalogue entry carries no schema rejects
+	// additionalModelRequestFields outright: measured HTTP 400
+	// "additionalModelRequestFields is not supported for this model" for
+	// max_tokens 1024, 4096, 64000 and 200000, and for an empty object, on
+	// claude-sonnet-4.5, claude-haiku-4.5, deepseek-3.2 and glm-5 across both
+	// credential kinds. Forwarding a clamped budget there fails the request.
+	unobserved := Parse("claude-sonnet-4.5", nil)
+	if unobserved.SchemaObserved || unobserved.AcceptsMaxTokens() {
 		t.Fatalf("unobserved schema = %+v", unobserved)
 	}
-	fields := unobserved.AdditionalFieldsForRequest("", 16)
-	if fields["max_tokens"] != DefaultMinimumOutputTokens {
-		t.Fatalf("max_tokens = %#v, want %d", fields["max_tokens"], DefaultMinimumOutputTokens)
+	if fields := unobserved.AdditionalFieldsForRequest("", 16); fields != nil {
+		t.Fatalf("an unobserved schema built fields anyway: %#v", fields)
+	}
+	if fields := unobserved.AdditionalFieldsForRequest("high", 64000); fields != nil {
+		t.Fatalf("an unobserved schema built fields anyway: %#v", fields)
+	}
+}
+
+func TestDeclaredMaxTokensWithoutAMinimumStillGetsTheTransportFloor(t *testing.T) {
+	// The 1024 floor only applies where the property is accepted at all.
+	declared := Parse("m", json.RawMessage(`{"properties":{"max_tokens":{"type":"integer"}}}`))
+	if !declared.AcceptsMaxTokens() || declared.MinimumOutputTokens != 0 {
+		t.Fatalf("declared schema = %+v", declared)
+	}
+	if got := declared.AdditionalFieldsForRequest("", 16)["max_tokens"]; got != DefaultMinimumOutputTokens {
+		t.Fatalf("max_tokens = %#v, want %d", got, DefaultMinimumOutputTokens)
 	}
 }
 
@@ -100,19 +118,54 @@ func TestDeclaredMaxTokensSchemaKeepsForwardingTheField(t *testing.T) {
 	}
 }
 
-func TestSnapshotUnionsSchemaObservation(t *testing.T) {
+// forgetAuth removes the registered credentials again once the test ends.
+// ReplaceForAuth with an empty list is not enough: it leaves the credential in
+// the registry advertising no models, and Snapshot intersects across every
+// registered credential, so the leftover would delete the models of any later
+// test in this package.
+func forgetAuth(t *testing.T, authIDs ...string) {
+	t.Helper()
 	t.Cleanup(func() {
-		ReplaceForAuth("auth-observed", nil)
-		ReplaceForAuth("auth-blind", nil)
+		registry.Lock()
+		defer registry.Unlock()
+		for _, authID := range authIDs {
+			delete(registry.byAuth, authID)
+		}
 	})
+}
+
+func TestSnapshotWithholdsABudgetOneCredentialCannotAccept(t *testing.T) {
+	// The advertised capability has to be safe for whichever credential the
+	// router picks, so one credential that cannot accept max_tokens withholds it
+	// for the whole snapshot.
+	forgetAuth(t, "auth-declares", "auth-silent")
+	ReplaceForAuth("auth-declares", []Capability{{ModelID: "m", SchemaObserved: true, SupportsMaxTokens: true, MinimumOutputTokens: 1024, MaximumOutputTokens: 64000}})
+	ReplaceForAuth("auth-silent", []Capability{{ModelID: "m"}})
+	for _, capability := range Snapshot() {
+		if capability.ModelID != "m" {
+			continue
+		}
+		if capability.AcceptsMaxTokens() {
+			t.Fatalf("a budget survived a credential that cannot accept it: %+v", capability)
+		}
+		if capability.MinimumOutputTokens != 0 || capability.MaximumOutputTokens != 0 {
+			t.Fatalf("stale bounds outlived the intersection: %+v", capability)
+		}
+		return
+	}
+	t.Fatal("model m disappeared from the snapshot")
+}
+
+func TestSnapshotUnionsSchemaObservation(t *testing.T) {
+	forgetAuth(t, "auth-observed", "auth-blind")
 	ReplaceForAuth("auth-observed", []Capability{{ModelID: "m", SchemaObserved: true}})
 	ReplaceForAuth("auth-blind", []Capability{{ModelID: "m"}})
 	for _, capability := range Snapshot() {
 		if capability.ModelID != "m" {
 			continue
 		}
-		if !capability.SchemaObserved || capability.AcceptsMaxTokens() {
-			t.Fatalf("intersected capability = %+v", capability)
+		if !capability.SchemaObserved {
+			t.Fatalf("schema observation did not union: %+v", capability)
 		}
 		return
 	}

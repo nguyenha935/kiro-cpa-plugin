@@ -30,3 +30,11 @@ func PrependInstructions(content, instructions string) string {
 	}
 	return strings.Join(parts, "\n\n")
 }
+
+// AgentModeVibe is the interactive agent mode, sent both as the
+// x-amzn-kiro-agent-mode header and as the top-level agentMode body field.
+//
+// The value is upper case because that is the spelling in Kiro's own enum,
+// alongside SPEC and AUTOPILOT. The header was measured to be case-insensitive,
+// but the body field is a modelled enum, so the canonical spelling is used.
+const AgentModeVibe = "VIBE"
