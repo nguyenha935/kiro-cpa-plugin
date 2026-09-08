@@ -1257,8 +1257,18 @@ func TestIdentityIsResolvedOnEveryCredentialCreationPath(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read %s: %v", source.file, err)
 		}
-		if !strings.Contains(string(body), source.anchor) {
-			t.Fatalf("%s no longer resolves the identity before the credential is stored", source.file)
+		// Git may check out Go source with CRLF on Windows. Exercise both
+		// checkout forms while preserving the exact call-site assertion.
+		lf := strings.ReplaceAll(string(body), "\r\n", "\n")
+		for _, checkout := range []struct{ name, body string }{
+			{"LF", lf},
+			{"CRLF", strings.ReplaceAll(lf, "\n", "\r\n")},
+		} {
+			t.Run(source.file+"/"+checkout.name, func(t *testing.T) {
+				if !strings.Contains(strings.ReplaceAll(checkout.body, "\r\n", "\n"), source.anchor) {
+					t.Fatalf("%s no longer resolves the identity before the credential is stored", source.file)
+				}
+			})
 		}
 	}
 }
