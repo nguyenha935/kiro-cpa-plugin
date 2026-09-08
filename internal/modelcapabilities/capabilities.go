@@ -24,14 +24,20 @@ type Capability struct {
 	MinimumOutputTokens int64      `json:"minimum_output_tokens,omitempty"`
 	MaximumOutputTokens int64      `json:"maximum_output_tokens,omitempty"`
 	// SchemaObserved records that a request-fields schema was actually read for
-	// this model. It separates "the schema is unavailable" from "the schema was
-	// read and declares no max_tokens", which SupportsMaxTokens alone cannot do.
+	// this model. It does not gate what is forwarded — Kiro treats "no schema"
+	// and "a schema that declares no max_tokens" identically — but the capability
+	// diagnostics endpoint needs the two apart to explain why a budget was
+	// dropped for one model and honoured for another.
 	SchemaObserved bool `json:"schema_observed,omitempty"`
 }
 
-// DefaultMinimumOutputTokens is enforced by the Kiro transport.  Kiro
-// rejects additionalModelRequestFields.max_tokens values below 1024 with
-// REQUEST_BODY_INVALID, even when the client-facing schema is unavailable.
+// DefaultMinimumOutputTokens is the floor every Kiro schema observed so far
+// declares for max_tokens. A value below it is rejected with
+// REQUEST_BODY_INVALID ("Invalid additionalModelRequestFields: must have a
+// minimum value of 1024.0"), so it is applied as a backstop for a model that
+// declares max_tokens without a minimum of its own. It says nothing about
+// models that do not declare the property at all: those reject the field
+// outright, whatever its value, which is AcceptsMaxTokens' job.
 const DefaultMinimumOutputTokens int64 = 1024
 
 // NormalizeMaxTokens returns a transport-safe output budget. A zero/negative
@@ -77,13 +83,20 @@ func (c Capability) AdditionalFields(effort string) map[string]any {
 }
 
 // AcceptsMaxTokens reports whether an output budget may be forwarded through
-// additionalModelRequestFields. A schema that was actually read is
-// authoritative: if it declares no max_tokens the field is omitted. When no
-// schema was observed the field is still forwarded, because Kiro rejects
-// requests carrying a budget below DefaultMinimumOutputTokens on exactly those
-// models whose schema is unavailable.
+// additionalModelRequestFields. Only a schema that declares max_tokens permits
+// it. Measured against both credential kinds on 2026-09-05: every model whose
+// catalogue entry carries no additionalModelRequestFieldsSchema answers any
+// budget, and even an empty object, with HTTP 400
+// {"message":"additionalModelRequestFields is not supported for this model",
+// "reason":"REQUEST_BODY_INVALID"} — 9 of 9 Builder ID models and 10 of 19 IDC
+// ones. A schema that was read but omits the property answers
+// "property 'max_tokens' is not defined in the schema and the schema does not
+// allow additional properties", because every schema sets
+// additionalProperties: false. So an unknown or absent schema means omit, never
+// forward: a missing budget only costs Kiro's own default, while an unwanted
+// one fails the request outright.
 func (c Capability) AcceptsMaxTokens() bool {
-	return c.SupportsMaxTokens || !c.SchemaObserved
+	return c.SupportsMaxTokens
 }
 
 func (c Capability) AdditionalFieldsForRequest(effort string, maxTokens int64) map[string]any {
@@ -240,8 +253,9 @@ func Snapshot() []Capability {
 			}
 			current.InputTokenLimit = minimumPositive(current.InputTokenLimit, next.InputTokenLimit)
 			// Observation unions while support intersects: one credential having
-			// read the schema is enough to know it exists, but the forwarded
-			// field must be safe for every credential in the snapshot.
+			// read the schema is enough for the diagnostics endpoint to report
+			// that it exists, while the forwarded field stays gated on
+			// SupportsMaxTokens, which every credential must agree on.
 			current.SchemaObserved = current.SchemaObserved || next.SchemaObserved
 			if !current.SupportsMaxTokens || !next.SupportsMaxTokens {
 				current.SupportsMaxTokens = false

@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+
+	kirocommon "github.com/nguyenha935/kiro-cpa-plugin/internal/translator/kiro/common"
 )
 
 func TestApplyKiroClientHeadersUsesCurrentPlatform(t *testing.T) {
@@ -29,7 +31,7 @@ func TestApplyKiroClientHeadersUsesCurrentPlatform(t *testing.T) {
 			t.Fatalf("%s contains a fabricated platform identity: %q", name, value)
 		}
 	}
-	if req.Header.Get("x-amzn-kiro-agent-mode") != kiroAgentModeVibe {
+	if req.Header.Get("x-amzn-kiro-agent-mode") != kirocommon.AgentModeVibe {
 		t.Fatal("IDC request did not retain the Kiro agent mode header")
 	}
 }

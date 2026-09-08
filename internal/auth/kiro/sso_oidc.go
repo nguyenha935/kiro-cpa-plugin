@@ -16,9 +16,32 @@ import (
 
 const (
 	defaultIDCRegion = "us-east-1"
-	kiroClientName   = "kiro-oauth-client"
 	kiroIssuerURL    = "https://identitycenter.amazonaws.com/ssoins-722374e8c3c8e6c6"
 )
+
+// clientName is the name RegisterClient records for this OAuth client. IAM
+// Identity Center shows it on the authorization consent screen and in the
+// account's list of registered applications in the AWS access portal, so it is
+// the one piece of this plugin an administrator actually reads.
+//
+// It used to be "kiro-oauth-client", which advertised the proxy rather than the
+// client it emulates: the portal listed an entry no user recognised next to the
+// genuine Kiro CLI registration. Release builds can pin it with
+// -ldflags -X, the same way clientVersion is pinned, so the value can be matched
+// to a given Kiro CLI release without editing code.
+//
+// Changing it only affects new registrations. RegisterClient runs on every
+// device login, so an existing credential keeps the name it was registered with
+// until it is authorised again.
+var clientName = "Kiro CLI"
+
+// ClientName reports the registered OAuth client name.
+func ClientName() string {
+	if name := strings.TrimSpace(clientName); name != "" {
+		return name
+	}
+	return "Kiro CLI"
+}
 
 var kiroScopes = []string{
 	"codewhisperer:completions",
@@ -95,7 +118,7 @@ func (c *SSOOIDCClient) RegisterClientWithRegion(ctx context.Context, region str
 
 func kiroClientRegistrationPayload() map[string]any {
 	return map[string]any{
-		"clientName": kiroClientName,
+		"clientName": ClientName(),
 		"clientType": "public",
 		"scopes":     append([]string(nil), kiroScopes...),
 		"grantTypes": []string{"urn:ietf:params:oauth:grant-type:device_code", "refresh_token"},

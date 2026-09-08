@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/google/uuid"
 	kiroauth "github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro"
+	"github.com/nguyenha935/kiro-cpa-plugin/internal/kiroroute"
 	"github.com/nguyenha935/kiro-cpa-plugin/internal/modelcapabilities"
 	kiroclaude "github.com/nguyenha935/kiro-cpa-plugin/internal/translator/kiro/claude"
 	kirocommon "github.com/nguyenha935/kiro-cpa-plugin/internal/translator/kiro/common"
@@ -53,7 +55,16 @@ const (
 	ErrStreamFatal     = "fatal"     // Connection/authentication errors, not recoverable
 	ErrStreamMalformed = "malformed" // Format errors, data cannot be parsed
 
-	kiroAgentModeVibe = "vibe"
+	// kiroLargePayloadBytes is the point past which a request is worth flagging.
+	//
+	// It is a reporting threshold, not a rejection: large conversations are
+	// legitimate. The value is calibrated against real traffic rather than
+	// guessed. Measured over a working session on 2026-09-06, ordinary
+	// claude-opus-5 turns carried 353k to 500k input tokens in 1.19 MB to 1.39 MB
+	// requests and all succeeded, so an earlier 512 KiB threshold fired on
+	// routine traffic. A warning that fires constantly is ignored when it finally
+	// matters, so the bar sits above the observed normal range.
+	kiroLargePayloadBytes = 2 << 20
 
 	kiroBuilderIDProfileARN = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
 	kiroSocialProfileARN    = "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
@@ -320,205 +331,124 @@ type kiroEndpointConfig struct {
 // Used when no region is specified in auth metadata.
 const kiroDefaultRegion = "us-east-1"
 
-// extractRegionFromProfileARN extracts the AWS region from a ProfileARN.
-// ARN format: arn:aws:codewhisperer:REGION:ACCOUNT:profile/PROFILE_ID
-// Returns empty string if region cannot be extracted.
-func extractRegionFromProfileARN(profileArn string) string {
-	if profileArn == "" {
+// kiroRoutingCredential lifts the routing facts out of CPA auth metadata so the
+// executor and the plugin binary resolve endpoints through the same code.
+func kiroRoutingCredential(auth *cliproxyauth.Auth) kiroroute.Credential {
+	credential := kiroroute.Credential{}
+	if auth == nil || auth.Metadata == nil {
+		return credential
+	}
+	read := func(key string) string {
+		if value, ok := auth.Metadata[key].(string); ok {
+			return strings.TrimSpace(value)
+		}
 		return ""
 	}
-	parts := strings.Split(profileArn, ":")
-	if len(parts) >= 4 && parts[3] != "" {
-		return parts[3]
-	}
-	return ""
+	credential.AuthMethod = read("auth_method")
+	credential.Provider = read("provider")
+	credential.ProfileARN = read("profile_arn")
+	credential.OIDCRegion = read("region")
+	credential.APIRegion = read("api_region")
+	return credential
 }
 
-// buildKiroEndpointConfigs creates endpoint configurations for the specified region.
-// This enables dynamic region support for Enterprise/IdC users in non-us-east-1 regions.
-//
-// Uses Q endpoint (q.{region}.amazonaws.com) as primary for ALL auth types:
-// - Works universally across all AWS regions (CodeWhisperer endpoint only exists in us-east-1)
-// - Uses /generateAssistantResponse path with AI_EDITOR origin
-// - Does NOT require X-Amz-Target header
-//
-// The AmzTarget field is kept for backward compatibility but should be empty
-// to indicate that the header should NOT be set.
-func buildKiroEndpointConfigs(region string) []kiroEndpointConfig {
-	if region == "" {
-		region = kiroDefaultRegion
-	}
-	return []kiroEndpointConfig{
-		{
-			// Amazon Q surface for API-key credentials.
-			URL:       fmt.Sprintf("https://q.%s.amazonaws.com/generateAssistantResponse", region),
-			Origin:    "AI_EDITOR",
-			AmzTarget: "", // Empty = don't set X-Amz-Target header
-			Name:      "AmazonQ",
-		},
-		{
-			// CodeWhisperer surface for IDC and external IdP credentials.
-			URL:       fmt.Sprintf("https://codewhisperer.%s.amazonaws.com/generateAssistantResponse", region),
-			Origin:    "AI_EDITOR",
-			AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
-			Name:      "CodeWhisperer",
-		},
-		{
-			// Kiro desktop runtime for Builder ID credentials.
-			URL:       fmt.Sprintf("https://runtime.%s.kiro.dev/generateAssistantResponse", region),
-			Origin:    "AI_EDITOR",
-			AmzTarget: "",
-			Name:      "KiroRuntime",
-		},
-	}
+// resolveKiroAccount resolves the routing context for a credential.
+func resolveKiroAccount(auth *cliproxyauth.Auth) kiroroute.Account {
+	return kiroroute.Resolve(kiroRoutingCredential(auth))
 }
 
-// resolveKiroAPIRegion determines the AWS region for Kiro API calls.
-// Region priority:
-// 1. auth.Metadata["api_region"] - explicit API region override
-// 2. ProfileARN region - extracted from arn:aws:service:REGION:account:resource
-// 3. kiroDefaultRegion (us-east-1) - fallback
-// Note: OIDC "region" is NOT used - it's for token refresh, not API calls
-func resolveKiroAPIRegion(auth *cliproxyauth.Auth) string {
-	if auth == nil || auth.Metadata == nil {
-		return kiroDefaultRegion
-	}
-	// Priority 1: Explicit api_region override
-	if r, ok := auth.Metadata["api_region"].(string); ok && r != "" {
-		log.Debugf("kiro: using region %s (source: api_region)", r)
-		return r
-	}
-	// Priority 2: Extract from ProfileARN
-	if profileArn, ok := auth.Metadata["profile_arn"].(string); ok && profileArn != "" {
-		if arnRegion := extractRegionFromProfileARN(profileArn); arnRegion != "" {
-			log.Debugf("kiro: using region %s (source: profile_arn)", arnRegion)
-			return arnRegion
-		}
-	}
-	method, _ := auth.Metadata["auth_method"].(string)
-	if strings.EqualFold(strings.TrimSpace(method), "api_key") {
-		if region, ok := auth.Metadata["region"].(string); ok && awsRegionPattern.MatchString(strings.TrimSpace(region)) {
-			return strings.TrimSpace(region)
-		}
-	}
-	// Note: OIDC "region" field is NOT used for API endpoint
-	// Kiro API only exists in us-east-1, while OIDC region can vary (e.g., ap-northeast-2)
-	// Using OIDC region for API calls causes DNS failures
-	log.Debugf("kiro: using region %s (source: default)", kiroDefaultRegion)
-	return kiroDefaultRegion
-}
-
-// kiroEndpointConfigs is kept for backward compatibility with default us-east-1 region.
-// Prefer using buildKiroEndpointConfigs(region) for dynamic region support.
-var kiroEndpointConfigs = buildKiroEndpointConfigs(kiroDefaultRegion)
-
-// getKiroEndpointConfigs returns the list of Kiro API endpoint configurations to try in order.
-// Supports dynamic region based on auth metadata "api_region", "profile_arn", or "region" field.
-// Supports reordering based on "preferred_endpoint" in auth metadata/attributes.
+// getKiroEndpointConfigs returns the single endpoint a credential is allowed to
+// use, wrapped in a slice so the surrounding retry loop keeps its shape.
 //
-// Region priority:
-// 1. auth.Metadata["api_region"] - explicit API region override
-// 2. ProfileARN region - extracted from arn:aws:service:REGION:account:resource
-// 3. kiroDefaultRegion (us-east-1) - fallback
-// Note: OIDC "region" is NOT used - it's for token refresh, not API calls
+// It used to return all three surfaces ordered by a guess at the credential's
+// kind, leaving the other two as fallbacks. That was unsafe in both directions.
+// A credential rejected by the wrong surface produced an authentication failure
+// recorded against the account, and a profile in eu-central-1 led with
+// codewhisperer.eu-central-1.amazonaws.com, a hostname with no DNS record, so
+// every request paid a connection failure before finding a working host.
+//
+// A credential is valid on exactly one runtime, so there is nothing to fall back
+// to. Resolving to one endpoint also removes the cross-surface retry fan-out,
+// which is the behaviour most likely to look anomalous to AWS.
 func getKiroEndpointConfigs(auth *cliproxyauth.Auth) []kiroEndpointConfig {
-	if auth == nil {
-		return kiroEndpointConfigs
-	}
-
-	// Determine API region using shared resolution logic
-	region := resolveKiroAPIRegion(auth)
-
-	// Build endpoint configs for the specified region
-	endpointConfigs := buildKiroEndpointConfigs(region)
-
-	// Order surfaces by credential type. A credential rejected by the wrong
-	// surface can otherwise look like an invalid account even though it is valid.
-	if auth.Metadata != nil {
-		authMethod, _ := auth.Metadata["auth_method"].(string)
-		switch strings.ToLower(strings.TrimSpace(authMethod)) {
-		case "builder-id", "social", "imported":
-			return orderKiroEndpoints(endpointConfigs, "KiroRuntime")
-		case "idc", "external_idp":
-			return orderKiroEndpoints(endpointConfigs, "CodeWhisperer")
-		case "api_key":
-			return orderKiroEndpoints(endpointConfigs, "AmazonQ")
+	account := resolveKiroAccount(auth)
+	url, err := account.RuntimeURL()
+	if err != nil {
+		// An unresolvable region falls back to the default rather than emitting a
+		// hostname that cannot exist.
+		log.Warnf("kiro: %v; falling back to %s", err, kiroDefaultRegion)
+		account.Region = kiroDefaultRegion
+		url, err = account.RuntimeURL()
+		if err != nil {
+			return nil
 		}
 	}
 
-	// Check for preference
-	var preference string
-	if auth.Metadata != nil {
-		if p, ok := auth.Metadata["preferred_endpoint"].(string); ok {
-			preference = p
-		}
+	name := "KiroRuntime"
+	if account.Provider == kiroroute.ProviderAPIKey {
+		name = "AmazonQ"
 	}
-	// Check attributes as fallback (e.g. from HTTP headers)
-	if preference == "" && auth.Attributes != nil {
-		preference = auth.Attributes["preferred_endpoint"]
-	}
-
-	if preference == "" {
-		return endpointConfigs
-	}
-
-	preference = strings.ToLower(strings.TrimSpace(preference))
-
-	// Create new slice to avoid modifying global state
-	var sorted []kiroEndpointConfig
-	var remaining []kiroEndpointConfig
-
-	for _, cfg := range endpointConfigs {
-		name := strings.ToLower(cfg.Name)
-		// Check for matches
-		// CodeWhisperer aliases: codewhisperer, ide
-		// AmazonQ aliases: amazonq, q, cli
-		isMatch := false
-		if (preference == "codewhisperer" || preference == "ide") && name == "codewhisperer" {
-			isMatch = true
-		} else if (preference == "amazonq" || preference == "q" || preference == "cli") && name == "amazonq" {
-			isMatch = true
-		}
-
-		if isMatch {
-			sorted = append(sorted, cfg)
-		} else {
-			remaining = append(remaining, cfg)
-		}
-	}
-
-	// If preference didn't match anything, return default
-	if len(sorted) == 0 {
-		return endpointConfigs
-	}
-
-	// Combine: preferred first, then others
-	return append(sorted, remaining...)
-}
-
-func orderKiroEndpoints(configs []kiroEndpointConfig, names ...string) []kiroEndpointConfig {
-	ordered := make([]kiroEndpointConfig, 0, len(configs))
-	seen := make(map[string]struct{}, len(configs))
-	for _, name := range names {
-		for _, cfg := range configs {
-			if strings.EqualFold(cfg.Name, name) {
-				ordered = append(ordered, cfg)
-				seen[strings.ToLower(cfg.Name)] = struct{}{}
-			}
-		}
-	}
-	for _, cfg := range configs {
-		if _, ok := seen[strings.ToLower(cfg.Name)]; !ok {
-			ordered = append(ordered, cfg)
-		}
-	}
-	return ordered
+	log.Debugf("kiro: routing %s credential (provider=%s) to %s in %s with origin %s",
+		account.AuthMethod, account.Provider, name, account.Region, account.Origin)
+	return []kiroEndpointConfig{{
+		URL:       url,
+		Origin:    account.Origin,
+		AmzTarget: "",
+		Name:      name,
+	}}
 }
 
 // KiroExecutor handles requests to AWS CodeWhisperer (Kiro) API.
 type KiroExecutor struct {
 	cfg          *config.Config
 	refreshLocks sync.Map // one mutex per credential; unrelated accounts refresh concurrently
+}
+
+// applyKiroRetryHeaders records which attempt this actually is.
+//
+// Amz-Sdk-Request used to be hardcoded to "attempt=1; max=3" inside the retry
+// loop, so a second or third attempt still declared itself the first. A client
+// that misreports its own retry state is the signal an abuse detector looks for,
+// and it also makes upstream throttling advice useless.
+//
+// x-kiro-attempt carries the same counter and is what Kiro CLI sends through its
+// AttemptHeaderInterceptor.
+func applyKiroRetryHeaders(req *http.Request, attempt, maxAttempts int) {
+	if req == nil {
+		return
+	}
+	if attempt < 1 {
+		attempt = 1
+	}
+	if maxAttempts < attempt {
+		maxAttempts = attempt
+	}
+	req.Header.Set("Amz-Sdk-Request", fmt.Sprintf("attempt=%d; max=%d", attempt, maxAttempts))
+	req.Header.Set("x-kiro-attempt", strconv.Itoa(attempt))
+	req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
+}
+
+// applyKiroProfileHeader mirrors the profile ARN into the header Kiro binds to
+// profile_arn on the streaming service. Kiro CLI sends it alongside the body
+// field; omitting it left the plugin distinguishable from the client it emulates.
+func applyKiroProfileHeader(req *http.Request, profileArn string) {
+	if req == nil {
+		return
+	}
+	if profileArn = strings.TrimSpace(profileArn); profileArn != "" {
+		req.Header.Set("x-amzn-kiro-profile-arn", profileArn)
+	}
+}
+
+// warnOnOversizedPayload records requests large enough that a retry multiplies
+// real traffic. A 1.19 MB conversation was observed in production; retried, that
+// is several megabytes for a single answer. The size is surfaced so a later
+// rejection can be correlated with it instead of guessed at.
+func warnOnOversizedPayload(payload []byte, endpointName string) {
+	if len(payload) >= kiroLargePayloadBytes {
+		log.Warnf("kiro: oversized upstream payload: bytes=%d endpoint=%s; a retry repeats this volume",
+			len(payload), endpointName)
+	}
 }
 
 func setKiroAuthorization(req *http.Request, auth *cliproxyauth.Auth, accessToken string) {
@@ -602,25 +532,32 @@ func normalizeKiroPayloadMaxTokens(payload []byte, capability modelcapabilities.
 	if !ok {
 		return payload
 	}
-	value, ok := fields["max_tokens"].(float64)
-	if !ok || value <= 0 {
-		return payload
-	}
-	if !capability.AcceptsMaxTokens() {
-		// The discovered schema does not declare max_tokens, so an already-Kiro
-		// body must not smuggle it through.
-		delete(fields, "max_tokens")
-		updated, err := json.Marshal(root)
-		if err != nil {
-			return payload
+	changed := false
+	if raw, present := fields["max_tokens"]; present {
+		// A non-numeric value decodes to zero here, and zero can satisfy no
+		// declared minimum, so both reach the same branch.
+		value, _ := raw.(float64)
+		if value <= 0 || !capability.AcceptsMaxTokens() {
+			// Kiro accepts max_tokens only on models whose schema declares it.
+			// Everywhere else the property itself is rejected, so an already-Kiro
+			// body must not smuggle it through.
+			delete(fields, "max_tokens")
+			changed = true
+		} else if normalized := capability.NormalizeMaxTokens(int64(value)); normalized != int64(value) {
+			fields["max_tokens"] = normalized
+			changed = true
 		}
-		return updated
 	}
-	normalized := capability.NormalizeMaxTokens(int64(value))
-	if int64(value) == normalized {
+	if len(fields) == 0 {
+		// An empty additionalModelRequestFields is rejected exactly like an
+		// unsupported property ("additionalModelRequestFields is not supported for
+		// this model"), so the container leaves with its last field.
+		delete(root, "additionalModelRequestFields")
+		changed = true
+	}
+	if !changed {
 		return payload
 	}
-	fields["max_tokens"] = normalized
 	updated, err := json.Marshal(root)
 	if err != nil {
 		return payload
@@ -679,7 +616,7 @@ func applyKiroClientHeaders(req *http.Request, auth *cliproxyauth.Auth) {
 	req.Header.Set("User-Agent", kiroauth.ClientUserAgent())
 	req.Header.Set("X-Amz-User-Agent", kiroauth.ClientAWSUserAgent("codewhispererstreaming"))
 	if isIDCAuth(auth) {
-		req.Header.Set("x-amzn-kiro-agent-mode", kiroAgentModeVibe)
+		req.Header.Set("x-amzn-kiro-agent-mode", kirocommon.AgentModeVibe)
 	}
 }
 
@@ -695,8 +632,7 @@ func (e *KiroExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth
 
 	applyKiroClientHeaders(req, auth)
 
-	req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
-	req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
+	applyKiroRetryHeaders(req, 1, 1)
 	setKiroAuthorization(req, auth, accessToken)
 	var attrs map[string]string
 	if auth != nil {
@@ -883,13 +819,13 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				httpReq.Header.Set("X-Amz-Target", endpointConfig.AmzTarget)
 			}
 			// Kiro-specific headers
-			httpReq.Header.Set("x-amzn-kiro-agent-mode", kiroAgentModeVibe)
+			httpReq.Header.Set("x-amzn-kiro-agent-mode", kirocommon.AgentModeVibe)
 			httpReq.Header.Set("x-amzn-codewhisperer-optout", "true")
 
 			applyKiroClientHeaders(httpReq, auth)
-
-			httpReq.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
-			httpReq.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
+			applyKiroProfileHeader(httpReq, profileArn)
+			applyKiroRetryHeaders(httpReq, attempt+1, maxRetries+1)
+			warnOnOversizedPayload(kiroPayload, endpointConfig.Name)
 
 			setKiroAuthorization(httpReq, auth, accessToken)
 
@@ -1327,13 +1263,13 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 				httpReq.Header.Set("X-Amz-Target", endpointConfig.AmzTarget)
 			}
 			// Kiro-specific headers
-			httpReq.Header.Set("x-amzn-kiro-agent-mode", kiroAgentModeVibe)
+			httpReq.Header.Set("x-amzn-kiro-agent-mode", kirocommon.AgentModeVibe)
 			httpReq.Header.Set("x-amzn-codewhisperer-optout", "true")
 
 			applyKiroClientHeaders(httpReq, auth)
-
-			httpReq.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
-			httpReq.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
+			applyKiroProfileHeader(httpReq, profileArn)
+			applyKiroRetryHeaders(httpReq, attempt+1, maxRetries+1)
+			warnOnOversizedPayload(kiroPayload, endpointConfig.Name)
 
 			// Bearer token authentication for all auth types (Builder ID, IDC, social, etc.)
 			setKiroAuthorization(httpReq, auth, accessToken)

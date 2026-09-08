@@ -15,6 +15,7 @@ import (
 	"time"
 
 	kiroauth "github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro"
+	"github.com/nguyenha935/kiro-cpa-plugin/internal/kiroroute"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
@@ -133,6 +134,7 @@ func handleConnectAPI(req pluginapi.ManagementRequest) ([]byte, error) {
 		_ = updateLoginFlow(state, func(flow *loginFlow) { flow.Used = false })
 		return connectAPIError(http.StatusBadRequest, err.Error())
 	}
+	reconcileIdentityBestEffort(context.Background(), token)
 	if err = updateLoginFlow(state, func(flow *loginFlow) {
 		flow.Completed = token
 		flow.Message = "Kiro credential connected"
@@ -207,7 +209,15 @@ func importAPIKey(ctx context.Context, rawKey, rawRegion string) (*kiroauth.Kiro
 }
 
 func listAvailableAPIKeyModels(ctx context.Context, accessToken, region string) ([]controlPlaneModel, error) {
-	endpoint := "https://q." + region + ".amazonaws.com/ListAvailableModels?origin=AI_EDITOR"
+	// An API key is always an Amazon Q credential, so it resolves to the Q
+	// surface. Routing through the resolver keeps this call from drifting away
+	// from the rest of the plugin.
+	account := kiroroute.Resolve(kiroroute.Credential{AuthMethod: "api_key", OIDCRegion: region})
+	base, err := account.MetadataURL(kiroroute.OpListAvailableModels)
+	if err != nil {
+		return nil, err
+	}
+	endpoint := base + "?origin=AI_EDITOR"
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err

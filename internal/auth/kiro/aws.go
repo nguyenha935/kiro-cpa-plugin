@@ -43,8 +43,29 @@ type KiroTokenData struct {
 	// ClientIDHash is the hash of client ID used to locate device registration file
 	// (Enterprise Kiro IDE stores clientId/clientSecret in ~/.aws/sso/cache/{clientIdHash}.json)
 	ClientIDHash string `json:"clientIdHash,omitempty"`
-	// Email is the user's email address (used for file naming)
+	// Email is the user's email address (used for file naming). It must only
+	// ever hold a real address: AWS returns one for some providers and leaves it
+	// empty for Builder ID and IAM Identity Center, whose access tokens are
+	// opaque and carry no claims. Synthetic display values belong in Identity.
 	Email string `json:"email,omitempty"`
+	// AWSUserID is the identity-store user identifier AWS reports in the
+	// getUsageLimits response as userInfo.userId, shaped
+	// "<directory-id>.<user-uuid>". It is the only per-user identifier available
+	// for Builder ID and IDC credentials.
+	AWSUserID string `json:"awsUserId,omitempty"`
+	// Identity is the resolved non-secret display name. It is persisted so a CPA
+	// restart that rebuilds Auth records from storage keeps the same label
+	// without writing a synthetic value into Email.
+	Identity string `json:"identity,omitempty"`
+	// ProfileName is the CodeWhisperer profile name reported by
+	// ListAvailableProfiles (IDC only; Builder ID tokens are refused with 403).
+	ProfileName string `json:"profileName,omitempty"`
+	// SubscriptionTitle is the plan name AWS reports in
+	// getUsageLimits.subscriptionInfo ("KIRO POWER", "KIRO FREE"). It is the only
+	// human-readable fact AWS gives about these accounts, because userInfo.email
+	// is null for both Builder ID and IDC credentials, so the display label is
+	// built from it instead of from an invented address.
+	SubscriptionTitle string `json:"subscriptionTitle,omitempty"`
 	// StartURL is the IDC/Identity Center start URL (only for IDC auth method)
 	StartURL string `json:"startUrl,omitempty"`
 	// Region is the AWS region for IDC authentication (only for IDC auth method)
