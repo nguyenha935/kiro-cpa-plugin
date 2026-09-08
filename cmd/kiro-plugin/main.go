@@ -219,7 +219,9 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		configurePlugin(request)
 		return okEnvelope(pluginRegistration())
 	case pluginabi.MethodModelStatic:
-		return okEnvelope(staticModels())
+		// File-backed credentials supply their own catalog through model.for_auth.
+		// Keep the ABI response valid without advertising unauthenticated models.
+		return okEnvelope(pluginapi.ModelResponse{Provider: providerName})
 	case pluginabi.MethodModelForAuth:
 		return handleModelsForAuth(request)
 	case pluginabi.MethodAuthIdentifier:
@@ -482,7 +484,7 @@ func pluginRegistration() registration {
 			ModelProvider:         true,
 			AuthProvider:          true,
 			Executor:              true,
-			ExecutorModelScope:    pluginapi.ExecutorModelScopeBoth,
+			ExecutorModelScope:    pluginapi.ExecutorModelScopeOAuth,
 			ExecutorInputFormats:  []string{"openai-response", "claude", "openai"},
 			ExecutorOutputFormats: []string{"openai-response", "claude", "openai"},
 			ManagementAPI:         true,
