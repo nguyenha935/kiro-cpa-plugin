@@ -23,22 +23,58 @@ func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) 
 	return f(request)
 }
 
-func TestKiroEndpointOrderMatchesAuthSurface(t *testing.T) {
-	tests := map[string][]string{
-		"builder-id":   {"KiroRuntime", "AmazonQ", "CodeWhisperer"},
-		"idc":          {"CodeWhisperer", "AmazonQ", "KiroRuntime"},
-		"external_idp": {"CodeWhisperer", "AmazonQ", "KiroRuntime"},
-		"api_key":      {"AmazonQ", "CodeWhisperer", "KiroRuntime"},
+// A credential is valid on exactly one runtime, so resolution must yield exactly
+// one endpoint. The previous behaviour returned all three surfaces ordered by a
+// guess, which meant a rejection on the first surface was retried against
+// services the credential was never valid on.
+func TestKiroResolvesExactlyOneEndpointPerAuthSurface(t *testing.T) {
+	tests := map[string]string{
+		"builder-id":   "https://runtime.us-east-1.kiro.dev/generateAssistantResponse",
+		"social":       "https://runtime.us-east-1.kiro.dev/generateAssistantResponse",
+		"idc":          "https://runtime.us-east-1.kiro.dev/generateAssistantResponse",
+		"external_idp": "https://runtime.us-east-1.kiro.dev/generateAssistantResponse",
+		"api_key":      "https://q.us-east-1.amazonaws.com/generateAssistantResponse",
 	}
 	for method, want := range tests {
-		auth := &cliproxyauth.Auth{Metadata: map[string]any{"auth_method": method}}
+		auth := &cliproxyauth.Auth{Metadata: map[string]any{"auth_method": method, "region": "us-east-1"}}
 		got := getKiroEndpointConfigs(auth)
-		if len(got) != len(want) {
-			t.Fatalf("%s endpoint count = %d, want %d", method, len(got), len(want))
+		if len(got) != 1 {
+			t.Fatalf("%s resolved %d endpoints, want exactly 1", method, len(got))
 		}
-		for i := range want {
-			if got[i].Name != want[i] {
-				t.Fatalf("%s endpoint %d = %s, want %s", method, i, got[i].Name, want[i])
+		if got[0].URL != want {
+			t.Fatalf("%s endpoint = %s, want %s", method, got[0].URL, want)
+		}
+	}
+}
+
+// An enterprise profile provisioned outside the login region must drive the
+// runtime region. Leading with the login region sent every request to a host
+// that does not serve the profile.
+func TestKiroRuntimeFollowsProfileRegionNotLoginRegion(t *testing.T) {
+	auth := &cliproxyauth.Auth{Metadata: map[string]any{
+		"auth_method": "idc",
+		"region":      "us-east-1",
+		"profile_arn": "arn:aws:codewhisperer:eu-central-1:111122223333:profile/EXAMPLEPROFILE",
+	}}
+	got := getKiroEndpointConfigs(auth)
+	if len(got) != 1 {
+		t.Fatalf("resolved %d endpoints, want 1", len(got))
+	}
+	if want := "https://runtime.eu-central-1.kiro.dev/generateAssistantResponse"; got[0].URL != want {
+		t.Fatalf("endpoint = %s, want %s", got[0].URL, want)
+	}
+}
+
+// codewhisperer.<region>.amazonaws.com has no DNS record outside us-east-1 and is
+// not the surface Kiro uses. No credential may resolve to it.
+func TestKiroNeverResolvesToTheCodeWhispererHost(t *testing.T) {
+	for _, method := range []string{"builder-id", "social", "idc", "external_idp", "imported", "api_key"} {
+		for _, region := range []string{"us-east-1", "eu-central-1"} {
+			auth := &cliproxyauth.Auth{Metadata: map[string]any{"auth_method": method, "region": region}}
+			for _, config := range getKiroEndpointConfigs(auth) {
+				if strings.Contains(config.URL, "codewhisperer.") {
+					t.Fatalf("%s in %s resolved to %s", method, region, config.URL)
+				}
 			}
 		}
 	}
@@ -58,11 +94,15 @@ func TestIsCoolingDisabledUsesCredentialOverride(t *testing.T) {
 
 func TestAPIKeyUsesConfiguredRegion(t *testing.T) {
 	auth := &cliproxyauth.Auth{Metadata: map[string]any{"auth_method": "api_key", "region": "eu-west-1"}}
-	if got := resolveKiroAPIRegion(auth); got != "eu-west-1" {
+	if got := resolveKiroAccount(auth).Region; got != "eu-west-1" {
 		t.Fatalf("API-key region = %q, want eu-west-1", got)
 	}
-	if endpoint := getKiroEndpointConfigs(auth)[0].URL; !strings.Contains(endpoint, "q.eu-west-1.amazonaws.com") {
-		t.Fatalf("API-key endpoint ignored configured region: %s", endpoint)
+	endpoints := getKiroEndpointConfigs(auth)
+	if len(endpoints) != 1 {
+		t.Fatalf("resolved %d endpoints, want 1", len(endpoints))
+	}
+	if !strings.Contains(endpoints[0].URL, "q.eu-west-1.amazonaws.com") {
+		t.Fatalf("API-key endpoint ignored configured region: %s", endpoints[0].URL)
 	}
 }
 

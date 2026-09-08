@@ -125,15 +125,72 @@ func TestNormalizeKiroPayloadDropsMaxTokensWhenSchemaOmitsIt(t *testing.T) {
 	}
 }
 
-func TestNormalizeKiroPayloadClampsWhenNoSchemaWasObserved(t *testing.T) {
-	payload := []byte(`{"additionalModelRequestFields":{"max_tokens":64}}`)
+func TestNormalizeKiroPayloadRemovesTheContainerWhenNoSchemaWasObserved(t *testing.T) {
+	// Kiro answers a budget on a schema-less model with HTTP 400
+	// "additionalModelRequestFields is not supported for this model", and answers
+	// the resulting empty object with the same error, so both have to go.
+	payload := []byte(`{"conversationState":{},"additionalModelRequestFields":{"max_tokens":64}}`)
 	updated := normalizeKiroPayloadMaxTokens(payload, modelcapabilities.Capability{ModelID: "m"})
 	var root map[string]any
 	if err := json.Unmarshal(updated, &root); err != nil {
 		t.Fatal(err)
 	}
+	if _, exists := root["additionalModelRequestFields"]; exists {
+		t.Fatalf("additionalModelRequestFields survived a schema-less model: %s", updated)
+	}
+	if _, exists := root["conversationState"]; !exists {
+		t.Fatalf("the conversation was collateral damage: %s", updated)
+	}
+}
+
+func TestNormalizeKiroPayloadRemovesAnAlreadyEmptyContainer(t *testing.T) {
+	payload := []byte(`{"conversationState":{},"additionalModelRequestFields":{}}`)
+	updated := normalizeKiroPayloadMaxTokens(payload, modelcapabilities.Capability{ModelID: "m", SupportsMaxTokens: true})
+	var root map[string]any
+	if err := json.Unmarshal(updated, &root); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := root["additionalModelRequestFields"]; exists {
+		t.Fatalf("an empty container survived: %s", updated)
+	}
+}
+
+func TestNormalizeKiroPayloadKeepsAcceptedBudgetsAndSiblings(t *testing.T) {
+	payload := []byte(`{"additionalModelRequestFields":{"max_tokens":64,"output_config":{"effort":"high"}}}`)
+	capability := modelcapabilities.Capability{ModelID: "m", SchemaObserved: true, SupportsMaxTokens: true, MinimumOutputTokens: 1024, MaximumOutputTokens: 128000}
+	updated := normalizeKiroPayloadMaxTokens(payload, capability)
+	var root map[string]any
+	if err := json.Unmarshal(updated, &root); err != nil {
+		t.Fatal(err)
+	}
 	fields, _ := root["additionalModelRequestFields"].(map[string]any)
-	if fields["max_tokens"] != float64(modelcapabilities.DefaultMinimumOutputTokens) {
-		t.Fatalf("max_tokens = %#v, want %d", fields["max_tokens"], modelcapabilities.DefaultMinimumOutputTokens)
+	if fields["max_tokens"] != float64(1024) {
+		t.Fatalf("max_tokens = %#v, want 1024", fields["max_tokens"])
+	}
+	if _, exists := fields["output_config"]; !exists {
+		t.Fatalf("the effort field was collateral damage: %s", updated)
+	}
+}
+
+func TestNormalizeKiroPayloadDropsAnUnusableBudget(t *testing.T) {
+	// A zero or non-numeric budget cannot satisfy the schema minimum, so it is
+	// removed rather than forwarded as-is.
+	for _, body := range []string{
+		`{"additionalModelRequestFields":{"max_tokens":0,"output_config":{"effort":"high"}}}`,
+		`{"additionalModelRequestFields":{"max_tokens":"4096","output_config":{"effort":"high"}}}`,
+	} {
+		capability := modelcapabilities.Capability{ModelID: "m", SchemaObserved: true, SupportsMaxTokens: true, MinimumOutputTokens: 1024}
+		updated := normalizeKiroPayloadMaxTokens([]byte(body), capability)
+		var root map[string]any
+		if err := json.Unmarshal(updated, &root); err != nil {
+			t.Fatal(err)
+		}
+		fields, _ := root["additionalModelRequestFields"].(map[string]any)
+		if _, exists := fields["max_tokens"]; exists {
+			t.Fatalf("an unusable budget survived: %s", updated)
+		}
+		if _, exists := fields["output_config"]; !exists {
+			t.Fatalf("the effort field was collateral damage: %s", updated)
+		}
 	}
 }

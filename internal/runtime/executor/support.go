@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	log "github.com/sirupsen/logrus"
+
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	"github.com/tidwall/gjson"
@@ -103,12 +105,62 @@ type upstreamRequestLog struct {
 	Body                                                          []byte
 }
 
-// The host owns request logging. These hooks intentionally avoid retaining
-// upstream request bodies or credentials inside the plugin.
-func recordAPIRequest(context.Context, *config.Config, upstreamRequestLog)        {}
-func recordAPIResponseMetadata(context.Context, *config.Config, int, http.Header) {}
-func recordAPIResponseError(context.Context, *config.Config, error)               {}
-func appendAPIResponseChunk(context.Context, *config.Config, []byte)              {}
+// The host owns full request logging. These hooks deliberately keep no request
+// body and no credential, but they do record metadata.
+//
+// They used to be empty. That left the plugin's only upstream failure evidence
+// in the host's access log as a bare status code, so a 502 during login could
+// not be attributed to a region, a surface or an operation without reproducing it
+// by hand. Metadata alone is enough to tell those apart, and it cannot leak a
+// prompt or a token.
+func recordAPIRequest(_ context.Context, _ *config.Config, entry upstreamRequestLog) {
+	log.Debugf("kiro upstream request: method=%s url=%s auth=%s provider=%s body_bytes=%d",
+		entry.Method, entry.URL, redactAuthLabel(entry.AuthLabel, entry.AuthID), entry.Provider, len(entry.Body))
+}
+
+func recordAPIResponseMetadata(_ context.Context, _ *config.Config, status int, header http.Header) {
+	// Request ids are the only reliable way to correlate a failure with an AWS
+	// support case, and they carry no account data.
+	requestID := header.Get("x-amzn-RequestId")
+	if requestID == "" {
+		requestID = header.Get("x-amzn-requestid")
+	}
+	// Failures are logged unconditionally. A rejection that is only visible when
+	// debug logging happens to be on is the situation that made a 502 during
+	// login impossible to attribute after the fact.
+	if status >= 400 {
+		log.Warnf("kiro upstream rejected: status=%d request_id=%s content_type=%s",
+			status, requestID, header.Get("Content-Type"))
+		return
+	}
+	log.Debugf("kiro upstream response: status=%d request_id=%s content_type=%s",
+		status, requestID, header.Get("Content-Type"))
+}
+
+func recordAPIResponseError(_ context.Context, _ *config.Config, err error) {
+	if err == nil {
+		return
+	}
+	// Transport errors are the class that silently escalated across service
+	// surfaces, so they are worth naming even though the body is never kept.
+	log.Warnf("kiro upstream transport error: %v", err)
+}
+
+// appendAPIResponseChunk stays a no-op: response chunks are model output, and
+// recording them here would put prompt-derived content in the plugin's log.
+func appendAPIResponseChunk(context.Context, *config.Config, []byte) {}
+
+// redactAuthLabel prefers the human label and falls back to the credential id,
+// never the token. Both are already visible in the host's own logs.
+func redactAuthLabel(label, id string) string {
+	if strings.TrimSpace(label) != "" {
+		return label
+	}
+	if strings.TrimSpace(id) != "" {
+		return id
+	}
+	return "unknown"
+}
 
 func applyCustomHeadersFromAttrs(request *http.Request, attrs map[string]string) {
 	if request == nil {

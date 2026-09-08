@@ -59,7 +59,10 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/sirupsen/logrus"
+
 	kiroauth "github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro"
+	"github.com/nguyenha935/kiro-cpa-plugin/internal/kiroroute"
 	"github.com/nguyenha935/kiro-cpa-plugin/internal/modelcapabilities"
 	kiroexecutor "github.com/nguyenha935/kiro-cpa-plugin/internal/runtime/executor"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -242,6 +245,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			Routes: []pluginapi.ManagementRoute{
 				{Method: http.MethodGet, Path: "/plugins/kiro/status"},
 				{Method: http.MethodPost, Path: "/plugins/kiro/connect"},
+				// Authenticated twin of the usage resource page. Resource routes are
+				// served without the management key (only the random path guards
+				// them), so the panel embeds this one instead.
+				{Method: http.MethodGet, Path: "/plugins/kiro/usage"},
 			},
 			Resources: []pluginapi.ResourceRoute{
 				{Path: "/capabilities"},
@@ -255,6 +262,38 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	}
 }
 
+// syncLogLevel adopts the host's debug setting for the plugin's own logger.
+//
+// A dynamic library gets its own logrus instance, and this one was left at the
+// default Info level forever. Every log.Debugf in the plugin was therefore
+// discarded even with debug: true in config.yaml, which is why an upstream
+// failure during login left no record of the endpoint, region or surface it came
+// from.
+//
+// CPA may hand over only the plugin's own subsection, in which case the host's
+// debug flag is not visible here. KIRO_PLUGIN_LOG_LEVEL exists for that case so
+// per-request detail can be turned on without editing the shared config.
+// Failures do not depend on either: they are logged at warn level.
+func syncLogLevel(configYAML []byte) {
+	if level := strings.TrimSpace(os.Getenv("KIRO_PLUGIN_LOG_LEVEL")); level != "" {
+		if parsed, err := logrus.ParseLevel(level); err == nil {
+			logrus.SetLevel(parsed)
+			return
+		}
+	}
+	var root struct {
+		Debug *bool `yaml:"debug"`
+	}
+	if yaml.Unmarshal(configYAML, &root) != nil || root.Debug == nil {
+		return
+	}
+	if *root.Debug {
+		logrus.SetLevel(logrus.DebugLevel)
+		return
+	}
+	logrus.SetLevel(logrus.InfoLevel)
+}
+
 func configurePlugin(raw []byte) {
 	clearUsageCache()
 	var req lifecycleRequest
@@ -262,6 +301,7 @@ func configurePlugin(raw []byte) {
 		kiroauth.ConfigureGlobalRateLimiter(pluginSettings.rateLimiterConfig())
 		return
 	}
+	syncLogLevel(req.ConfigYAML)
 	// CPA may send either the plugin subsection or the complete config.yaml.
 	// Merge only keys that are actually present; rebuilding from defaults here
 	// used to erase settings whenever a lifecycle reconfigure omitted them.
@@ -422,6 +462,7 @@ func handleLoginPoll(raw []byte) ([]byte, error) {
 			return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusError, Message: "Kiro profile discovery failed after login: " + err.Error()})
 		}
 	}
+	reconcileIdentityBestEffort(context.Background(), token)
 	clearUsageCache()
 	return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusSuccess, Message: "Kiro device login completed", Auth: authData(token, "")})
 }
@@ -475,7 +516,11 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 	if err = normalizeAndValidateKiroToken(token); err != nil {
 		return nil, fmt.Errorf("parse Kiro credential: %w", err)
 	}
-	if !isAPIKeyCredential(token) && !isBuilderIDCredential(token) {
+	// Only credential kinds that can actually own a profile are put through
+	// discovery. Using a hand-rolled "not an API key and not Builder ID" test
+	// here included social credentials, which listAvailableProfiles refuses, so
+	// the predicate has to be the same one reconcileProfile enforces.
+	if resolveAccount(token).ProfileDiscoverable() {
 		if err = reconcileParsedProfile(context.Background(), token, reconcileProfile); err != nil {
 			return nil, fmt.Errorf("validate Kiro profile: %w", err)
 		}
@@ -490,6 +535,15 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 func isKiroProviderLabel(value string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(value))
 	if normalized == "" || normalized == providerName {
+		return true
+	}
+	// Kiro's own account taxonomy. These are the values Kiro CLI stores in a
+	// credential's provider field, and authProviderLabel already writes
+	// "Enterprise" for Identity Center logins. Omitting them made
+	// handleParseAuth answer Handled=false for those credentials, so a restart
+	// silently dropped a working enterprise account instead of adopting it.
+	switch normalized {
+	case "enterprise", "internal", "externalidp", "external_idp", "builderid", "builder-id", "google", "github", "apikey", "api_key", "cliproxyapi":
 		return true
 	}
 	return normalized == "aws" || strings.HasPrefix(normalized, "aws ") || normalized == "amazon"
@@ -529,6 +583,10 @@ func decodeKiroCredential(raw []byte) (*kiroauth.KiroTokenData, error) {
 	decodeFallback("scopes", &token.Scopes)
 	decodeFallback("region", &token.Region)
 	decodeFallback("email", &token.Email)
+	decodeFallback("aws_user_id", &token.AWSUserID)
+	decodeFallback("identity", &token.Identity)
+	decodeFallback("profile_name", &token.ProfileName)
+	decodeFallback("subscription_title", &token.SubscriptionTitle)
 	decodeFallback("preferred_endpoint", &token.PreferredEndpoint)
 	decodeFallback("preferred-endpoint", &token.PreferredEndpoint)
 	if value, ok := shape["priority"]; ok {
@@ -621,9 +679,15 @@ func authData(token *kiroauth.KiroTokenData, fileName string) pluginapi.AuthData
 	// Persist the non-secret display identity in the credential JSON itself.
 	// CPA rebuilds Auth records from StorageJSON after restart; Metadata and
 	// Attributes are runtime-only and are not guaranteed to survive that scan.
+	// It goes into Identity, never into Email: a synthetic value written to Email
+	// is read back as an address and then re-derived into the file name, which is
+	// what produced names like kiro-idc-kiro-idc-03c.json.
 	storageToken := *token
-	if strings.TrimSpace(storageToken.Email) == "" {
-		storageToken.Email = credentialIdentity(token)
+	if !looksLikeEmail(storageToken.Email) {
+		storageToken.Email = ""
+	}
+	if strings.TrimSpace(storageToken.Identity) == "" {
+		storageToken.Identity = credentialIdentity(token)
 	}
 	storage, _ := json.Marshal(&storageToken)
 	// Keep CPA's classification fields in the persisted file as well as in
@@ -654,10 +718,7 @@ func authData(token *kiroauth.KiroTokenData, fileName string) pluginapi.AuthData
 	}
 	fileName = filepath.Base(fileName)
 	expiresAt, _ := time.Parse(time.RFC3339, token.ExpiresAt)
-	label := "Kiro"
-	if startURL, err := url.Parse(token.StartURL); err == nil && startURL.Hostname() != "" {
-		label += " - " + strings.ToLower(startURL.Hostname())
-	}
+	label := identityLabel(token)
 	return pluginapi.AuthData{
 		Provider: providerName,
 		// Kiro credentials are file-backed regardless of authentication method.
@@ -675,25 +736,106 @@ func authData(token *kiroauth.KiroTokenData, fileName string) pluginapi.AuthData
 	}
 }
 
+// authDataForHostUpdate returns AuthData that keeps a credential's existing file
+// identity on the host update paths.
+//
+// CPA rebuilds the auth from a refresh response with an empty path
+// (internal/pluginhost/auth_provider.go and adapters_executors.go both call
+// AuthDataToCoreAuth(data, "", data.FileName)) and copies Attributes verbatim,
+// only filling them from the previous auth when the plugin sends none. The file
+// store then resolves the write target from attributes["path"], falling back to
+// the file name (sdk/auth/filestore.go). So a response that omits the path lets
+// the derived name decide where the credential is written, and any change to the
+// derivation moves a live credential into a second file. Echoing the path the
+// host just supplied removes the derived name from that decision entirely.
+func authDataForHostUpdate(token *kiroauth.KiroTokenData, attributes map[string]string, authID string) pluginapi.AuthData {
+	name := resolveAuthFileName(attributes, authID)
+	if name == "" {
+		// Neither the path nor the auth id reached the plugin, so authData falls
+		// back to the derived name. That is how an update to a live credential ends
+		// up in a second file, so it is recorded rather than left silent: the
+		// derivation is stable per identity, but a host that stops sending both
+		// fields must be visible in the log.
+		log.Printf("kiro: host update for %q carried no path or auth id; falling back to the derived file name %s", token.AuthMethod, kiroFileName(token))
+	}
+	data := authData(token, name)
+	path := ""
+	if attributes != nil {
+		path = strings.TrimSpace(attributes[coreauth.AttributePath])
+	}
+	if path == "" {
+		return data
+	}
+	if data.Attributes == nil {
+		data.Attributes = make(map[string]string)
+	}
+	data.Attributes[coreauth.AttributePath] = path
+	source := ""
+	if attributes != nil {
+		source = strings.TrimSpace(attributes[coreauth.AttributeSource])
+	}
+	if source == "" {
+		source = path
+	}
+	data.Attributes[coreauth.AttributeSource] = source
+	backend := ""
+	if attributes != nil {
+		backend = strings.TrimSpace(attributes[coreauth.AttributeSourceBackend])
+	}
+	if backend == "" {
+		backend = coreauth.AuthSourceFile
+	}
+	data.Attributes[coreauth.AttributeSourceBackend] = backend
+	return data
+}
+
+// resolveAuthFileName keeps an existing credential's file name authoritative on
+// every host update path. Two traps are handled: filepath.Base("") returns ".",
+// which would rename the credential to ".", and an update that reaches the
+// plugin without a path attribute must still fall back to the auth ID rather
+// than let a freshly derived name replace the stored one.
+func resolveAuthFileName(attributes map[string]string, authID string) string {
+	name := ""
+	if attributes != nil {
+		name = strings.TrimSpace(attributes[coreauth.AttributePath])
+	}
+	if name == "" {
+		name = strings.TrimSpace(authID)
+	}
+	if name == "" {
+		return ""
+	}
+	name = filepath.Base(name)
+	if name == "." || name == ".." || name == string(filepath.Separator) {
+		return ""
+	}
+	return name
+}
+
 func kiroFileName(token *kiroauth.KiroTokenData) string {
 	method := strings.ToLower(strings.TrimSpace(token.AuthMethod))
 	if method == "" {
 		method = "imported"
 	}
-	id := ""
-	// API-key identities must always derive from the secret hash. The persisted
-	// display email is intentionally synthetic and would otherwise change the
-	// auth filename after the first restart.
+	// API-key identities must always derive from the secret hash: an API key has
+	// no AWS user record to name it after.
 	if isAPIKeyCredential(token) && token.AccessToken != "" {
 		hash := sha256.Sum256([]byte(token.AccessToken))
-		id = hex.EncodeToString(hash[:])
+		return "kiro-" + method + "-" + hex.EncodeToString(hash[:])[:12] + ".json"
 	}
-	if id == "" {
-		id = sanitize(token.Email)
+	// A real address is the clearest name. Only a real one qualifies; a synthetic
+	// display identity must never round-trip into the file name.
+	if looksLikeEmail(token.Email) {
+		if id := sanitize(token.Email); id != "" {
+			return "kiro-" + method + "-" + id + ".json"
+		}
 	}
-	if id == "" {
-		id = sanitize(token.ClientIDHash)
+	// The AWS identity-store user names one account, where a client hash only
+	// names one device registration.
+	if id := resolveAWSIdentity(token).identityFingerprint(); id != "" {
+		return "kiro-" + method + "-" + id + ".json"
 	}
+	id := sanitize(token.ClientIDHash)
 	if id == "" && token.ClientID != "" {
 		hash := sha256.Sum256([]byte(token.ClientID))
 		id = hex.EncodeToString(hash[:])
@@ -739,8 +881,26 @@ func authMetadata(token *kiroauth.KiroTokenData) map[string]any {
 	} else {
 		metadata["auth_kind"] = coreauth.AuthKindOAuth
 	}
+	// CPA resolves the panel account column from metadata["email"], then
+	// attributes["email"], then the credential document's own email field
+	// (internal/api/handlers/management/auth_files.go authEmail). There is no
+	// other display channel, so a blank value makes the panel fall back to the
+	// file name. AWS reports userInfo.email == null for both Builder ID and IDC
+	// Kiro credentials, so this carries the readable label instead of the
+	// machine identity, which used to leak a "kiro-idc-d-…" string into a field
+	// the panel presents as an address.
+	if label := identityLabel(token); label != "" {
+		metadata["email"] = label
+		metadata["display_name"] = label
+	}
 	if identity := credentialIdentity(token); identity != "" {
-		metadata["email"] = identity
+		metadata["identity"] = identity
+	}
+	if value := strings.TrimSpace(token.AWSUserID); value != "" {
+		metadata["aws_user_id"] = value
+	}
+	if value := strings.TrimSpace(token.ProfileName); value != "" {
+		metadata["profile_name"] = value
 	}
 	if token.AccessToken != "" {
 		metadata["access_token"] = token.AccessToken
@@ -796,11 +956,14 @@ func authAttributes(token *kiroauth.KiroTokenData) map[string]string {
 		attrs[coreauth.AttributeAuthKind] = authKind
 		attrs[coreauth.AttributeAPIKey] = token.AccessToken
 	}
-	if identity := credentialIdentity(token); identity != "" {
+	if label := identityLabel(token); label != "" {
 		// CPA uses this non-secret account identifier to populate AccountInfo for
 		// OAuth credentials. Builder ID tokens are opaque and have no email claim,
-		// so use a stable method/hash label instead of leaving MKP with no identity.
-		attrs["email"] = identity
+		// so present the readable label; the machine identity stays in its own key.
+		attrs["email"] = label
+	}
+	if identity := credentialIdentity(token); identity != "" {
+		attrs["identity"] = identity
 	}
 	if token.ProfileArn != "" {
 		attrs["profile_arn"] = token.ProfileArn
@@ -824,12 +987,22 @@ func credentialIdentity(token *kiroauth.KiroTokenData) string {
 	if token == nil {
 		return ""
 	}
-	if email := strings.TrimSpace(token.Email); email != "" {
-		return email
+	if looksLikeEmail(token.Email) {
+		return strings.TrimSpace(token.Email)
 	}
 	method := strings.ToLower(strings.TrimSpace(token.AuthMethod))
 	if method == "" {
 		method = "imported"
+	}
+	// The AWS user identifier names the account itself, so it outranks every
+	// device-scoped hash below.
+	if fingerprint := resolveAWSIdentity(token).identityFingerprint(); fingerprint != "" {
+		return "kiro-" + method + "-" + fingerprint
+	}
+	// A previously resolved display identity is reused so the name stays stable
+	// across restarts, but only when it is not itself a stale derivation.
+	if identity := strings.TrimSpace(token.Identity); identity != "" && !strings.HasPrefix(identity, "kiro-") {
+		return identity
 	}
 	fingerprint := strings.TrimSpace(token.ClientIDHash)
 	if fingerprint == "" && token.ClientID != "" {
@@ -920,14 +1093,7 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	clearUsageCache()
-	fileName := ""
-	if req.Attributes != nil {
-		fileName = filepath.Base(strings.TrimSpace(req.Attributes[coreauth.AttributePath]))
-	}
-	if fileName == "" {
-		fileName = filepath.Base(strings.TrimSpace(req.AuthID))
-	}
-	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: authData(refreshed, fileName), NextRefreshAfter: nextRefreshAfter(refreshed, parseTime(refreshed.ExpiresAt))})
+	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: authDataForHostUpdate(refreshed, req.Attributes, req.AuthID), NextRefreshAfter: nextRefreshAfter(refreshed, parseTime(refreshed.ExpiresAt))})
 }
 
 func handleModelsForAuth(raw []byte) ([]byte, error) {
@@ -956,7 +1122,11 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 		}
 		authUpdated = true
 		clearUsageCache()
-	} else if !isAPIKeyCredential(token) && !isBuilderIDCredential(token) && strings.TrimSpace(token.ProfileArn) == "" {
+	} else if resolveAccount(token).ProfileDiscoverable() && strings.TrimSpace(token.ProfileArn) == "" {
+		// A social credential reached this branch under the previous
+		// "not an API key and not Builder ID" test, and discovery refuses social,
+		// so listing models failed outright for it. Social has no profile to find
+		// and is served by the Amazon Q surface, exactly like Builder ID.
 		if err = reconcileProfile(ctx, token); err != nil {
 			return nil, fmt.Errorf("discover required Kiro profile: %w", err)
 		} else {
@@ -990,11 +1160,7 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 	modelcapabilities.ReplaceForAuth(req.AuthID, capabilities)
 	response := pluginapi.ModelResponse{Provider: providerName, Models: out}
 	if authUpdated {
-		fileName := ""
-		if req.Attributes != nil {
-			fileName = filepath.Base(req.Attributes[coreauth.AttributePath])
-		}
-		response.AuthUpdate = authData(token, fileName)
+		response.AuthUpdate = authDataForHostUpdate(token, req.Attributes, req.AuthID)
 	}
 	return okEnvelope(response)
 }
@@ -1155,66 +1321,70 @@ func newModelCatalogRequest(ctx context.Context, token *kiroauth.KiroTokenData, 
 	if token == nil {
 		return nil, pluginStatusError{status: http.StatusUnauthorized, message: "Kiro credential is missing"}
 	}
-	region := kiroServiceRegion(token)
-	if isAPIKeyCredential(token) || isBuilderIDCredential(token) {
-		query := url.Values{"origin": {"AI_EDITOR"}}
-		if nextToken != "" {
-			query.Set("nextToken", nextToken)
-		}
-		endpoint := "https://q." + region + ".amazonaws.com/ListAvailableModels?" + query.Encode()
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Authorization", "Bearer "+token.AccessToken)
-		req.Header.Set("Accept", "application/json")
-		req.Header.Set("User-Agent", kiroauth.ClientUserAgent())
-		req.Header.Set("X-Amz-User-Agent", kiroauth.ClientAWSUserAgent("codewhisperer"))
-		if isAPIKeyCredential(token) {
-			req.Header.Set("TokenType", "API_KEY")
-		}
-		return req, nil
-	}
-
-	profileARN := strings.TrimSpace(token.ProfileArn)
-	if profileARN == "" {
+	account := resolveAccount(token)
+	// A credential kind that requires a profile must not be quietly downgraded to
+	// the Amazon Q surface when its profile has not been discovered yet. Q would
+	// reject the OAuth token, and the failure would look like a bad credential
+	// rather than incomplete setup.
+	if account.RequiresProfile() && strings.TrimSpace(token.ProfileArn) == "" {
 		return nil, pluginStatusError{status: http.StatusUnauthorized, message: "Kiro profile ARN is required for this credential type"}
 	}
-	payload := map[string]any{"origin": "AI_EDITOR", "profileArn": profileARN}
-	if nextToken != "" {
-		payload["nextToken"] = nextToken
-	}
-	body, err := json.Marshal(payload)
+	endpoint, err := account.MetadataURL(kiroroute.OpListAvailableModels)
 	if err != nil {
-		return nil, err
+		return nil, pluginStatusError{status: http.StatusBadRequest, message: err.Error()}
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, codeWhispererEndpoint(region), bytes.NewReader(body))
+
+	// Both surfaces expose the model catalogue as a GET with query parameters.
+	// The control plane additionally requires the profile ARN and answers 400
+	// "Invalid profileArn." without it, while Amazon Q serves profile-less
+	// credentials and needs only the origin.
+	query := url.Values{"origin": {"AI_EDITOR"}}
+	if nextToken != "" {
+		query.Set("nextToken", nextToken)
+	}
+	if account.MetadataSurface == kiroroute.SurfaceControlPlane {
+		profileARN := strings.TrimSpace(token.ProfileArn)
+		if profileARN == "" {
+			return nil, pluginStatusError{status: http.StatusUnauthorized, message: "Kiro profile ARN is required for this credential type"}
+		}
+		query.Set("profileArn", profileARN)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"?"+query.Encode(), nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token.AccessToken)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/x-amz-json-1.0")
-	req.Header.Set("X-Amz-Target", "AmazonCodeWhispererService.ListAvailableModels")
 	req.Header.Set("User-Agent", kiroauth.ClientUserAgent())
 	req.Header.Set("X-Amz-User-Agent", kiroauth.ClientAWSUserAgent("codewhisperer"))
-	if strings.EqualFold(strings.TrimSpace(token.AuthMethod), "external_idp") {
-		req.Header.Set("TokenType", "EXTERNAL_IDP")
+	if account.TokenType != "" {
+		req.Header.Set("TokenType", account.TokenType)
 	}
 	return req, nil
 }
 
-func kiroServiceRegion(token *kiroauth.KiroTokenData) string {
-	if token != nil {
-		parts := strings.Split(strings.TrimSpace(token.ProfileArn), ":")
-		if len(parts) > 3 && validateRegion(parts[3]) == nil {
-			return parts[3]
-		}
-		if validateRegion(token.Region) == nil {
-			return token.Region
-		}
+// resolveAccount turns a stored credential into the one routing context every
+// call must use. Endpoints are never assembled anywhere else: doing so is how
+// profile discovery, model listing and usage ended up querying three different
+// services for the same credential.
+func resolveAccount(token *kiroauth.KiroTokenData) kiroroute.Account {
+	if token == nil {
+		return kiroroute.Resolve(kiroroute.Credential{})
 	}
-	return "us-east-1"
+	return kiroroute.Resolve(routingCredential(token))
+}
+
+func routingCredential(token *kiroauth.KiroTokenData) kiroroute.Credential {
+	if token == nil {
+		return kiroroute.Credential{}
+	}
+	return kiroroute.Credential{
+		AuthMethod: token.AuthMethod,
+		Provider:   token.Provider,
+		ProfileARN: token.ProfileArn,
+		OIDCRegion: token.Region,
+	}
 }
 
 func thinkingSupport(capability modelcapabilities.Capability) *pluginapi.ThinkingSupport {
@@ -1230,35 +1400,94 @@ func thinkingSupport(capability modelcapabilities.Capability) *pluginapi.Thinkin
 }
 
 type availableProfile struct {
-	ARN      string `json:"arn"`
-	StartURL string `json:"startUrl"`
+	ARN         string `json:"arn"`
+	StartURL    string `json:"startUrl"`
+	ProfileName string `json:"profileName"`
 }
 
+// profileLister is a seam so profile discovery can be tested without reaching
+// the network. Discovery sweeps several regions, and a test that cannot observe
+// which regions were asked cannot prove the sweep happens.
+var profileLister = listAvailableProfiles
+
+// reconcileProfile locates the CodeWhisperer profile a credential is entitled to.
+//
+// It probes every region Kiro serves rather than only the region the token was
+// minted in. Those are routinely different: an enterprise account can
+// authenticate through us-east-1 while its administrator provisioned the profile
+// in eu-central-1. Asking only the login region returns HTTP 200 with an empty
+// profile list, which is indistinguishable from having no entitlement and is
+// what produced "Kiro did not return an available profile" for an account that
+// works correctly in Kiro CLI.
+//
+// Kiro CLI performs the same sweep; a traced run resolved
+// management.us-east-1.kiro.dev and then management.eu-central-1.kiro.dev for a
+// single account.
 func reconcileProfile(ctx context.Context, token *kiroauth.KiroTokenData) error {
 	if token == nil {
 		return errors.New("Kiro token is missing")
 	}
-	if err := validateRegion(token.Region); err != nil {
-		return err
+	account := resolveAccount(token)
+	if !account.ProfileDiscoverable() {
+		// Builder ID, social and API key credentials are answered with 403 "User
+		// is not authorized to access this feature." Sending the request anyway
+		// would only add rejections to the account's history.
+		return fmt.Errorf("Kiro %s credentials do not have a profile to discover", account.AuthMethod)
 	}
-	profiles, err := listAvailableProfiles(ctx, &http.Client{Timeout: 30 * time.Second}, codeWhispererProfilesEndpoint(token.Region), token.AccessToken)
-	if err != nil {
-		return err
+
+	regions := kiroroute.ProfileSearchRegions(routingCredential(token))
+	if len(regions) == 0 {
+		return errors.New("no Kiro region is available to search for a profile")
 	}
-	if len(profiles) == 0 {
-		return errors.New("Kiro did not return an available profile")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	searched := make([]string, 0, len(regions))
+	var firstErr error
+	for _, region := range regions {
+		endpoint, err := kiroroute.ProfileListURL(region)
+		if err != nil {
+			continue
+		}
+		profiles, err := profileLister(ctx, client, endpoint, token.AccessToken)
+		if err != nil {
+			// A region that rejects the token is recorded and the sweep
+			// continues: the profile may still live in another region, and the
+			// first region's error is not the whole story.
+			log.Printf("kiro: profile discovery in %s unavailable: %v", region, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			searched = append(searched, region+" (error)")
+			continue
+		}
+		if len(profiles) == 0 {
+			searched = append(searched, region+" (none)")
+			continue
+		}
+		if len(profiles) > 1 {
+			log.Printf("kiro: listAvailableProfiles returned %d profiles in %s; using the first", len(profiles), region)
+		}
+		if strings.TrimSpace(profiles[0].ARN) == "" {
+			return errors.New("Kiro returned a profile without an ARN")
+		}
+		token.ProfileArn = profiles[0].ARN
+		if token.StartURL == "" {
+			token.StartURL = profiles[0].StartURL
+		}
+		if strings.TrimSpace(token.ProfileName) == "" {
+			token.ProfileName = strings.TrimSpace(profiles[0].ProfileName)
+		}
+		log.Printf("kiro: resolved profile in %s for %s credential", region, account.AuthMethod)
+		return nil
 	}
-	if len(profiles) > 1 {
-		log.Printf("kiro: ListAvailableProfiles returned %d profiles; using the first", len(profiles))
+
+	// Report where the search actually looked. The previous message named no
+	// region, so an account whose profile simply lives elsewhere was
+	// indistinguishable from one with no entitlement at all.
+	if firstErr != nil {
+		return fmt.Errorf("Kiro did not return an available profile (searched %s): %w", strings.Join(searched, ", "), firstErr)
 	}
-	if strings.TrimSpace(profiles[0].ARN) == "" {
-		return errors.New("Kiro returned a profile without an ARN")
-	}
-	token.ProfileArn = profiles[0].ARN
-	if token.StartURL == "" {
-		token.StartURL = profiles[0].StartURL
-	}
-	return nil
+	return fmt.Errorf("Kiro did not return an available profile (searched %s)", strings.Join(searched, ", "))
 }
 
 func reconcileParsedProfile(ctx context.Context, token *kiroauth.KiroTokenData, discover func(context.Context, *kiroauth.KiroTokenData) error) error {
@@ -1289,6 +1518,33 @@ func profileRequired(token *kiroauth.KiroTokenData) bool {
 	}
 }
 
+// reconcileIdentityBestEffort resolves who a freshly obtained credential belongs
+// to before it is written, so the auth file is named after the AWS account from
+// the start instead of being renamed on the first usage page load. AWS reports
+// this only in the getUsageLimits response, never in the token.
+func reconcileIdentityBestEffort(ctx context.Context, token *kiroauth.KiroTokenData) {
+	if token == nil || strings.TrimSpace(token.AccessToken) == "" {
+		return
+	}
+	if usage, err := requestUsageLimits(ctx, usageHTTPClient(), token); err == nil {
+		if email := strings.TrimSpace(usage.UserInfo.Email); looksLikeEmail(email) {
+			token.Email = email
+		}
+		if userID := strings.TrimSpace(usage.UserInfo.UserID); userID != "" {
+			token.AWSUserID = userID
+		}
+		if plan := strings.TrimSpace(usage.SubscriptionInfo.SubscriptionTitle); plan != "" {
+			token.SubscriptionTitle = plan
+		}
+	} else {
+		log.Printf("kiro: identity discovery after login unavailable: %v", err)
+	}
+	if name := discoverProfileName(ctx, token); name != "" {
+		token.ProfileName = name
+	}
+	token.Identity = credentialIdentity(token)
+}
+
 func reconcileProfileBestEffort(ctx context.Context, token *kiroauth.KiroTokenData, phase string) {
 	if token == nil || strings.TrimSpace(token.ProfileArn) != "" {
 		return
@@ -1316,8 +1572,12 @@ func listAvailableProfiles(ctx context.Context, client *http.Client, endpoint, a
 		}
 		req.Header.Set("Authorization", "Bearer "+accessToken)
 		req.Header.Set("Accept", "application/json")
-		req.Header.Set("Content-Type", "application/x-amz-json-1.0")
-		req.Header.Set("X-Amz-Target", "AmazonCodeWhispererService.ListAvailableProfiles")
+		// The Kiro control plane addresses operations by path and expects plain
+		// JSON. It is not the Amazon CodeWhisperer surface, so it takes neither
+		// the x-amz-json-1.0 content type nor an X-Amz-Target header. Verified
+		// against management.eu-central-1.kiro.dev, which answers 200 for this
+		// exact shape.
+		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("User-Agent", kiroauth.ClientUserAgent())
 		req.Header.Set("X-Amz-User-Agent", kiroauth.ClientAWSUserAgent("codewhisperer"))
 		resp, err := client.Do(req)
@@ -1346,18 +1606,6 @@ func listAvailableProfiles(ctx context.Context, client *http.Client, endpoint, a
 		}
 	}
 	return nil, fmt.Errorf("Kiro profile pagination exceeded %d pages", maxPages)
-}
-
-func managementEndpoint(region, operation string) string {
-	return "https://management." + region + ".kiro.dev/" + operation
-}
-
-func codeWhispererEndpoint(region string) string {
-	return "https://codewhisperer." + region + ".amazonaws.com"
-}
-
-func codeWhispererProfilesEndpoint(region string) string {
-	return codeWhispererEndpoint(region)
 }
 
 func profileDiscoveryHTTPError(resp *http.Response, body []byte) error {
@@ -1593,6 +1841,8 @@ func handleManagement(raw []byte) ([]byte, error) {
 		return okEnvelope(pluginapi.ManagementResponse{StatusCode: http.StatusOK, Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: body})
 	case "/v0/management/plugins/kiro/connect":
 		return handleConnectAPI(req)
+	case "/v0/management/plugins/kiro/usage":
+		return handleUsagePage(req)
 	case "/v0/resource/plugins/kiro/capabilities":
 		capabilities := modelcapabilities.Snapshot()
 		sort.Slice(capabilities, func(i, j int) bool { return capabilities[i].ModelID < capabilities[j].ModelID })

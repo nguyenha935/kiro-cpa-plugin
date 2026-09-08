@@ -9,8 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html/template"
 	"io"
+	"log"
 	"math"
 	"net/http"
 	"net/url"
@@ -21,6 +21,7 @@ import (
 	"time"
 
 	kiroauth "github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro"
+	"github.com/nguyenha935/kiro-cpa-plugin/internal/kiroroute"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -45,9 +46,14 @@ var (
 	}
 	usageHostCall          = hostCall
 	usageRefreshCredential = refreshKiroCredential
-	usagePageTemplate      = template.Must(template.New("kiro-usage").Funcs(template.FuncMap{
-		"formatNumber": formatUsageNumber,
-	}).Parse(usagePageHTML))
+)
+
+// Credential presentation states. The key drives both the CSS class and the
+// localized label, so a cached view stays language-neutral.
+const (
+	usageStateActive      = "active"
+	usageStateDisabled    = "disabled"
+	usageStateUnavailable = "unavailable"
 )
 
 type httpDoer interface {
@@ -66,18 +72,36 @@ type hostCallEnvelope struct {
 
 type usageLimitsResponse struct {
 	NextDateReset      usageResetTime            `json:"nextDateReset"`
+	DaysUntilReset     *float64                  `json:"daysUntilReset"`
 	UsageBreakdownList []usageBreakdown          `json:"usageBreakdownList"`
 	SubscriptionInfo   usageSubscriptionInfo     `json:"subscriptionInfo"`
 	OverageConfig      usageOverageConfiguration `json:"overageConfiguration"`
+	// UserInfo is the only place AWS reports who a Kiro credential belongs to.
+	// The access token is opaque, so without this block a Builder ID or IDC
+	// credential has no per-user identifier at all.
+	UserInfo usageUserInfo `json:"userInfo"`
+}
+
+type usageUserInfo struct {
+	Email  string `json:"email"`
+	UserID string `json:"userId"`
 }
 
 type usageSubscriptionInfo struct {
 	Type              string `json:"type"`
 	SubscriptionTitle string `json:"subscriptionTitle"`
+	// Measured live on 2026-09-05: getUsageLimits reports what a plan may do as
+	// well as what it has used. A free plan answers OVERAGE_INCAPABLE /
+	// UPGRADE_CAPABLE / PURCHASE, a paid one OVERAGE_CAPABLE /
+	// UPGRADE_INCAPABLE / MANAGE, and the page dropped all three.
+	OverageCapability string `json:"overageCapability"`
+	UpgradeCapability string `json:"upgradeCapability"`
+	ManagementTarget  string `json:"subscriptionManagementTarget"`
 }
 
 type usageOverageConfiguration struct {
-	OverageStatus string `json:"overageStatus"`
+	OverageStatus string   `json:"overageStatus"`
+	OverageLimit  *float64 `json:"overageLimit"`
 }
 
 type usageBreakdown struct {
@@ -93,6 +117,70 @@ type usageBreakdown struct {
 	Unit                         string         `json:"unit"`
 	Currency                     string         `json:"currency"`
 	NextDateReset                usageResetTime `json:"nextDateReset"`
+	// The money side of a bucket. AWS reports the overage ceiling, its unit
+	// price and what has already been charged; without them a page cannot say
+	// what running past the limit costs.
+	OverageCap              *float64        `json:"overageCap"`
+	OverageCapWithPrecision *float64        `json:"overageCapWithPrecision"`
+	OverageRate             *float64        `json:"overageRate"`
+	OverageCharges          *float64        `json:"overageCharges"`
+	Bonuses                 []usageBonus    `json:"bonuses"`
+	OverageCredits          []usageBonus    `json:"overageCredits"`
+	FreeTrialInfo           *usageFreeTrial `json:"freeTrialInfo"`
+}
+
+// usageBonus covers both bonuses and overageCredits. Both arrays were empty on
+// every credential measured on 2026-09-05, so the field names inside an element
+// are NOT observed facts: several plausible spellings are accepted and the
+// element is still counted when none of them matches, so a granted credit shows
+// up as a row with an unknown amount instead of vanishing.
+type usageBonus struct {
+	Amount              *float64       `json:"amount"`
+	AmountWithPrecision *float64       `json:"amountWithPrecision"`
+	CreditAmount        *float64       `json:"creditAmount"`
+	Quantity            *float64       `json:"quantity"`
+	Value               *float64       `json:"value"`
+	RemainingAmount     *float64       `json:"remainingAmount"`
+	ExpiryDate          usageResetTime `json:"expiryDate"`
+	ExpiresAt           usageResetTime `json:"expiresAt"`
+	ExpirationDate      usageResetTime `json:"expirationDate"`
+	EndDate             usageResetTime `json:"endDate"`
+	Description         string         `json:"description"`
+	Name                string         `json:"name"`
+}
+
+// amount returns the first spelling AWS actually sent, and whether any did.
+func (bonus usageBonus) amount() (float64, bool) {
+	for _, candidate := range []*float64{
+		bonus.AmountWithPrecision, bonus.Amount, bonus.RemainingAmount,
+		bonus.CreditAmount, bonus.Quantity, bonus.Value,
+	} {
+		if candidate != nil {
+			return *candidate, true
+		}
+	}
+	return 0, false
+}
+
+// expiry returns the first expiry spelling AWS sent.
+func (bonus usageBonus) expiry() string {
+	for _, candidate := range []usageResetTime{
+		bonus.ExpiryDate, bonus.ExpiresAt, bonus.ExpirationDate, bonus.EndDate,
+	} {
+		if candidate != "" {
+			return string(candidate)
+		}
+	}
+	return ""
+}
+
+type usageFreeTrial struct {
+	CurrentUsage              *float64       `json:"currentUsage"`
+	CurrentUsageWithPrecision *float64       `json:"currentUsageWithPrecision"`
+	UsageLimit                *float64       `json:"usageLimit"`
+	UsageLimitWithPrecision   *float64       `json:"usageLimitWithPrecision"`
+	FreeTrialStatus           string         `json:"freeTrialStatus"`
+	FreeTrialExpiry           usageResetTime `json:"freeTrialExpiry"`
 }
 
 type usageResetTime string
@@ -132,6 +220,18 @@ func (e *usageHTTPError) Error() string {
 	return fmt.Sprintf("Kiro usage request returned HTTP %d: %s", e.StatusCode, e.Message)
 }
 
+// Credit kinds. AWS reports one CREDIT bucket per account, but that bucket
+// carries three further pools beside it: a free-trial allowance, granted
+// bonuses and overage credits. They are different money and are shown as their
+// own rows; only usageKindPlan is summed into the fleet totals, because adding a
+// trial allowance to a plan ceiling would invent a limit nobody has.
+const (
+	usageKindPlan          = "plan"
+	usageKindTrial         = "trial"
+	usageKindBonus         = "bonus"
+	usageKindOverageCredit = "overage_credit"
+)
+
 type usageBucketView struct {
 	Name      string
 	Used      float64
@@ -142,22 +242,74 @@ type usageBucketView struct {
 	Reset     string
 	Unit      string
 	Currency  string
+	// Kind names which pool this row is. NameKey, when set, localises the row
+	// name at render time; AWS only names the plan bucket.
+	Kind    string
+	NameKey string
+	// HasShare is false for a granted pool, where AWS reports what was given but
+	// never how much of it went out, so a percentage would be invented.
+	HasShare bool
+	// Grants is how many entries a bonus or overage-credit array held, so a
+	// grant whose amount field is spelled in a way this code does not know is
+	// still visible as a row.
+	Grants      int
+	AmountKnown bool
+	Expiry      string
+	StatusKey   string
+	StatusRaw   string
+	// The money and trial facts AWS reports alongside the counters. A zero cap
+	// with a zero rate means AWS said nothing, which the page renders as a dash
+	// rather than as free.
+	OverageCap      float64
+	OverageRate     float64
+	OverageCharges  float64
+	BonusTotal      float64
+	OverageCredit   float64
+	FreeTrialUsed   float64
+	FreeTrialLimit  float64
+	FreeTrialStatus string
+	FreeTrialExpiry string
 }
 
 type usageAccountView struct {
 	Label         string
 	State         string
+	StateKey      string
 	StateClass    string
 	Plan          string
+	PlanType      string
 	OverageStatus string
 	UpdatedAt     string
 	Buckets       []usageBucketView
 	Error         string
-}
-
-type usagePageView struct {
-	Accounts []usageAccountView
-	Empty    bool
+	ErrorKey      string
+	// Credential facts. These come from the host record and the credential
+	// document, never from the Kiro usage response, and never carry a secret:
+	// Identity is an email or a truncated fingerprint (see credentialIdentity).
+	AuthMethod     string
+	Region         string
+	Identity       string
+	FileName       string
+	TokenExpiresAt string
+	LastRefresh    string
+	StatusMessage  string
+	// Structured AWS identity. Each field is a separate parameter AWS actually
+	// reports, so the page can name an account instead of printing one opaque
+	// string: Account is the address or short user key, Directory the identity
+	// store, AWSAccountID the 12-digit account behind an IDC profile.
+	Account      string
+	Directory    string
+	UserKey      string
+	AWSAccountID string
+	ProfileName  string
+	// Plan capabilities and the reset horizon, as AWS reports them.
+	DaysUntilReset    float64
+	HasDaysUntilReset bool
+	OverageLimit      float64
+	HasOverageLimit   bool
+	OverageCapability string
+	UpgradeCapability string
+	ManagementTarget  string
 }
 
 type usageCacheEntry struct {
@@ -451,32 +603,31 @@ func refreshExternalIDP(ctx context.Context, token *kiroauth.KiroTokenData) (*ki
 	return &copy, nil
 }
 
+// handleUsagePage answers both the legacy resource route and the authenticated
+// management route. Theme and language come from the embedding panel; both are
+// validated against a closed set before reaching the document.
 func handleUsagePage(req pluginapi.ManagementRequest) ([]byte, error) {
 	accounts := collectUsageAccounts(context.Background(), true)
-	page, err := renderUsagePage(accounts)
+	view := newUsagePageView(accounts, usagePageOptions{
+		Theme: req.Query.Get("theme"),
+		Lang:  req.Query.Get("lang"),
+	}, usageNow().Format(time.RFC3339))
+	page, err := renderUsagePage(view)
 	if err != nil {
 		return nil, err
 	}
 	return okEnvelope(pluginapi.ManagementResponse{
 		StatusCode: http.StatusOK,
-		Headers:    usagePageHeaders(),
+		Headers:    usagePageHeaders(view.Options.Nonce),
 		Body:       page,
 	})
 }
 
-func renderUsagePage(accounts []usageAccountView) ([]byte, error) {
-	var page bytes.Buffer
-	if err := usagePageTemplate.Execute(&page, usagePageView{Accounts: accounts, Empty: len(accounts) == 0}); err != nil {
-		return nil, fmt.Errorf("render Kiro usage page: %w", err)
-	}
-	return page.Bytes(), nil
-}
-
-func usagePageHeaders() http.Header {
+func usagePageHeaders(nonce string) http.Header {
 	return http.Header{
 		"Content-Type":            []string{"text/html; charset=utf-8"},
 		"Cache-Control":           []string{"no-store"},
-		"Content-Security-Policy": []string{"default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'self'; base-uri 'none'"},
+		"Content-Security-Policy": []string{"default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-" + nonce + "'; frame-ancestors 'self'; base-uri 'none'"},
 		"Referrer-Policy":         []string{"no-referrer"},
 		"X-Content-Type-Options":  []string{"nosniff"},
 	}
@@ -485,7 +636,10 @@ func usagePageHeaders() http.Header {
 func collectUsageAccounts(ctx context.Context, force bool) []usageAccountView {
 	var listed hostAuthListResponse
 	if err := callHostResult(pluginabi.MethodHostAuthList, nil, &listed); err != nil {
-		return []usageAccountView{{Label: "Kiro", State: "Unavailable", StateClass: "error", Error: "CLIProxyAPI could not list connected accounts."}}
+		return []usageAccountView{{
+			Label: "Kiro", State: "Unavailable", StateKey: usageStateUnavailable, StateClass: "error",
+			Error: "CLIProxyAPI could not list connected accounts.", ErrorKey: "err_list_failed",
+		}}
 	}
 	entries := make([]pluginapi.HostAuthFileEntry, 0, len(listed.Files))
 	for _, entry := range listed.Files {
@@ -571,7 +725,16 @@ func loadUsageAccount(ctx context.Context, entry pluginapi.HostAuthFileEntry, fo
 	return loadUsageCredential(ctx, credential, force)
 }
 
+// loadUsageCredential decorates whatever the transport or the cache produced:
+// credential facts are cheap, language-neutral and must also appear on cached,
+// disabled and failed accounts.
 func loadUsageCredential(ctx context.Context, credential usageCredential, force bool) usageAccountView {
+	account := loadUsageCredentialView(ctx, credential, force)
+	decorateUsageAccount(&account, credential, nil)
+	return account
+}
+
+func loadUsageCredentialView(ctx context.Context, credential usageCredential, force bool) usageAccountView {
 	entry := credential.entry
 	label := strings.TrimSpace(entry.Label)
 	if credential.token != nil {
@@ -581,10 +744,13 @@ func loadUsageCredential(ctx context.Context, credential usageCredential, force 
 		label = "Kiro"
 	}
 	if entry.Disabled {
-		return usageAccountView{Label: label, State: "Disabled", StateClass: "muted"}
+		return usageAccountView{Label: label, State: "Disabled", StateKey: usageStateDisabled, StateClass: "muted"}
 	}
 	if entry.Unavailable {
-		return usageAccountView{Label: label, State: "Unavailable", StateClass: "error", Error: "This credential is currently unavailable."}
+		return usageAccountView{
+			Label: label, State: "Unavailable", StateKey: usageStateUnavailable, StateClass: "error",
+			Error: "This credential is currently unavailable.", ErrorKey: "err_unavailable",
+		}
 	}
 	forceRefresh := false
 	if force {
@@ -598,7 +764,10 @@ func loadUsageCredential(ctx context.Context, credential usageCredential, force 
 		return cached
 	}
 	if credential.err != nil {
-		return usageAccountView{Label: label, State: "Unavailable", StateClass: "error", Error: publicUsageError(credential.err)}
+		return usageAccountView{
+			Label: label, State: "Unavailable", StateKey: usageStateUnavailable, StateClass: "error",
+			Error: publicUsageError(credential.err), ErrorKey: publicUsageErrorKey(credential.err),
+		}
 	}
 
 	lock := credentialUsageLock(credential.token, entry.AuthIndex)
@@ -616,8 +785,10 @@ func loadUsageCredential(ctx context.Context, credential usageCredential, force 
 			account.Label = label
 		}
 		account.State = "Unavailable"
+		account.StateKey = usageStateUnavailable
 		account.StateClass = "error"
 		account.Error = publicUsageError(err)
+		account.ErrorKey = publicUsageErrorKey(err)
 	}
 	storeCachedUsage(credential.cacheKey, account)
 	return account
@@ -655,7 +826,77 @@ func fetchUsageForCredential(ctx context.Context, credential usageCredential) (u
 	if err != nil {
 		return usageAccountView{Label: label}, err
 	}
-	return usageView(label, usage, usageNow()), nil
+	// The usage response is the only place AWS names the account, so a credential
+	// stored before this was read heals itself on the first page load.
+	if reconcileCredentialIdentity(ctx, authRecord.Name, raw, token, usage.UserInfo, usage.SubscriptionInfo.SubscriptionTitle) {
+		label = kiroUsageLabel(token)
+	}
+	account := usageView(label, usage, usageNow())
+	// The refreshed token is the freshest source for session expiry.
+	decorateUsageAccount(&account, credential, token)
+	return account, nil
+}
+
+// decorateUsageAccount fills empty presentation fields only, so a caller that
+// already knows a fresher value (a refreshed token) keeps it.
+func decorateUsageAccount(account *usageAccountView, credential usageCredential, token *kiroauth.KiroTokenData) {
+	if account == nil {
+		return
+	}
+	if account.StateKey == "" {
+		account.StateKey = usageStateActive
+	}
+	entry := credential.entry
+	if account.FileName == "" {
+		if name := strings.TrimSpace(entry.Name); name != "" {
+			account.FileName = filepath.Base(name)
+		}
+	}
+	if account.StatusMessage == "" {
+		account.StatusMessage = strings.TrimSpace(entry.StatusMessage)
+	}
+	if account.LastRefresh == "" && !entry.LastRefresh.IsZero() {
+		account.LastRefresh = entry.LastRefresh.UTC().Format(time.RFC3339)
+	}
+	if token == nil {
+		token = credential.token
+	}
+	if token == nil {
+		return
+	}
+	if account.AuthMethod == "" {
+		account.AuthMethod = strings.TrimSpace(token.AuthMethod)
+	}
+	if account.Region == "" {
+		account.Region = resolveAccount(token).Region
+	}
+	if account.Identity == "" {
+		account.Identity = credentialIdentity(token)
+	}
+	identity := resolveAWSIdentity(token)
+	if account.Account == "" {
+		if identity.Email != "" {
+			account.Account = identity.Email
+		} else {
+			account.Account = identity.UserKey
+		}
+	}
+	if account.Directory == "" {
+		account.Directory = identity.Directory
+	}
+	if account.UserKey == "" {
+		account.UserKey = identity.UserKey
+	}
+	if account.AWSAccountID == "" {
+		account.AWSAccountID = identity.AccountID
+	}
+	if account.ProfileName == "" {
+		account.ProfileName = identity.ProfileName
+	}
+	// An API key has no session to expire; showing one would be misleading.
+	if account.TokenExpiresAt == "" && !isAPIKeyCredential(token) {
+		account.TokenExpiresAt = strings.TrimSpace(token.ExpiresAt)
+	}
 }
 
 func getHostKiroAuth(authIndex string) (pluginapi.HostAuthGetResponse, []byte, *kiroauth.KiroTokenData, error) {
@@ -734,18 +975,21 @@ func requestUsageLimits(ctx context.Context, client httpDoer, token *kiroauth.Ki
 	if strings.EqualFold(token.AuthMethod, "external_idp") && token.ProfileArn == "" {
 		return nil, errors.New("usage is not available for this Kiro credential type")
 	}
-	region := kiroServiceRegion(token)
-	if err := validateRegion(region); err != nil {
+	account := resolveAccount(token)
+	endpoint, err := account.MetadataURL(kiroroute.OpGetUsageLimits)
+	if err != nil {
 		return nil, err
 	}
 	query := url.Values{}
 	query.Set("origin", "AI_EDITOR")
 	query.Set("resourceType", "AGENTIC_REQUEST")
-	endpoint := managementEndpoint(region, "getUsageLimits")
-	if isBuilderIDCredential(token) || isAPIKeyCredential(token) {
-		endpoint = "https://q." + region + ".amazonaws.com/getUsageLimits"
-	} else if profileARN := strings.TrimSpace(token.ProfileArn); profileARN != "" {
-		query.Set("profileArn", profileARN)
+	// The control plane scopes usage to a profile and answers 400 "Invalid
+	// profileArn." without one. Amazon Q serves the profile-less credentials and
+	// must not receive the parameter.
+	if account.MetadataSurface == kiroroute.SurfaceControlPlane {
+		if profileARN := strings.TrimSpace(token.ProfileArn); profileARN != "" {
+			query.Set("profileArn", profileARN)
+		}
 	}
 	endpoint += "?" + query.Encode()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
@@ -788,10 +1032,24 @@ func usageView(label string, usage *usageLimitsResponse, fetchedAt time.Time) us
 	view := usageAccountView{
 		Label:         label,
 		State:         "Active",
+		StateKey:      usageStateActive,
 		StateClass:    "active",
-		Plan:          defaultString(usage.SubscriptionInfo.SubscriptionTitle, "Unknown plan"),
+		Plan:          strings.TrimSpace(usage.SubscriptionInfo.SubscriptionTitle),
+		PlanType:      strings.TrimSpace(usage.SubscriptionInfo.Type),
 		OverageStatus: strings.ToLower(strings.TrimSpace(usage.OverageConfig.OverageStatus)),
 		UpdatedAt:     fetchedAt.Format(time.RFC3339),
+
+		OverageCapability: strings.TrimSpace(usage.SubscriptionInfo.OverageCapability),
+		UpgradeCapability: strings.TrimSpace(usage.SubscriptionInfo.UpgradeCapability),
+		ManagementTarget:  strings.TrimSpace(usage.SubscriptionInfo.ManagementTarget),
+	}
+	if usage.DaysUntilReset != nil {
+		view.DaysUntilReset = *usage.DaysUntilReset
+		view.HasDaysUntilReset = true
+	}
+	if usage.OverageConfig.OverageLimit != nil {
+		view.OverageLimit = *usage.OverageConfig.OverageLimit
+		view.HasOverageLimit = true
 	}
 	for _, item := range usage.UsageBreakdownList {
 		used := preferredUsageValue(item.CurrentUsageWithPrecision, item.CurrentUsage)
@@ -806,15 +1064,99 @@ func usageView(label string, usage *usageLimitsResponse, fetchedAt time.Time) us
 			percent = math.Max(0, math.Min(100, used/limit*100))
 		}
 		reset := defaultString(string(item.NextDateReset), string(usage.NextDateReset))
-		view.Buckets = append(view.Buckets, usageBucketView{
+		bucket := usageBucketView{
 			Name: name, Used: used, Limit: limit, Remaining: math.Max(0, limit-used), Overage: overage,
 			Percent: percent, Reset: reset, Unit: item.Unit, Currency: item.Currency,
-		})
+			OverageCap:     preferredUsageValue(item.OverageCapWithPrecision, item.OverageCap),
+			OverageRate:    preferredUsageValue(nil, item.OverageRate),
+			OverageCharges: preferredUsageValue(nil, item.OverageCharges),
+			BonusTotal:     sumUsageBonuses(item.Bonuses),
+			OverageCredit:  sumUsageBonuses(item.OverageCredits),
+		}
+		bucket.Kind = usageKindPlan
+		bucket.HasShare = true
+		if trial := item.FreeTrialInfo; trial != nil {
+			bucket.FreeTrialUsed = preferredUsageValue(trial.CurrentUsageWithPrecision, trial.CurrentUsage)
+			bucket.FreeTrialLimit = preferredUsageValue(trial.UsageLimitWithPrecision, trial.UsageLimit)
+			bucket.FreeTrialStatus = strings.TrimSpace(trial.FreeTrialStatus)
+			bucket.FreeTrialExpiry = string(trial.FreeTrialExpiry)
+		}
+		view.Buckets = append(view.Buckets, bucket)
+		view.Buckets = append(view.Buckets, creditPoolRows(item, bucket)...)
 	}
 	if len(view.Buckets) == 0 {
 		view.Error = "Kiro did not return a usage bucket for this account."
+		view.ErrorKey = "err_no_buckets"
 	}
 	return view
+}
+
+// creditPoolRows turns the pools that sit inside one CREDIT bucket into their own
+// rows: the free-trial allowance, granted bonuses and overage credits. A pool
+// that AWS did not report produces no row, so the page never shows a zero it did
+// not measure.
+func creditPoolRows(item usageBreakdown, plan usageBucketView) []usageBucketView {
+	rows := make([]usageBucketView, 0, 3)
+	if trial := item.FreeTrialInfo; trial != nil {
+		used := preferredUsageValue(trial.CurrentUsageWithPrecision, trial.CurrentUsage)
+		limit := preferredUsageValue(trial.UsageLimitWithPrecision, trial.UsageLimit)
+		if limit > 0 || used > 0 {
+			percent := 0.0
+			if limit > 0 {
+				percent = math.Max(0, math.Min(100, used/limit*100))
+			}
+			rows = append(rows, usageBucketView{
+				Kind: usageKindTrial, NameKey: "quota_trial", HasShare: true, AmountKnown: true,
+				Used: used, Limit: limit, Remaining: math.Max(0, limit-used), Percent: percent,
+				Unit: plan.Unit, Currency: plan.Currency,
+				Expiry: string(trial.FreeTrialExpiry), StatusRaw: strings.TrimSpace(trial.FreeTrialStatus),
+			})
+		}
+	}
+	for _, pool := range []struct {
+		kind    string
+		nameKey string
+		items   []usageBonus
+	}{
+		{usageKindBonus, "quota_bonus", item.Bonuses},
+		{usageKindOverageCredit, "quota_overage_credit", item.OverageCredits},
+	} {
+		if len(pool.items) == 0 {
+			continue
+		}
+		total, known := 0.0, false
+		expiry := ""
+		for _, entry := range pool.items {
+			if amount, ok := entry.amount(); ok {
+				total += amount
+				known = true
+			}
+			// The soonest expiry is the one that matters: it is when the pool
+			// starts shrinking.
+			if candidate := entry.expiry(); candidate != "" && (expiry == "" || candidate < expiry) {
+				expiry = candidate
+			}
+		}
+		rows = append(rows, usageBucketView{
+			Kind: pool.kind, NameKey: pool.nameKey, HasShare: false, AmountKnown: known,
+			Limit: total, Remaining: total, Grants: len(pool.items),
+			Unit: plan.Unit, Currency: plan.Currency, Expiry: expiry,
+		})
+	}
+	return rows
+}
+
+// sumUsageBonuses adds a bonus array. AWS returns these grants separately from
+// the counters, so an account can hold credit that neither the used nor the
+// limit column accounts for.
+func sumUsageBonuses(items []usageBonus) float64 {
+	total := 0.0
+	for _, item := range items {
+		if amount, ok := item.amount(); ok {
+			total += amount
+		}
+	}
+	return total
 }
 
 func preferredUsageValue(precise, fallback *float64) float64 {
@@ -827,13 +1169,143 @@ func preferredUsageValue(precise, fallback *float64) float64 {
 	return 0
 }
 
-func kiroUsageLabel(token *kiroauth.KiroTokenData) string {
-	if token != nil {
-		if parsed, err := url.Parse(token.StartURL); err == nil && parsed.Hostname() != "" {
-			return "Kiro - " + strings.ToLower(parsed.Hostname())
+// reconcileCredentialIdentity copies AWS-reported identity into the credential
+// and persists it. It reports whether the token changed. Failures are logged and
+// ignored: the page must still render usage when the credential cannot be saved.
+func reconcileCredentialIdentity(ctx context.Context, name string, original []byte, token *kiroauth.KiroTokenData, info usageUserInfo, plan string) bool {
+	if token == nil || len(original) == 0 {
+		return false
+	}
+	changed := false
+	if email := strings.TrimSpace(info.Email); looksLikeEmail(email) && !looksLikeEmail(token.Email) {
+		token.Email = email
+		changed = true
+	}
+	if userID := strings.TrimSpace(info.UserID); userID != "" && userID != strings.TrimSpace(token.AWSUserID) {
+		token.AWSUserID = userID
+		changed = true
+	}
+	if profileName := discoverProfileName(ctx, token); profileName != "" {
+		token.ProfileName = profileName
+		changed = true
+	}
+	// The plan title is the only human-readable fact AWS reports about these
+	// accounts, so it is persisted and drives the display label.
+	if plan = strings.TrimSpace(plan); plan != "" && plan != strings.TrimSpace(token.SubscriptionTitle) {
+		token.SubscriptionTitle = plan
+		changed = true
+	}
+	if !changed {
+		return false
+	}
+	// A synthetic value written into email by an earlier version is cleared, so
+	// the file name and the display identity stop deriving from it.
+	if !looksLikeEmail(token.Email) {
+		token.Email = ""
+	}
+	token.Identity = credentialIdentity(token)
+	merged, err := mergeIdentityFields(original, token)
+	if err != nil {
+		log.Printf("kiro: encode resolved credential identity failed: %v", err)
+		return true
+	}
+	request, _ := json.Marshal(pluginapi.HostAuthSaveRequest{Name: filepath.Base(name), JSON: merged})
+	var saved pluginapi.HostAuthSaveResponse
+	if err := callHostResult(pluginabi.MethodHostAuthSave, request, &saved); err != nil {
+		log.Printf("kiro: persist resolved credential identity failed: %v", err)
+	}
+	return true
+}
+
+// usageProfileLister is indirected so a test can prove that credentials AWS
+// refuses are never asked, rather than only that the result is empty.
+var usageProfileLister = listAvailableProfiles
+
+// discoverProfileName asks CodeWhisperer for the profile name of an IDC
+// credential. Builder ID tokens are refused with 403, so they are not asked.
+func discoverProfileName(ctx context.Context, token *kiroauth.KiroTokenData) string {
+	if token == nil || strings.TrimSpace(token.ProfileName) != "" {
+		return ""
+	}
+	arn := strings.TrimSpace(token.ProfileArn)
+	if arn == "" {
+		return ""
+	}
+	account := resolveAccount(token)
+	if !account.ProfileDiscoverable() {
+		return ""
+	}
+	// The ARN already names the region that owns the profile, so this lookup does
+	// not need the multi-region sweep that discovery does.
+	endpoint, err := kiroroute.ProfileListURL(account.Region)
+	if err != nil {
+		return ""
+	}
+	profiles, err := usageProfileLister(ctx, &http.Client{Timeout: usageRequestTimeout}, endpoint, token.AccessToken)
+	if err != nil {
+		log.Printf("kiro: profile name discovery unavailable: %v", err)
+		return ""
+	}
+	for _, profile := range profiles {
+		if strings.EqualFold(strings.TrimSpace(profile.ARN), arn) {
+			return strings.TrimSpace(profile.ProfileName)
 		}
 	}
-	return "Kiro"
+	return ""
+}
+
+// mergeIdentityFields writes only the identity keys back into the stored
+// document. Rewriting the whole credential here would let a page request
+// overwrite host-owned settings it never read.
+func mergeIdentityFields(original []byte, token *kiroauth.KiroTokenData) ([]byte, error) {
+	var document map[string]any
+	if err := json.Unmarshal(original, &document); err != nil {
+		return nil, fmt.Errorf("decode persisted Kiro credential: %w", err)
+	}
+	// This function only ever adds. An earlier version deleted a key whose value
+	// had become empty, which removed the email field from a Builder ID document
+	// and collapsed the panel card to a bare file name. Nothing here is allowed
+	// to remove a field the host or the user owns.
+	setIfPresent(document, "email", identityLabel(token))
+	setIfPresent(document, "awsUserId", token.AWSUserID)
+	setIfPresent(document, "identity", token.Identity)
+	setIfPresent(document, "profileName", token.ProfileName)
+	setIfPresent(document, "subscriptionTitle", token.SubscriptionTitle)
+	document["type"] = providerName
+	return json.Marshal(document)
+}
+
+func setIfPresent(document map[string]any, key, value string) {
+	if trimmed := strings.TrimSpace(value); trimmed != "" {
+		document[key] = trimmed
+	}
+}
+
+func kiroUsageLabel(token *kiroauth.KiroTokenData) string {
+	if token == nil {
+		return "Kiro"
+	}
+	return identityLabel(token)
+}
+
+// publicUsageErrorKey mirrors publicUsageError as a text key so the page can
+// localize the same condition. Both are kept: Error remains the machine-facing
+// English string used by host diagnostics.
+func publicUsageErrorKey(err error) string {
+	var httpError *usageHTTPError
+	if errors.As(err, &httpError) {
+		switch httpError.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return "err_rejected"
+		case http.StatusTooManyRequests:
+			return "err_rate_limited"
+		default:
+			if httpError.StatusCode >= 500 {
+				return "err_upstream"
+			}
+		}
+	}
+	return "err_generic"
 }
 
 func publicUsageError(err error) string {
@@ -917,48 +1389,3 @@ func formatUsageNumber(value float64) string {
 	}
 	return strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.2f", value), "0"), ".")
 }
-
-const usagePageHTML = `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Kiro Usage</title>
-<style>
-:root{color-scheme:dark;--page:#19161d;--surface:#211e25;--surface-2:#29252d;--text:#f3f0f5;--muted:#aaa4af;--border:#403a45;--accent:#8f72f4;--accent-2:#aa94fa;--danger:#ffb4c8;--success:#8ed8b2}
-*{box-sizing:border-box}body{margin:0;min-height:100vh;background:var(--page);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.45}main{width:min(1080px,100%);margin:0 auto;padding:32px 24px 48px}.heading{margin-bottom:24px}h1{margin:0;font-size:24px;line-height:1.2;font-weight:650;letter-spacing:-.02em}.intro{margin:7px 0 0;color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:16px}.card{min-width:0;padding:20px;border:1px solid var(--border);border-radius:12px;background:var(--surface);box-shadow:0 14px 38px rgba(0,0,0,.17)}.card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.account{min-width:0;margin:0;font-size:16px;font-weight:650;overflow-wrap:anywhere}.state{flex:none;padding:3px 8px;border:1px solid var(--border);border-radius:999px;color:var(--muted);font-size:11px;font-weight:650;text-transform:uppercase;letter-spacing:.04em}.state.active{border-color:#35634e;color:var(--success);background:#1d3028}.state.error{border-color:#704052;color:var(--danger);background:#302028}.plan{margin:8px 0 18px;color:var(--muted)}.bucket{margin-top:18px;padding-top:18px;border-top:1px solid var(--border)}.bucket:first-of-type{margin-top:0;padding-top:0;border-top:0}.bucket-title{margin:0 0 10px;font-size:14px;font-weight:650}.numbers{display:flex;align-items:baseline;gap:6px;margin-bottom:9px}.used{font-size:25px;font-weight:670;letter-spacing:-.025em}.limit{color:var(--muted)}.track{height:8px;overflow:hidden;border-radius:999px;background:#171419}.fill{height:100%;border-radius:inherit;background:linear-gradient(90deg,var(--accent),var(--accent-2))}.details{display:grid;grid-template-columns:1fr 1fr;gap:9px 18px;margin-top:13px}.detail span{display:block;color:var(--muted);font-size:12px}.detail strong{display:block;margin-top:2px;font-size:13px;font-weight:600;overflow-wrap:anywhere}.error-message,.empty{padding:18px;border:1px solid #704052;border-radius:9px;background:#302028;color:var(--danger)}.empty{max-width:620px}.updated{margin:18px 0 0;color:var(--muted);font-size:12px}@media(max-width:600px){main{padding:22px 14px 36px}.card{padding:18px}.details{grid-template-columns:1fr}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto}}
-</style>
-</head>
-<body>
-<main>
-  <div class="heading">
-    <div><h1>Kiro Usage</h1><p class="intro">Subscription usage reported by Kiro for each connected account.</p></div>
-  </div>
-  {{if .Empty}}<div class="empty" role="status">No Kiro accounts are connected. Add one from OAuth Login.</div>{{else}}
-  <div class="grid">
-  {{range .Accounts}}
-    <article class="card">
-      <div class="card-head"><h2 class="account">{{.Label}}</h2><span class="state {{.StateClass}}">{{.State}}</span></div>
-      {{if .Plan}}<p class="plan">{{.Plan}}</p>{{end}}
-      {{if .Error}}<div class="error-message" role="status">{{.Error}}</div>{{end}}
-      {{range .Buckets}}
-      <section class="bucket" aria-label="{{.Name}} usage">
-        <h3 class="bucket-title">{{.Name}}</h3>
-        <div class="numbers"><span class="used">{{formatNumber .Used}}</span><span class="limit">of {{formatNumber .Limit}}</span></div>
-        <div class="track" role="meter" aria-label="{{.Name}} used" aria-valuemin="0" aria-valuemax="{{formatNumber .Limit}}" aria-valuenow="{{formatNumber .Used}}"><div class="fill" style="width:{{printf "%.2f" .Percent}}%"></div></div>
-        <div class="details">
-          <div class="detail"><span>Remaining</span><strong>{{formatNumber .Remaining}}</strong></div>
-          {{if gt .Overage 0.0}}<div class="detail"><span>Overage</span><strong>{{formatNumber .Overage}}</strong></div>{{end}}
-          {{if .Reset}}<div class="detail"><span>Renews</span><strong><time datetime="{{.Reset}}">{{.Reset}}</time></strong></div>{{end}}
-          {{if .Unit}}<div class="detail"><span>Unit</span><strong>{{.Unit}}</strong></div>{{end}}
-        </div>
-      </section>
-      {{end}}
-      {{if .OverageStatus}}<div class="detail"><span>Overage billing</span><strong>{{.OverageStatus}}</strong></div>{{end}}
-      {{if .UpdatedAt}}<p class="updated">Updated <time datetime="{{.UpdatedAt}}">{{.UpdatedAt}}</time></p>{{end}}
-    </article>
-  {{end}}
-  </div>{{end}}
-</main>
-</body>
-</html>`
