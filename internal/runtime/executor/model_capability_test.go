@@ -40,19 +40,62 @@ func TestPrepareModelCapabilityAllowsClientMaxTokens(t *testing.T) {
 	}
 }
 
-func TestPrepareModelCapabilityRejectsUnsupportedEffort(t *testing.T) {
+func TestPrepareModelCapabilityClampsUnsupportedEffort(t *testing.T) {
 	auth := &cliproxyauth.Auth{ID: "auth-capability-test"}
 	modelcapabilities.ReplaceForAuth(auth.ID, []modelcapabilities.Capability{{
 		ModelID: "claude-opus-5", EffortPath: modelcapabilities.EffortPathOutputConfig,
 		EffortLevels: []string{"low", "high"},
 	}})
 	opts := cliproxyexecutor.Options{Metadata: map[string]any{cliproxyexecutor.ReasoningEffortMetadataKey: "max"}}
-	err := prepareModelCapability(auth, "claude-opus-5", &opts)
-	if err == nil {
-		t.Fatal("expected unsupported effort to be rejected")
+	if err := prepareModelCapability(auth, "claude-opus-5", &opts); err != nil {
+		t.Fatalf("an effort above the schema's range was rejected instead of clamped: %v", err)
 	}
-	if scoped, ok := err.(interface{ IsRequestScoped() bool }); !ok || !scoped.IsRequestScoped() {
-		t.Fatalf("error is not request scoped: %T", err)
+	if got := opts.Metadata[cliproxyexecutor.ReasoningEffortMetadataKey]; got != "high" {
+		t.Fatalf("effort = %#v, want the highest declared level high", got)
+	}
+}
+
+// Claude Code sends thinking:{type:"enabled"} without a budget, which CPA
+// reports as effort "auto". Measured on 2026-09-13, none of the nine Builder ID
+// models publishes an effort schema, so both cases must degrade to "no effort
+// field" rather than fail the request.
+func TestPrepareModelCapabilityNeverRejectsOverEffort(t *testing.T) {
+	withSchema := &cliproxyauth.Auth{ID: "auth-auto-effort"}
+	modelcapabilities.ReplaceForAuth(withSchema.ID, []modelcapabilities.Capability{{
+		ModelID: "claude-opus-5", EffortPath: modelcapabilities.EffortPathOutputConfig,
+		EffortLevels: []string{"low", "medium", "high"}, DefaultEffort: "medium",
+	}})
+	withoutSchema := &cliproxyauth.Auth{ID: "auth-no-schema"}
+	modelcapabilities.ReplaceForAuth(withoutSchema.ID, []modelcapabilities.Capability{{ModelID: "claude-opus-5"}})
+	unknownAccount := &cliproxyauth.Auth{ID: "auth-never-discovered"}
+
+	for _, test := range []struct {
+		name      string
+		auth      *cliproxyauth.Auth
+		requested string
+		want      any
+	}{
+		{"auto uses the schema default", withSchema, "auto", "medium"},
+		{"auto without a schema omits the field", withoutSchema, "auto", nil},
+		{"auto on an undiscovered account omits the field", unknownAccount, "auto", nil},
+		{"level without a schema omits the field", withoutSchema, "high", nil},
+		{"level on an undiscovered account omits the field", unknownAccount, "high", nil},
+		{"disabled without a schema omits the field", withoutSchema, "none", nil},
+		{"garbage is dropped", withSchema, "turbo", nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			opts := cliproxyexecutor.Options{Metadata: map[string]any{cliproxyexecutor.ReasoningEffortMetadataKey: test.requested}}
+			if err := prepareModelCapability(test.auth, "claude-opus-5", &opts); err != nil {
+				t.Fatalf("request rejected over reasoning effort: %v", err)
+			}
+			got, exists := opts.Metadata[cliproxyexecutor.ReasoningEffortMetadataKey]
+			if test.want == nil && exists {
+				t.Fatalf("effort metadata = %#v, want it omitted", got)
+			}
+			if test.want != nil && got != test.want {
+				t.Fatalf("effort metadata = %#v, want %#v", got, test.want)
+			}
+		})
 	}
 }
 
@@ -79,6 +122,10 @@ func TestIdentityCenterProfileIsSentUpstream(t *testing.T) {
 	}
 }
 
+// A credential without a profile ARN is served profileless, the way the Kiro
+// CLI itself serves Builder ID logins. Substituting a placeholder ARN from an
+// unrelated AWS account would label the request as that account's, so no
+// credential type ever gets one invented for it.
 func TestGenerateProfileContractMatchesCredentialType(t *testing.T) {
 	const accountProfile = "arn:aws:codewhisperer:eu-west-1:123456789012:profile/account"
 	tests := []struct {
@@ -86,8 +133,9 @@ func TestGenerateProfileContractMatchesCredentialType(t *testing.T) {
 		stored   string
 		expected string
 	}{
-		{method: "builder-id", expected: kiroBuilderIDProfileARN},
-		{method: "social", expected: kiroSocialProfileARN},
+		{method: "builder-id", expected: ""},
+		{method: "social", expected: ""},
+		{method: "social", stored: accountProfile, expected: accountProfile},
 		{method: "idc", stored: accountProfile, expected: accountProfile},
 		{method: "external_idp", stored: accountProfile, expected: accountProfile},
 		{method: "imported", stored: accountProfile, expected: accountProfile},

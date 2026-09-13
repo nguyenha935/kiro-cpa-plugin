@@ -26,10 +26,11 @@ import (
 // 200. It was previously sent only as a header, so the body omitted a field Kiro
 // CLI includes.
 type KiroPayload struct {
-	ConversationState            KiroConversationState `json:"conversationState"`
-	ProfileArn                   string                `json:"profileArn,omitempty"`
-	AgentMode                    string                `json:"agentMode,omitempty"`
-	AdditionalModelRequestFields map[string]any        `json:"additionalModelRequestFields,omitempty"`
+	ConversationState            KiroConversationState       `json:"conversationState"`
+	ProfileArn                   string                      `json:"profileArn,omitempty"`
+	AgentMode                    string                      `json:"agentMode,omitempty"`
+	InferenceConfig              *kirocommon.InferenceConfig `json:"inferenceConfig,omitempty"`
+	AdditionalModelRequestFields map[string]any              `json:"additionalModelRequestFields,omitempty"`
 }
 
 // KiroConversationState holds the conversation context
@@ -189,6 +190,7 @@ func BuildKiroPayloadFromOpenAI(openaiBody []byte, modelID, profileArn, origin s
 		},
 		ProfileArn:                   profileArn,
 		AgentMode:                    kirocommon.AgentModeVibe,
+		InferenceConfig:              kirocommon.InferenceConfigFromRequest(openaiBody),
 		AdditionalModelRequestFields: capability.AdditionalFieldsForRequest(effort, maxTokens),
 	}
 
@@ -665,8 +667,16 @@ func buildAssistantMessageFromOpenAI(msg gjson.Result) KiroAssistantResponseMess
 			toolName := tc.Get("function.name").String()
 			toolArgs := tc.Get("function.arguments").String()
 
-			var inputMap map[string]interface{}
-			_ = json.Unmarshal([]byte(toolArgs), &inputMap)
+			// Kiro's input is an object; a missing, empty or truncated argument
+			// string (a client replaying an interrupted stream) must replay as {}
+			// rather than null.
+			inputMap := make(map[string]interface{})
+			if err := json.Unmarshal([]byte(toolArgs), &inputMap); err != nil || inputMap == nil {
+				if err != nil {
+					log.Warnf("kiro-openai: tool call %s carried undecodable arguments; replaying with empty input", toolName)
+				}
+				inputMap = make(map[string]interface{})
+			}
 
 			toolUses = append(toolUses, KiroToolUse{
 				ToolUseID: toolUseID,

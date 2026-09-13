@@ -51,7 +51,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -75,8 +74,19 @@ import (
 )
 
 const (
+	// pluginID is the host's identity for this plugin: the shared-library file
+	// name without extension, the plugins.configs key and the prefix of every
+	// browser-navigable resource route. It deliberately differs from
+	// providerName because the official store already publishes a plugin with
+	// id "kiro", and a store install writes <id>.so, so sharing the id would let
+	// an unrelated install overwrite this binary in place.
+	pluginID = "kiro-ha"
+	// providerName is the executor/auth provider key: the credential type,
+	// the model owner and the key of oauth-model-alias and the like. It stays
+	// "kiro" so existing credential files and config stay valid.
 	providerName      = "kiro"
 	pluginDisplayName = "Kiro"
+	resourceBasePath  = "/v0/resource/plugins/" + pluginID
 	maxPages          = 10
 )
 
@@ -126,10 +136,11 @@ type envelope struct {
 }
 
 type envelopeError struct {
-	Code       string `json:"code"`
-	Message    string `json:"message"`
-	Retryable  bool   `json:"retryable,omitempty"`
-	HTTPStatus int    `json:"http_status,omitempty"`
+	Code         string `json:"code"`
+	Message      string `json:"message"`
+	Retryable    bool   `json:"retryable,omitempty"`
+	HTTPStatus   int    `json:"http_status,omitempty"`
+	RetryAfterMS int64  `json:"retry_after_ms,omitempty"`
 }
 
 type registration struct {
@@ -218,6 +229,12 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
 		configurePlugin(request)
 		return okEnvelope(pluginRegistration())
+	case pluginabi.MethodPluginQuiesce, pluginabi.MethodPluginShutdown:
+		// Hot reload announces the replacement to the outgoing library, and the
+		// host waits out in-flight calls itself before the C shutdown export
+		// severs the host API. The plugin keeps no state worth winding down, so
+		// an acknowledgement is the whole contract.
+		return okEnvelope(struct{}{})
 	case pluginabi.MethodModelStatic:
 		// File-backed credentials supply their own catalog through model.for_auth.
 		// Keep the ABI response valid without advertising unauthenticated models.
@@ -321,8 +338,11 @@ func configurePlugin(raw []byte) {
 			} `yaml:"plugins"`
 		}
 		if yaml.Unmarshal(req.ConfigYAML, &full) == nil {
-			if configured, ok := full.Plugins.Configs[providerName]; ok && !configured.isZero() {
-				next = mergePluginSettings(next, configured)
+			for _, key := range settingsKeys {
+				if configured, ok := full.Plugins.Configs[key]; ok && !configured.isZero() {
+					next = mergePluginSettings(next, configured)
+					break
+				}
 			}
 		}
 		var root map[string]any
@@ -340,14 +360,10 @@ func configurePlugin(raw []byte) {
 }
 
 // mergePluginSettings overlays only the fields the host actually set, treating
-// a zero value as "not configured". Two consequences are deliberate:
-// daily_max_requests cannot be set to 0 through config (0 means unlimited via
-// the default), and removing a key from config.yaml does not revert the setting
-// until the process restarts, because nothing in the update says to clear it.
+// an empty value as "not configured". One consequence is deliberate: removing a
+// key from config.yaml does not revert the setting until the process restarts,
+// because nothing in the update says to clear it.
 func mergePluginSettings(base, update pluginSettingsData) pluginSettingsData {
-	if update.DailyMaxRequests != 0 {
-		base.DailyMaxRequests = update.DailyMaxRequests
-	}
 	if update.MinTokenInterval != "" {
 		base.MinTokenInterval = update.MinTokenInterval
 	}
@@ -360,6 +376,12 @@ func mergePluginSettings(base, update pluginSettingsData) pluginSettingsData {
 	return base
 }
 
+// settingsKeys are the plugins.configs keys this plugin reads its settings
+// from, most specific first: the plugin id the host actually files the
+// section under, then the provider name kept for configs written before the
+// id changed.
+var settingsKeys = []string{pluginID, providerName}
+
 // findKiroConfig locates this plugin's settings inside an arbitrarily shaped
 // host config document.
 //
@@ -370,8 +392,10 @@ func mergePluginSettings(base, update pluginSettingsData) pluginSettingsData {
 // restarts; the child keys are therefore visited in sorted order.
 func findKiroConfig(value any) (map[string]any, bool) {
 	if object, ok := value.(map[string]any); ok {
-		if kiro, ok := object["kiro"].(map[string]any); ok {
-			return kiro, true
+		for _, key := range settingsKeys {
+			if kiro, ok := object[key].(map[string]any); ok {
+				return kiro, true
+			}
 		}
 		keys := make([]string, 0, len(object))
 		for key := range object {
@@ -1245,18 +1269,6 @@ func intValue(value any, fallback int) int {
 	return fallback
 }
 
-func isKiroAuthorizationError(err error) bool {
-	if err == nil {
-		return false
-	}
-	message := err.Error()
-	return strings.Contains(message, "HTTP 401") || strings.Contains(message, "HTTP 403")
-}
-
-func isBuilderIDCredential(token *kiroauth.KiroTokenData) bool {
-	return token != nil && strings.EqualFold(strings.TrimSpace(token.AuthMethod), "builder-id")
-}
-
 func normalizeModelID(id string) string {
 	id = strings.TrimSpace(id)
 	if strings.EqualFold(id, "auto") {
@@ -1547,15 +1559,6 @@ func reconcileIdentityBestEffort(ctx context.Context, token *kiroauth.KiroTokenD
 	token.Identity = credentialIdentity(token)
 }
 
-func reconcileProfileBestEffort(ctx context.Context, token *kiroauth.KiroTokenData, phase string) {
-	if token == nil || strings.TrimSpace(token.ProfileArn) != "" {
-		return
-	}
-	if err := reconcileProfile(ctx, token); err != nil {
-		log.Printf("kiro: profile discovery %s unavailable: %v; continuing without profile ARN", phase, err)
-	}
-}
-
 func listAvailableProfiles(ctx context.Context, client *http.Client, endpoint, accessToken string) ([]availableProfile, error) {
 	profiles := make([]availableProfile, 0, 1)
 	nextToken := ""
@@ -1793,26 +1796,53 @@ func handleExecuteStream(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	if req.StreamID == "" {
-		chunks := make([]pluginapi.ExecutorStreamChunk, 0)
-		for chunk := range result.Chunks {
-			chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: chunk.Payload, Err: chunk.Err})
-		}
-		return okEnvelope(synchronousStreamResponse{Headers: result.Headers, Chunks: chunks})
+		return collectStream(result)
 	}
 	go pumpStream(req.StreamID, result.Chunks)
 	return okEnvelope(synchronousStreamResponse{Headers: result.Headers})
 }
 
+// collectStream serves hosts that open no stream bridge. ExecutorStreamChunk.Err
+// is an interface with no JSON tag, so an error cannot ride inside the chunk
+// array: the first error becomes the envelope error and the partial payload is
+// discarded, which is what the host would do with a truncated stream anyway.
+func collectStream(result *coreexec.StreamResult) ([]byte, error) {
+	chunks := make([]pluginapi.ExecutorStreamChunk, 0)
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			drainStream(result.Chunks)
+			return nil, chunk.Err
+		}
+		if len(chunk.Payload) > 0 {
+			chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: chunk.Payload})
+		}
+	}
+	return okEnvelope(synchronousStreamResponse{Headers: result.Headers, Chunks: chunks})
+}
+
+// pumpStream forwards executor chunks to the host bridge. The executor goroutine
+// sends on an unbuffered channel and only closes the upstream body once it
+// finishes, so every exit path must keep receiving until the channel closes:
+// returning early would park that goroutine and its connection for good.
 func pumpStream(streamID string, chunks <-chan coreexec.StreamChunk) {
-	defer streamClose(streamID)
+	var streamErr error
+	defer func() {
+		drainStream(chunks)
+		streamClose(streamID, streamErr)
+	}()
 	for chunk := range chunks {
 		if chunk.Err != nil {
-			streamEmitError(streamID, chunk.Err.Error())
+			streamErr = chunk.Err
 			return
 		}
 		if len(chunk.Payload) > 0 && streamEmit(streamID, chunk.Payload) != nil {
 			return
 		}
+	}
+}
+
+func drainStream(chunks <-chan coreexec.StreamChunk) {
+	for range chunks {
 	}
 }
 
@@ -1845,7 +1875,7 @@ func handleManagement(raw []byte) ([]byte, error) {
 		return handleConnectAPI(req)
 	case "/v0/management/plugins/kiro/usage":
 		return handleUsagePage(req)
-	case "/v0/resource/plugins/kiro/capabilities":
+	case resourceBasePath + "/capabilities":
 		capabilities := modelcapabilities.Snapshot()
 		sort.Slice(capabilities, func(i, j int) bool { return capabilities[i].ModelID < capabilities[j].ModelID })
 		body, _ := json.Marshal(map[string]any{"provider": providerName, "models": capabilities})
@@ -1859,7 +1889,7 @@ func handleManagement(raw []byte) ([]byte, error) {
 			Body: body,
 		})
 	}
-	if req.Path == "/v0/resource/plugins/kiro"+usageResourcePath {
+	if req.Path == resourceBasePath+usageResourcePath {
 		return handleUsagePage(req)
 	}
 	return okEnvelope(pluginapi.ManagementResponse{StatusCode: http.StatusNotFound, Headers: http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}}, Body: []byte("Not found")})
@@ -1880,8 +1910,10 @@ func validateIDCInput(startURL, region string) error {
 	return nil
 }
 
+// validateRegion applies the shared region rule to operator and credential
+// input, keeping the connect form's wording for the rejection.
 func validateRegion(region string) error {
-	if matched, _ := regexp.MatchString(`^[a-z]{2}(?:-gov)?-[a-z]+-\d$`, region); !matched {
+	if _, err := kiroroute.ValidateRegion(region); err != nil {
 		return errors.New("Enter a valid AWS Region, for example us-east-1.")
 	}
 	return nil
@@ -1913,20 +1945,34 @@ func hostCall(method string, request []byte) ([]byte, error) {
 	return out, nil
 }
 
+// hostStreamMessage mirrors the host's stream.emit and stream.close request
+// shapes. The host reads a stream error only from the top-level "error" field;
+// anything placed in "payload" is delivered to the client as ordinary bytes.
+type hostStreamMessage struct {
+	StreamID string `json:"stream_id"`
+	Payload  []byte `json:"payload,omitempty"`
+	Error    string `json:"error,omitempty"`
+}
+
+// streamHostCall is swapped by tests that drive pumpStream without a host.
+var streamHostCall = hostCall
+
 func streamEmit(streamID string, payload []byte) error {
-	body, _ := json.Marshal(map[string]any{"stream_id": streamID, "payload": payload})
-	_, err := hostCall(pluginabi.MethodHostStreamEmit, body)
+	body, _ := json.Marshal(hostStreamMessage{StreamID: streamID, Payload: payload})
+	_, err := streamHostCall(pluginabi.MethodHostStreamEmit, body)
 	return err
 }
 
-func streamEmitError(streamID, message string) {
-	payload, _ := json.Marshal(map[string]any{"error": map[string]any{"message": message}})
-	_ = streamEmit(streamID, payload)
-}
-
-func streamClose(streamID string) {
-	body, _ := json.Marshal(map[string]any{"stream_id": streamID})
-	_, _ = hostCall(pluginabi.MethodHostStreamClose, body)
+// streamClose ends the host stream. A non-nil err is queued by the host as a
+// terminal error chunk after every payload already emitted, so the client sees
+// the failure and the host records it against the credential.
+func streamClose(streamID string, err error) {
+	message := hostStreamMessage{StreamID: streamID}
+	if err != nil {
+		message.Error = err.Error()
+	}
+	body, _ := json.Marshal(message)
+	_, _ = streamHostCall(pluginabi.MethodHostStreamClose, body)
 }
 
 func defaultString(value, fallback string) string {
@@ -1959,11 +2005,22 @@ func errorEnvelopeFromError(err error) []byte {
 	if errors.As(err, &statusError) {
 		status = statusError.StatusCode()
 	}
+	// The host's rpcError (7.2.151) does not read retry_after_ms yet; the field
+	// is emitted so a host that learns it can honor the plugin's window instead
+	// of starting its own backoff ladder at one second.
+	var retryAfterMS int64
+	var retryAfterError interface{ RetryAfter() *time.Duration }
+	if errors.As(err, &retryAfterError) {
+		if retryAfter := retryAfterError.RetryAfter(); retryAfter != nil && *retryAfter > 0 {
+			retryAfterMS = retryAfter.Milliseconds()
+		}
+	}
 	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{
-		Code:       "plugin_error",
-		Message:    err.Error(),
-		Retryable:  status == http.StatusTooManyRequests || status >= http.StatusInternalServerError,
-		HTTPStatus: status,
+		Code:         "plugin_error",
+		Message:      err.Error(),
+		Retryable:    status == http.StatusTooManyRequests || status >= http.StatusInternalServerError,
+		HTTPStatus:   status,
+		RetryAfterMS: retryAfterMS,
 	}})
 	return raw
 }

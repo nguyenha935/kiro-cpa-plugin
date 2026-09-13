@@ -17,7 +17,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -66,9 +65,6 @@ const (
 	// matters, so the bar sits above the observed normal range.
 	kiroLargePayloadBytes = 2 << 20
 
-	kiroBuilderIDProfileARN = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
-	kiroSocialProfileARN    = "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
-
 	// Socket retry configuration constants
 	// Maximum number of retry attempts for socket/network errors
 	kiroSocketMaxRetries = 3
@@ -89,8 +85,6 @@ var retryableHTTPStatusCodes = map[int]bool{
 	503: true, // Service Unavailable - server temporarily overloaded
 	504: true, // Gateway Timeout - upstream server timeout
 }
-
-var awsRegionPattern = regexp.MustCompile("^[a-z]{2}(?:-gov)?-[a-z]+-\\d$")
 
 // retryConfig holds configuration for socket retry logic.
 // Based on kiro2Api Python implementation patterns.
@@ -313,18 +307,12 @@ func newKiroHTTPClientWithPooling(ctx context.Context, cfg *config.Config, auth 
 
 var kiroHTTPClientFor = newKiroHTTPClientWithPooling
 
-// kiroEndpointConfig bundles endpoint URL with its compatible Origin and AmzTarget values.
-// This solves the "triple mismatch" problem where different endpoints require matching
-// Origin and X-Amz-Target header values.
-//
-// Based on reference implementations:
-// - amq2api-main: Uses Amazon Q endpoint with CLI origin and AmazonQDeveloperStreamingService target
-// - AIClient-2-API: Uses CodeWhisperer endpoint with AI_EDITOR origin and AmazonCodeWhispererStreamingService target
+// kiroEndpointConfig is the runtime a credential is valid on together with the
+// request Origin that runtime expects.
 type kiroEndpointConfig struct {
-	URL       string // Endpoint URL
-	Origin    string // Request Origin: "CLI" for Amazon Q quota, "AI_EDITOR" for Kiro IDE quota
-	AmzTarget string // X-Amz-Target header value
-	Name      string // Endpoint name for logging
+	URL    string
+	Origin string
+	Name   string // Endpoint name for logging
 }
 
 // kiroDefaultRegion is the default AWS region for Kiro API endpoints.
@@ -357,20 +345,12 @@ func resolveKiroAccount(auth *cliproxyauth.Auth) kiroroute.Account {
 	return kiroroute.Resolve(kiroRoutingCredential(auth))
 }
 
-// getKiroEndpointConfigs returns the single endpoint a credential is allowed to
-// use, wrapped in a slice so the surrounding retry loop keeps its shape.
-//
-// It used to return all three surfaces ordered by a guess at the credential's
-// kind, leaving the other two as fallbacks. That was unsafe in both directions.
-// A credential rejected by the wrong surface produced an authentication failure
-// recorded against the account, and a profile in eu-central-1 led with
-// codewhisperer.eu-central-1.amazonaws.com, a hostname with no DNS record, so
-// every request paid a connection failure before finding a working host.
-//
-// A credential is valid on exactly one runtime, so there is nothing to fall back
-// to. Resolving to one endpoint also removes the cross-surface retry fan-out,
-// which is the behaviour most likely to look anomalous to AWS.
-func getKiroEndpointConfigs(auth *cliproxyauth.Auth) []kiroEndpointConfig {
+// kiroEndpointFor resolves the single runtime a credential is valid on. There
+// is deliberately no fallback across surfaces: a credential rejected by the
+// wrong surface is recorded as an authentication failure against the account,
+// and codewhisperer.<region>.amazonaws.com has no DNS record outside
+// us-east-1, so trying "the other endpoints" only ever added failed requests.
+func kiroEndpointFor(auth *cliproxyauth.Auth) (kiroEndpointConfig, error) {
 	account := resolveKiroAccount(auth)
 	url, err := account.RuntimeURL()
 	if err != nil {
@@ -378,9 +358,8 @@ func getKiroEndpointConfigs(auth *cliproxyauth.Auth) []kiroEndpointConfig {
 		// hostname that cannot exist.
 		log.Warnf("kiro: %v; falling back to %s", err, kiroDefaultRegion)
 		account.Region = kiroDefaultRegion
-		url, err = account.RuntimeURL()
-		if err != nil {
-			return nil
+		if url, err = account.RuntimeURL(); err != nil {
+			return kiroEndpointConfig{}, statusErr{code: http.StatusInternalServerError, msg: "kiro: cannot resolve runtime endpoint: " + err.Error()}
 		}
 	}
 
@@ -390,12 +369,7 @@ func getKiroEndpointConfigs(auth *cliproxyauth.Auth) []kiroEndpointConfig {
 	}
 	log.Debugf("kiro: routing %s credential (provider=%s) to %s in %s with origin %s",
 		account.AuthMethod, account.Provider, name, account.Region, account.Origin)
-	return []kiroEndpointConfig{{
-		URL:       url,
-		Origin:    account.Origin,
-		AmzTarget: "",
-		Name:      name,
-	}}
+	return kiroEndpointConfig{URL: url, Origin: account.Origin, Name: name}, nil
 }
 
 // KiroExecutor handles requests to AWS CodeWhisperer (Kiro) API.
@@ -574,23 +548,20 @@ func prepareModelCapability(auth *cliproxyauth.Auth, modelID string, opts *clipr
 		authID = auth.ID
 	}
 	opts.Metadata["_kiro_auth_id"] = authID
-	effort, _ := opts.Metadata[cliproxyexecutor.ReasoningEffortMetadataKey].(string)
-	effort = strings.ToLower(strings.TrimSpace(effort))
-	capability, ok := modelcapabilities.ForAuth(authID, modelID)
-	// CPA represents Anthropic thinking.type=disabled as effort "none". Claude
-	// Kiro schemas often omit "none" entirely; in that case disabled means omit
-	// the reasoning field, not reject the request.
-	if effort == "none" && ok && !capability.SupportsEffort(effort) {
-		effort = ""
+	requested, _ := opts.Metadata[cliproxyexecutor.ReasoningEffortMetadataKey].(string)
+	// Reasoning effort is an optional enrichment, so a request is never refused
+	// over it: the effort is fitted to what the selected account's schema for
+	// this model accepts, and any change is logged. A model with no schema at
+	// all (every Builder ID model measured on 2026-09-13) simply carries no
+	// effort field, which is also what happens for "auto".
+	capability, _ := modelcapabilities.ForAuth(authID, modelID)
+	effort, note := capability.ResolveEffort(requested)
+	if note != "" {
+		log.WithFields(log.Fields{"model": modelID, "auth_id": authID, "requested": requested, "effort": effort}).Info("kiro: reasoning effort adjusted: " + note)
+	}
+	if effort == "" {
 		delete(opts.Metadata, cliproxyexecutor.ReasoningEffortMetadataKey)
-	}
-	if !ok && effort != "" {
-		return requestValidationErr{msg: fmt.Sprintf("Kiro capabilities are unavailable for model %q and the selected account", modelID)}
-	}
-	if effort != "" && !capability.SupportsEffort(effort) {
-		return requestValidationErr{msg: fmt.Sprintf("Kiro model %q does not support reasoning effort %q", modelID, effort)}
-	}
-	if effort != "" {
+	} else {
 		opts.Metadata[cliproxyexecutor.ReasoningEffortMetadataKey] = effort
 	}
 	// Output budgets are normalized while building the final Kiro payload. This
@@ -691,6 +662,87 @@ func isCoolingDisabled(auth *cliproxyauth.Auth) bool {
 	return false
 }
 
+// admitCredential applies the plugin-owned protection before a request goes
+// upstream: a credential the plugin has taken out of rotation is refused with
+// its remaining window so CPA can fail over at once, and one that is admitted
+// is paced to its next slot. The wait ends with the caller's context.
+func admitCredential(ctx context.Context, auth *cliproxyauth.Auth, tokenKey string) error {
+	if isCoolingDisabled(auth) {
+		return nil
+	}
+	limiter := kiroauth.GetGlobalRateLimiter()
+	if reason, retryAfter, unavailable := limiter.TokenUnavailable(tokenKey); unavailable {
+		log.Warnf("kiro: token %s is out of rotation for %v (%s)", tokenKey, retryAfter, reason)
+		return statusErr{code: http.StatusTooManyRequests, msg: fmt.Sprintf("kiro: token unavailable for %v (%s)", retryAfter, reason), retryAfter: &retryAfter}
+	}
+	if err := limiter.WaitForToken(ctx, tokenKey); err != nil {
+		return statusErr{code: 499, msg: "client canceled request"}
+	}
+	return nil
+}
+
+// markUnavailable records an upstream condition the plugin must remember
+// across requests. It is a no-op when the credential opted out of cooling.
+func markUnavailable(auth *cliproxyauth.Auth, tokenKey, reason string, window time.Duration) {
+	if isCoolingDisabled(auth) {
+		return
+	}
+	kiroauth.GetGlobalRateLimiter().MarkUnavailable(tokenKey, reason, window)
+}
+
+// markSuspended parks a credential Kiro reported as suspended for the
+// configured cooldown. CPA's own ladder would retry it within seconds.
+func markSuspended(auth *cliproxyauth.Auth, tokenKey string) {
+	if isCoolingDisabled(auth) {
+		return
+	}
+	kiroauth.GetGlobalRateLimiter().MarkSuspended(tokenKey)
+	log.Errorf("kiro: account suspended, token %s taken out of rotation", tokenKey)
+}
+
+// isSuspendedBody reports whether a 403 body carries Kiro's suspension marker.
+func isSuspendedBody(body string) bool {
+	return strings.Contains(body, "SUSPENDED")
+}
+
+// sleepWithContext waits for a retry delay but gives up as soon as the caller
+// does, so a disconnected client never holds a credential's slot.
+func sleepWithContext(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return statusErr{code: http.StatusGatewayTimeout, msg: "upstream request timed out"}
+		}
+		return statusErr{code: 499, msg: "client canceled request"}
+	}
+}
+
+// retryAfterHeader parses an upstream Retry-After header (delay-seconds or
+// HTTP-date). It is nil when absent or malformed so CPA falls back to its own
+// backoff ladder.
+func retryAfterHeader(header http.Header) *time.Duration {
+	value := strings.TrimSpace(header.Get("Retry-After"))
+	if value == "" {
+		return nil
+	}
+	var delay time.Duration
+	if seconds, err := strconv.Atoi(value); err == nil {
+		delay = time.Duration(seconds) * time.Second
+	} else if at, err := http.ParseTime(value); err == nil {
+		delay = time.Until(at)
+	} else {
+		return nil
+	}
+	if delay <= 0 {
+		return nil
+	}
+	return &delay
+}
+
 // Execute sends the request to Kiro API and returns the response.
 // Supports automatic token refresh on 401/403 errors.
 func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
@@ -699,30 +751,9 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		return resp, statusErr{code: http.StatusUnauthorized, msg: "kiro: access token not found in auth"}
 	}
 
-	// Rate limiting: get token key for tracking
 	tokenKey := getTokenKey(auth)
-	coolingDisabled := isCoolingDisabled(auth)
-	rateLimiter := kiroauth.GetGlobalRateLimiter()
-	cooldownMgr := kiroauth.GetGlobalCooldownManager()
-
-	// Check if token is in cooldown period
-	if !coolingDisabled && cooldownMgr.IsInCooldown(tokenKey) {
-		remaining := cooldownMgr.GetRemainingCooldown(tokenKey)
-		reason := cooldownMgr.GetCooldownReason(tokenKey)
-		log.Warnf("kiro: token %s is in cooldown (reason: %s), remaining: %v", tokenKey, reason, remaining)
-		return resp, statusErr{code: http.StatusTooManyRequests, msg: fmt.Sprintf("kiro: token is in cooldown for %v (reason: %s)", remaining, reason), retryAfter: &remaining}
-	}
-	if !coolingDisabled {
-		if reason, remaining, unavailable := rateLimiter.TokenUnavailable(tokenKey); unavailable {
-			return resp, statusErr{code: http.StatusTooManyRequests, msg: fmt.Sprintf("kiro: token unavailable for %v (%s)", remaining, reason), retryAfter: &remaining}
-		}
-	}
-
-	// Wait for rate limiter before proceeding
-	if !coolingDisabled {
-		log.Debugf("kiro: waiting for rate limiter for token %s", tokenKey)
-		rateLimiter.WaitForToken(tokenKey)
-		log.Debugf("kiro: rate limiter cleared for token %s", tokenKey)
+	if err := admitCredential(ctx, auth, tokenKey); err != nil {
+		return resp, err
 	}
 
 	// Check if token is expired before making the request.
@@ -770,207 +801,247 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		return resp, err
 	}
 
-	// Determine the effective profile ARN for the selected credential.
-	// Execute with retry on 401/403 and 429 (quota exhausted)
-	// Note: currentOrigin and kiroPayload are built inside executeWithRetry for each endpoint
-	resp, err = e.executeWithRetry(ctx, auth, req, opts, accessToken, profileArn, nil, body, from, to, "", kiroModelID, tokenKey)
-	return resp, err
+	return e.executeWithRetry(ctx, auth, req, opts, accessToken, profileArn, body, from, to, kiroModelID, tokenKey)
 }
 
-// executeWithRetry performs the actual HTTP request with automatic retry on auth errors.
-// Supports automatic fallback between endpoints with different quotas:
-// - Amazon Q endpoint (CLI origin) uses Amazon Q Developer quota
-// - CodeWhisperer endpoint (AI_EDITOR origin) uses Kiro IDE quota
-// Also supports multi-endpoint fallback similar to Antigravity implementation.
-// tokenKey is used for rate limiting and cooldown tracking.
-func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, accessToken, profileArn string, kiroPayload, body []byte, from, to sdktranslator.Format, currentOrigin, kiroModelID, tokenKey string) (cliproxyexecutor.Response, error) {
+// executeWithRetry performs the HTTP request against the credential's runtime
+// with automatic retry on auth errors. tokenKey identifies the credential in
+// the plugin's protection state.
+func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, accessToken, profileArn string, body []byte, from, to sdktranslator.Format, kiroModelID, tokenKey string) (cliproxyexecutor.Response, error) {
 	var resp cliproxyexecutor.Response
-	var lastEndpointErr error
-	maxRetries := 2 // Allow retries for token refresh + endpoint fallback
-	rateLimiter := kiroauth.GetGlobalRateLimiter()
-	cooldownMgr := kiroauth.GetGlobalCooldownManager()
-	coolingDisabled := isCoolingDisabled(auth)
-	endpointConfigs := getKiroEndpointConfigs(auth)
-	var last429Err error
+	maxRetries := 2 // Allow retries for token refresh
+	endpoint, err := kiroEndpointFor(auth)
+	if err != nil {
+		return resp, err
+	}
+	url := endpoint.URL
+	kiroPayload, _ := buildKiroPayloadForFormat(body, kiroModelID, profileArn, endpoint.Origin, from, opts.Metadata)
 
-	for endpointIdx := 0; endpointIdx < len(endpointConfigs); endpointIdx++ {
-		endpointConfig := endpointConfigs[endpointIdx]
-		url := endpointConfig.URL
-		// Use this endpoint's compatible Origin (critical for avoiding 403 errors)
-		currentOrigin = endpointConfig.Origin
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(kiroPayload))
+		if err != nil {
+			return resp, upstreamTransportErr{cause: err}
+		}
 
-		// Rebuild payload with the correct origin for this endpoint
-		// Each endpoint requires its matching Origin value in the request body
-		kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, from, opts.Metadata)
+		httpReq.Header.Set("Content-Type", kiroContentType)
+		httpReq.Header.Set("Accept", kiroAcceptStream)
+		// Kiro-specific headers
+		httpReq.Header.Set("x-amzn-kiro-agent-mode", kirocommon.AgentModeVibe)
+		httpReq.Header.Set("x-amzn-codewhisperer-optout", "true")
 
-		log.Debugf("kiro: trying endpoint %d/%d: %s (Name: %s, Origin: %s)",
-			endpointIdx+1, len(endpointConfigs), url, endpointConfig.Name, currentOrigin)
+		applyKiroClientHeaders(httpReq, auth)
+		applyKiroProfileHeader(httpReq, profileArn)
+		applyKiroRetryHeaders(httpReq, attempt+1, maxRetries+1)
+		warnOnOversizedPayload(kiroPayload, endpoint.Name)
 
-		for attempt := 0; attempt <= maxRetries; attempt++ {
-			httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(kiroPayload))
-			if err != nil {
-				return resp, upstreamTransportErr{cause: err}
+		setKiroAuthorization(httpReq, auth, accessToken)
+
+		var attrs map[string]string
+		if auth != nil {
+			attrs = auth.Attributes
+		}
+		applyCustomHeadersFromAttrs(httpReq, attrs)
+
+		var authID, authLabel, authType, authValue string
+		if auth != nil {
+			authID = auth.ID
+			authLabel = auth.Label
+			authType, authValue = auth.AccountInfo()
+		}
+		recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
+			URL:       url,
+			Method:    http.MethodPost,
+			Headers:   httpReq.Header.Clone(),
+			Body:      kiroPayload,
+			Provider:  e.Identifier(),
+			AuthID:    authID,
+			AuthLabel: authLabel,
+			AuthType:  authType,
+			AuthValue: authValue,
+		})
+
+		httpClient := kiroHTTPClientFor(ctx, e.cfg, auth, 120*time.Second)
+		httpResp, err := httpClient.Do(httpReq)
+		if err != nil {
+			// Check for context cancellation first - client disconnected, not a server error
+			// Use 499 (Client Closed Request - nginx convention) instead of 500
+			if errors.Is(err, context.Canceled) {
+				log.Debugf("kiro: request canceled by client (context.Canceled)")
+				return resp, statusErr{code: 499, msg: "client canceled request"}
 			}
 
-			httpReq.Header.Set("Content-Type", kiroContentType)
-			httpReq.Header.Set("Accept", kiroAcceptStream)
-			// Only set X-Amz-Target if specified (Q endpoint doesn't require it)
-			if endpointConfig.AmzTarget != "" {
-				httpReq.Header.Set("X-Amz-Target", endpointConfig.AmzTarget)
+			// Check for context deadline exceeded - request timed out
+			// Return 504 Gateway Timeout instead of 500
+			if errors.Is(err, context.DeadlineExceeded) {
+				log.Debugf("kiro: request timed out (context.DeadlineExceeded)")
+				return resp, statusErr{code: http.StatusGatewayTimeout, msg: "upstream request timed out"}
 			}
-			// Kiro-specific headers
-			httpReq.Header.Set("x-amzn-kiro-agent-mode", kirocommon.AgentModeVibe)
-			httpReq.Header.Set("x-amzn-codewhisperer-optout", "true")
 
-			applyKiroClientHeaders(httpReq, auth)
-			applyKiroProfileHeader(httpReq, profileArn)
-			applyKiroRetryHeaders(httpReq, attempt+1, maxRetries+1)
-			warnOnOversizedPayload(kiroPayload, endpointConfig.Name)
+			recordAPIResponseError(ctx, e.cfg, err)
 
-			setKiroAuthorization(httpReq, auth, accessToken)
-
-			var attrs map[string]string
-			if auth != nil {
-				attrs = auth.Attributes
-			}
-			applyCustomHeadersFromAttrs(httpReq, attrs)
-
-			var authID, authLabel, authType, authValue string
-			if auth != nil {
-				authID = auth.ID
-				authLabel = auth.Label
-				authType, authValue = auth.AccountInfo()
-			}
-			recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
-				URL:       url,
-				Method:    http.MethodPost,
-				Headers:   httpReq.Header.Clone(),
-				Body:      kiroPayload,
-				Provider:  e.Identifier(),
-				AuthID:    authID,
-				AuthLabel: authLabel,
-				AuthType:  authType,
-				AuthValue: authValue,
-			})
-
-			httpClient := kiroHTTPClientFor(ctx, e.cfg, auth, 120*time.Second)
-			httpResp, err := httpClient.Do(httpReq)
-			if err != nil {
-				// Check for context cancellation first - client disconnected, not a server error
-				// Use 499 (Client Closed Request - nginx convention) instead of 500
-				if errors.Is(err, context.Canceled) {
-					log.Debugf("kiro: request canceled by client (context.Canceled)")
-					return resp, statusErr{code: 499, msg: "client canceled request"}
+			// Enhanced socket retry: Check if error is retryable (network timeout, connection reset, etc.)
+			retryCfg := defaultRetryConfig()
+			if isRetryableError(err) && attempt < retryCfg.MaxRetries {
+				delay := calculateRetryDelay(attempt, retryCfg)
+				logRetryAttempt(attempt, retryCfg.MaxRetries, fmt.Sprintf("socket error: %v", err), delay, endpoint.Name)
+				if sleepErr := sleepWithContext(ctx, delay); sleepErr != nil {
+					return resp, sleepErr
 				}
+				continue
+			}
 
-				// Check for context deadline exceeded - request timed out
-				// Return 504 Gateway Timeout instead of 500
-				if errors.Is(err, context.DeadlineExceeded) {
-					log.Debugf("kiro: request timed out (context.DeadlineExceeded)")
-					return resp, statusErr{code: http.StatusGatewayTimeout, msg: "upstream request timed out"}
+			return resp, normalizeTransportError(err)
+		}
+		recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+
+		// 429 goes straight back to CPA, which owns the per-credential backoff
+		// ladder and the failover to the next credential.
+		if httpResp.StatusCode == http.StatusTooManyRequests {
+			respBody, _ := io.ReadAll(httpResp.Body)
+			_ = httpResp.Body.Close()
+			appendAPIResponseChunk(ctx, e.cfg, respBody)
+			summary := summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)
+			log.Warnf("kiro: %s returned 429 for token %s, body: %s", endpoint.Name, tokenKey, summary)
+			return resp, statusErr{code: httpResp.StatusCode, msg: summary, retryAfter: retryAfterHeader(httpResp.Header)}
+		}
+
+		// Handle 5xx server errors with exponential backoff retry
+		// Enhanced: Use retryConfig for consistent retry behavior
+		if httpResp.StatusCode >= 500 && httpResp.StatusCode < 600 {
+			respBody, _ := io.ReadAll(httpResp.Body)
+			_ = httpResp.Body.Close()
+			appendAPIResponseChunk(ctx, e.cfg, respBody)
+
+			retryCfg := defaultRetryConfig()
+			// Check if this specific 5xx code is retryable (502, 503, 504)
+			if isRetryableHTTPStatus(httpResp.StatusCode) && attempt < retryCfg.MaxRetries {
+				delay := calculateRetryDelay(attempt, retryCfg)
+				logRetryAttempt(attempt, retryCfg.MaxRetries, fmt.Sprintf("HTTP %d", httpResp.StatusCode), delay, endpoint.Name)
+				if sleepErr := sleepWithContext(ctx, delay); sleepErr != nil {
+					return resp, sleepErr
 				}
+				continue
+			} else if attempt < maxRetries {
+				// Fallback for other 5xx errors (500, 501, etc.)
+				backoff := time.Duration(1<<attempt) * time.Second
+				if backoff > 30*time.Second {
+					backoff = 30 * time.Second
+				}
+				log.Warnf("kiro: server error %d, retrying in %v (attempt %d/%d)", httpResp.StatusCode, backoff, attempt+1, maxRetries)
+				if sleepErr := sleepWithContext(ctx, backoff); sleepErr != nil {
+					return resp, sleepErr
+				}
+				continue
+			}
+			log.Errorf("kiro: server error %d after %d retries", httpResp.StatusCode, maxRetries)
+			return resp, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
+		}
 
-				recordAPIResponseError(ctx, e.cfg, err)
-
-				// Enhanced socket retry: Check if error is retryable (network timeout, connection reset, etc.)
-				retryCfg := defaultRetryConfig()
-				if isRetryableError(err) && attempt < retryCfg.MaxRetries {
-					delay := calculateRetryDelay(attempt, retryCfg)
-					logRetryAttempt(attempt, retryCfg.MaxRetries, fmt.Sprintf("socket error: %v", err), delay, endpointConfig.Name)
-					time.Sleep(delay)
+		if httpResp.StatusCode == http.StatusBadRequest {
+			respBody, _ := io.ReadAll(httpResp.Body)
+			_ = httpResp.Body.Close()
+			appendAPIResponseChunk(ctx, e.cfg, respBody)
+			if attempt == 0 && isThinkingSignatureInvalid(respBody) {
+				if stripped, ok := stripInvalidReasoningHistory(body); ok {
+					body = stripped
+					kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, endpoint.Origin, from, opts.Metadata)
 					continue
 				}
-
-				lastEndpointErr = normalizeTransportError(err)
-				break
 			}
-			recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+			return resp, statusErr{code: http.StatusBadRequest, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
+		}
 
-			// Handle 429 errors (quota exhausted) - try next endpoint
-			// Each endpoint has its own quota pool, so we can try different endpoints
-			if httpResp.StatusCode == 429 {
-				respBody, _ := io.ReadAll(httpResp.Body)
-				_ = httpResp.Body.Close()
-				appendAPIResponseChunk(ctx, e.cfg, respBody)
-				cooldownDuration := kiroauth.CalculateCooldownFor429(attempt)
+		// Handle 401 errors with token refresh and retry
+		// 401 = Unauthorized (token expired/invalid) - refresh token
+		if httpResp.StatusCode == 401 {
+			respBody, _ := io.ReadAll(httpResp.Body)
+			_ = httpResp.Body.Close()
+			appendAPIResponseChunk(ctx, e.cfg, respBody)
+			if isAPIKeyAuth(auth) {
+				log.Warnf("kiro: API key rejected with HTTP 401; returning without OAuth refresh")
+				return resp, statusErr{code: http.StatusUnauthorized, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
+			}
 
-				// Record failure and set cooldown for 429
-				if !coolingDisabled {
-					rateLimiter.MarkTokenFailed(tokenKey)
-					cooldownMgr.SetCooldown(tokenKey, cooldownDuration, kiroauth.CooldownReason429)
-					log.Warnf("kiro: rate limit hit (429), token %s set to cooldown for %v", tokenKey, cooldownDuration)
+			log.Warnf("kiro: received 401 error, attempting token refresh")
+			refreshedAuth, refreshErr := e.Refresh(ctx, auth)
+			if refreshErr != nil {
+				log.Errorf("kiro: token refresh failed: %v", refreshErr)
+				return resp, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
+			}
+
+			if refreshedAuth != nil {
+				auth = refreshedAuth
+				// Persist the refreshed auth to file so subsequent requests use it
+				if persistErr := e.persistRefreshedAuth(auth); persistErr != nil {
+					log.Warnf("kiro: failed to persist refreshed auth: %v", persistErr)
+					// Continue anyway - the token is valid for this request
 				}
-
-				// Preserve last 429 so callers can correctly backoff when all endpoints are exhausted
-				last429Err = statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody), retryAfter: &cooldownDuration}
-
-				log.Warnf("kiro: %s endpoint quota exhausted (429), returning credential cooldown to CPA, body: %s",
-					endpointConfig.Name, summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
-
-				return resp, last429Err
-			}
-
-			// Handle 5xx server errors with exponential backoff retry
-			// Enhanced: Use retryConfig for consistent retry behavior
-			if httpResp.StatusCode >= 500 && httpResp.StatusCode < 600 {
-				respBody, _ := io.ReadAll(httpResp.Body)
-				_ = httpResp.Body.Close()
-				appendAPIResponseChunk(ctx, e.cfg, respBody)
-
-				retryCfg := defaultRetryConfig()
-				// Check if this specific 5xx code is retryable (502, 503, 504)
-				if isRetryableHTTPStatus(httpResp.StatusCode) && attempt < retryCfg.MaxRetries {
-					delay := calculateRetryDelay(attempt, retryCfg)
-					logRetryAttempt(attempt, retryCfg.MaxRetries, fmt.Sprintf("HTTP %d", httpResp.StatusCode), delay, endpointConfig.Name)
-					time.Sleep(delay)
-					continue
-				} else if attempt < maxRetries {
-					// Fallback for other 5xx errors (500, 501, etc.)
-					backoff := time.Duration(1<<attempt) * time.Second
-					if backoff > 30*time.Second {
-						backoff = 30 * time.Second
-					}
-					log.Warnf("kiro: server error %d, retrying in %v (attempt %d/%d)", httpResp.StatusCode, backoff, attempt+1, maxRetries)
-					time.Sleep(backoff)
+				accessToken, profileArn = kiroRuntimeCredentials(auth)
+				// Rebuild payload with new profile ARN if changed
+				kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, endpoint.Origin, from, opts.Metadata)
+				if attempt < maxRetries {
+					log.Infof("kiro: token refreshed successfully, retrying request (attempt %d/%d)", attempt+1, maxRetries+1)
 					continue
 				}
-				log.Errorf("kiro: server error %d after %d retries", httpResp.StatusCode, maxRetries)
-				lastEndpointErr = statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
-				break
+				log.Infof("kiro: token refreshed successfully, no retries remaining")
 			}
 
-			if httpResp.StatusCode == http.StatusBadRequest {
-				respBody, _ := io.ReadAll(httpResp.Body)
-				_ = httpResp.Body.Close()
-				appendAPIResponseChunk(ctx, e.cfg, respBody)
-				if attempt == 0 && isThinkingSignatureInvalid(respBody) {
-					if stripped, ok := stripInvalidReasoningHistory(body); ok {
-						body = stripped
-						kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, from, opts.Metadata)
-						continue
-					}
-				}
-				return resp, statusErr{code: http.StatusBadRequest, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
+			log.Warnf("kiro request error, status: 401, body: %s", summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
+			return resp, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
+		}
+
+		// Handle 402 errors - Monthly Limit Reached. CPA needs a 429 to
+		// rotate away from this credential.
+		if httpResp.StatusCode == 402 {
+			respBody, _ := io.ReadAll(httpResp.Body)
+			_ = httpResp.Body.Close()
+			appendAPIResponseChunk(ctx, e.cfg, respBody)
+
+			log.Warnf("kiro: received 402 (monthly limit). Upstream body: %s", summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
+
+			remaining := kiroauth.UntilNextUTCDay()
+			markUnavailable(auth, tokenKey, "monthly limit reached", remaining)
+			return resp, statusErr{code: http.StatusTooManyRequests, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody), retryAfter: &remaining}
+		}
+
+		// Handle 403 errors - Access Denied / Token Expired
+		if httpResp.StatusCode == 403 {
+			respBody, _ := io.ReadAll(httpResp.Body)
+			_ = httpResp.Body.Close()
+			appendAPIResponseChunk(ctx, e.cfg, respBody)
+
+			// Log the 403 error details for debugging
+			log.Warnf("kiro: received 403 error (attempt %d/%d), body: %s", attempt+1, maxRetries+1, summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
+
+			respBodyStr := string(respBody)
+
+			if isSuspendedBody(respBodyStr) {
+				markSuspended(auth, tokenKey)
+				return resp, statusErr{code: httpResp.StatusCode, msg: "account suspended: " + summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 			}
 
-			// Handle 401 errors with token refresh and retry
-			// 401 = Unauthorized (token expired/invalid) - refresh token
-			if httpResp.StatusCode == 401 {
-				respBody, _ := io.ReadAll(httpResp.Body)
-				_ = httpResp.Body.Close()
-				appendAPIResponseChunk(ctx, e.cfg, respBody)
-				if isAPIKeyAuth(auth) {
-					log.Warnf("kiro: API key rejected with HTTP 401; returning without OAuth refresh")
-					return resp, statusErr{code: http.StatusUnauthorized, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
-				}
+			// API keys are long-lived and cannot be refreshed. In particular, do not
+			// turn an invalid API key into the misleading "refresh token not found"
+			// error that used to hide the real upstream response.
+			if isAPIKeyAuth(auth) {
+				log.Warnf("kiro: API key rejected with HTTP 403; returning without OAuth refresh")
+				return resp, statusErr{code: http.StatusForbidden, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
+			}
 
-				log.Warnf("kiro: received 401 error, attempting token refresh")
+			// Check if this looks like a token-related 403 (some APIs return 403 for expired tokens)
+			isTokenRelated := strings.Contains(respBodyStr, "token") ||
+				strings.Contains(respBodyStr, "expired") ||
+				strings.Contains(respBodyStr, "invalid") ||
+				strings.Contains(respBodyStr, "unauthorized")
+
+			if isTokenRelated && attempt < maxRetries {
+				log.Warnf("kiro: 403 appears token-related, attempting token refresh")
 				refreshedAuth, refreshErr := e.Refresh(ctx, auth)
 				if refreshErr != nil {
 					log.Errorf("kiro: token refresh failed: %v", refreshErr)
+					// Token refresh failed - return error immediately
 					return resp, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 				}
-
 				if refreshedAuth != nil {
 					auth = refreshedAuth
 					// Persist the refreshed auth to file so subsequent requests use it
@@ -979,192 +1050,70 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 						// Continue anyway - the token is valid for this request
 					}
 					accessToken, profileArn = kiroRuntimeCredentials(auth)
-					// Rebuild payload with new profile ARN if changed
-					kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, from, opts.Metadata)
-					if attempt < maxRetries {
-						log.Infof("kiro: token refreshed successfully, retrying request (attempt %d/%d)", attempt+1, maxRetries+1)
-						continue
-					}
-					log.Infof("kiro: token refreshed successfully, no retries remaining")
+					kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, endpoint.Origin, from, opts.Metadata)
+					log.Infof("kiro: token refreshed for 403, retrying request")
+					continue
 				}
-
-				log.Warnf("kiro request error, status: 401, body: %s", summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
-				return resp, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 			}
 
-			// Handle 402 errors - Monthly Limit Reached. CPA needs a 429 to
-			// rotate away from this credential.
-			if httpResp.StatusCode == 402 {
-				respBody, _ := io.ReadAll(httpResp.Body)
-				_ = httpResp.Body.Close()
-				appendAPIResponseChunk(ctx, e.cfg, respBody)
-
-				log.Warnf("kiro: received 402 (monthly limit). Upstream body: %s", summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
-
-				// Return upstream error body directly
-				remaining := kiroauth.CalculateCooldownUntilNextDay()
-				if !coolingDisabled {
-					cooldownMgr.SetCooldown(tokenKey, remaining, kiroauth.CooldownReasonQuotaExhausted)
-				}
-				return resp, statusErr{code: http.StatusTooManyRequests, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody), retryAfter: &remaining}
-			}
-
-			// Handle 403 errors - Access Denied / Token Expired
-			// Do NOT switch endpoints for 403 errors
-			if httpResp.StatusCode == 403 {
-				respBody, _ := io.ReadAll(httpResp.Body)
-				_ = httpResp.Body.Close()
-				appendAPIResponseChunk(ctx, e.cfg, respBody)
-
-				// Log the 403 error details for debugging
-				log.Warnf("kiro: received 403 error (attempt %d/%d), body: %s", attempt+1, maxRetries+1, summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
-
-				respBodyStr := string(respBody)
-
-				// Check for SUSPENDED status - return immediately without retry
-				if strings.Contains(respBodyStr, "SUSPENDED") || strings.Contains(respBodyStr, "TEMPORARILY_SUSPENDED") {
-					// Set long cooldown for suspended accounts
-					if !coolingDisabled {
-						rateLimiter.CheckAndMarkSuspended(tokenKey, respBodyStr)
-						cooldownMgr.SetCooldown(tokenKey, kiroauth.LongCooldown, kiroauth.CooldownReasonSuspended)
-						log.Errorf("kiro: account is suspended, token %s set to cooldown for %v", tokenKey, kiroauth.LongCooldown)
-					}
-					return resp, statusErr{code: httpResp.StatusCode, msg: "account suspended: " + summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
-				}
-
-				// API keys are long-lived and cannot be refreshed. In particular, do not
-				// turn an invalid API key into the misleading "refresh token not found"
-				// error that used to hide the real upstream response.
-				if isAPIKeyAuth(auth) {
-					log.Warnf("kiro: API key rejected with HTTP 403; returning without OAuth refresh")
-					return resp, statusErr{code: http.StatusForbidden, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
-				}
-
-				// Check if this looks like a token-related 403 (some APIs return 403 for expired tokens)
-				isTokenRelated := strings.Contains(respBodyStr, "token") ||
-					strings.Contains(respBodyStr, "expired") ||
-					strings.Contains(respBodyStr, "invalid") ||
-					strings.Contains(respBodyStr, "unauthorized")
-
-				if isTokenRelated && attempt < maxRetries {
-					log.Warnf("kiro: 403 appears token-related, attempting token refresh")
-					refreshedAuth, refreshErr := e.Refresh(ctx, auth)
-					if refreshErr != nil {
-						log.Errorf("kiro: token refresh failed: %v", refreshErr)
-						// Token refresh failed - return error immediately
-						return resp, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
-					}
-					if refreshedAuth != nil {
-						auth = refreshedAuth
-						// Persist the refreshed auth to file so subsequent requests use it
-						if persistErr := e.persistRefreshedAuth(auth); persistErr != nil {
-							log.Warnf("kiro: failed to persist refreshed auth: %v", persistErr)
-							// Continue anyway - the token is valid for this request
-						}
-						accessToken, profileArn = kiroRuntimeCredentials(auth)
-						kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, from, opts.Metadata)
-						log.Infof("kiro: token refreshed for 403, retrying request")
-						continue
-					}
-				}
-
-				// For non-token 403 or after max retries, return error immediately
-				// Do NOT switch endpoints for 403 errors
-				log.Warnf("kiro: 403 error, returning immediately (no endpoint switch)")
-				return resp, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
-			}
-
-			if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-				b, _ := io.ReadAll(httpResp.Body)
-				appendAPIResponseChunk(ctx, e.cfg, b)
-				log.Debugf("kiro request error, status: %d, body: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-				err = statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), b)}
-				if errClose := httpResp.Body.Close(); errClose != nil {
-					log.Errorf("response body close error: %v", errClose)
-				}
-				return resp, err
-			}
-
-			defer func() {
-				if errClose := httpResp.Body.Close(); errClose != nil {
-					log.Errorf("response body close error: %v", errClose)
-				}
-			}()
-
-			content, reasoning, toolUses, usageInfo, stopReason, err := e.parseEventStream(httpResp.Body)
-			if err != nil {
-				recordAPIResponseError(ctx, e.cfg, err)
-				return resp, normalizeTransportError(err)
-			}
-
-			appendAPIResponseChunk(ctx, e.cfg, []byte(content))
-			requestPayload := opts.OriginalRequest
-			if len(bytes.TrimSpace(requestPayload)) == 0 {
-				requestPayload = req.Payload
-			}
-			usageInfo = completeKiroUsage(usageInfo, requestPayload, content, reasoning, toolUses)
-
-			// Record success for rate limiting
-			if !coolingDisabled {
-				rateLimiter.MarkTokenSuccess(tokenKey)
-			}
-			log.Debugf("kiro: request successful, token %s marked as success", tokenKey)
-
-			// Build response in Claude format for Kiro translator
-			// stopReason is extracted from upstream response by parseEventStream
-			requestedModel := payloadRequestedModel(opts, req.Model)
-			kiroResponse := kiroclaude.BuildClaudeResponse(content, reasoning, toolUses, requestedModel, usageInfo, stopReason)
-			out := sdktranslator.TranslateNonStream(ctx, to, from, requestedModel, bytes.Clone(opts.OriginalRequest), body, kiroResponse, nil)
-			resp = cliproxyexecutor.Response{Payload: []byte(out)}
-			return resp, nil
+			// For non-token 403 or after max retries, return error immediately
+			log.Warnf("kiro: 403 error, returning immediately")
+			return resp, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 		}
-		// Inner retry loop exhausted for this endpoint, try next endpoint
-		// Note: This code is unreachable because all paths in the inner loop
-		// either return or continue. Kept as comment for documentation.
+
+		if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+			b, _ := io.ReadAll(httpResp.Body)
+			appendAPIResponseChunk(ctx, e.cfg, b)
+			log.Debugf("kiro request error, status: %d, body: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+			err = statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), b)}
+			if errClose := httpResp.Body.Close(); errClose != nil {
+				log.Errorf("response body close error: %v", errClose)
+			}
+			return resp, err
+		}
+
+		defer func() {
+			if errClose := httpResp.Body.Close(); errClose != nil {
+				log.Errorf("response body close error: %v", errClose)
+			}
+		}()
+
+		content, reasoning, toolUses, usageInfo, stopReason, err := e.parseEventStream(httpResp.Body)
+		if err != nil {
+			recordAPIResponseError(ctx, e.cfg, err)
+			return resp, normalizeTransportError(err)
+		}
+
+		appendAPIResponseChunk(ctx, e.cfg, []byte(content))
+		requestPayload := opts.OriginalRequest
+		if len(bytes.TrimSpace(requestPayload)) == 0 {
+			requestPayload = req.Payload
+		}
+		usageInfo = completeKiroUsage(usageInfo, requestPayload, content, reasoning, toolUses)
+
+		// Build response in Claude format for Kiro translator
+		// stopReason is extracted from upstream response by parseEventStream
+		requestedModel := payloadRequestedModel(opts, req.Model)
+		kiroResponse := kiroclaude.BuildClaudeResponse(content, reasoning, toolUses, requestedModel, usageInfo, stopReason)
+		out := sdktranslator.TranslateNonStream(ctx, to, from, requestedModel, bytes.Clone(opts.OriginalRequest), body, kiroResponse, nil)
+		resp = cliproxyexecutor.Response{Payload: []byte(out)}
+		return resp, nil
 	}
 
-	// All endpoints exhausted
-	if last429Err != nil {
-		return resp, last429Err
-	}
-	if lastEndpointErr != nil {
-		return resp, lastEndpointErr
-	}
-	return resp, statusErr{code: http.StatusServiceUnavailable, msg: "kiro: all endpoints exhausted"}
+	return resp, statusErr{code: http.StatusServiceUnavailable, msg: "kiro: retries exhausted"}
 }
 
 // ExecuteStream handles streaming requests to Kiro API.
-// Supports automatic token refresh on 401/403 errors and quota fallback on 429.
+// Supports automatic token refresh on 401/403 errors.
 func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	accessToken, profileArn := kiroRuntimeCredentials(auth)
 	if accessToken == "" {
 		return nil, statusErr{code: http.StatusUnauthorized, msg: "kiro: access token not found in auth"}
 	}
 
-	// Rate limiting: get token key for tracking
 	tokenKey := getTokenKey(auth)
-	coolingDisabled := isCoolingDisabled(auth)
-	rateLimiter := kiroauth.GetGlobalRateLimiter()
-	cooldownMgr := kiroauth.GetGlobalCooldownManager()
-
-	// Check if token is in cooldown period
-	if !coolingDisabled && cooldownMgr.IsInCooldown(tokenKey) {
-		remaining := cooldownMgr.GetRemainingCooldown(tokenKey)
-		reason := cooldownMgr.GetCooldownReason(tokenKey)
-		log.Warnf("kiro: token %s is in cooldown (reason: %s), remaining: %v", tokenKey, reason, remaining)
-		return nil, statusErr{code: http.StatusTooManyRequests, msg: fmt.Sprintf("kiro: token is in cooldown for %v (reason: %s)", remaining, reason), retryAfter: &remaining}
-	}
-	if !coolingDisabled {
-		if reason, remaining, unavailable := rateLimiter.TokenUnavailable(tokenKey); unavailable {
-			return nil, statusErr{code: http.StatusTooManyRequests, msg: fmt.Sprintf("kiro: token unavailable for %v (%s)", remaining, reason), retryAfter: &remaining}
-		}
-	}
-
-	// Wait for rate limiter before proceeding
-	if !coolingDisabled {
-		log.Debugf("kiro: stream waiting for rate limiter for token %s", tokenKey)
-		rateLimiter.WaitForToken(tokenKey)
-		log.Debugf("kiro: stream rate limiter cleared for token %s", tokenKey)
+	if err := admitCredential(ctx, auth, tokenKey); err != nil {
+		return nil, err
 	}
 
 	// Check if token is expired before making the request.
@@ -1212,202 +1161,240 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		return nil, err
 	}
 
-	// Determine the effective profile ARN for the selected credential.
-	// Execute stream with retry on 401/403 and 429 (quota exhausted)
-	// Note: currentOrigin and kiroPayload are built inside executeStreamWithRetry for each endpoint
-	streamKiro, errStreamKiro := e.executeStreamWithRetry(ctx, auth, req, opts, accessToken, profileArn, nil, body, from, "", kiroModelID, tokenKey)
+	streamKiro, errStreamKiro := e.executeStreamWithRetry(ctx, auth, req, opts, accessToken, profileArn, body, from, kiroModelID, tokenKey)
 	if errStreamKiro != nil {
 		return nil, errStreamKiro
 	}
 	return &cliproxyexecutor.StreamResult{Chunks: streamKiro}, nil
 }
 
-// executeStreamWithRetry performs the streaming HTTP request with automatic retry on auth errors.
-// Supports automatic fallback between endpoints with different quotas:
-// - Amazon Q endpoint (CLI origin) uses Amazon Q Developer quota
-// - CodeWhisperer endpoint (AI_EDITOR origin) uses Kiro IDE quota
-// Also supports multi-endpoint fallback similar to Antigravity implementation.
-// tokenKey is used for rate limiting and cooldown tracking.
-func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, accessToken, profileArn string, kiroPayload, body []byte, from sdktranslator.Format, currentOrigin, kiroModelID, tokenKey string) (<-chan cliproxyexecutor.StreamChunk, error) {
-	maxRetries := 2 // Allow retries for token refresh + endpoint fallback
-	var lastEndpointErr error
-	rateLimiter := kiroauth.GetGlobalRateLimiter()
-	cooldownMgr := kiroauth.GetGlobalCooldownManager()
-	coolingDisabled := isCoolingDisabled(auth)
-	endpointConfigs := getKiroEndpointConfigs(auth)
-	var last429Err error
+// executeStreamWithRetry is the streaming twin of executeWithRetry: same
+// endpoint resolution, retry and protection rules, but a 2xx hands the body to
+// a goroutine that feeds the returned channel.
+func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, accessToken, profileArn string, body []byte, from sdktranslator.Format, kiroModelID, tokenKey string) (<-chan cliproxyexecutor.StreamChunk, error) {
+	maxRetries := 2 // Allow retries for token refresh
+	endpoint, err := kiroEndpointFor(auth)
+	if err != nil {
+		return nil, err
+	}
+	url := endpoint.URL
+	kiroPayload, _ := buildKiroPayloadForFormat(body, kiroModelID, profileArn, endpoint.Origin, from, opts.Metadata)
 
-	for endpointIdx := 0; endpointIdx < len(endpointConfigs); endpointIdx++ {
-		endpointConfig := endpointConfigs[endpointIdx]
-		url := endpointConfig.URL
-		// Use this endpoint's compatible Origin (critical for avoiding 403 errors)
-		currentOrigin = endpointConfig.Origin
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(kiroPayload))
+		if err != nil {
+			return nil, upstreamTransportErr{cause: err}
+		}
 
-		// Rebuild payload with the correct origin for this endpoint
-		// Each endpoint requires its matching Origin value in the request body
-		kiroPayload, _ := buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, from, opts.Metadata)
+		httpReq.Header.Set("Content-Type", kiroContentType)
+		httpReq.Header.Set("Accept", kiroAcceptStream)
+		// Kiro-specific headers
+		httpReq.Header.Set("x-amzn-kiro-agent-mode", kirocommon.AgentModeVibe)
+		httpReq.Header.Set("x-amzn-codewhisperer-optout", "true")
 
-		log.Debugf("kiro: stream trying endpoint %d/%d: %s (Name: %s, Origin: %s)",
-			endpointIdx+1, len(endpointConfigs), url, endpointConfig.Name, currentOrigin)
+		applyKiroClientHeaders(httpReq, auth)
+		applyKiroProfileHeader(httpReq, profileArn)
+		applyKiroRetryHeaders(httpReq, attempt+1, maxRetries+1)
+		warnOnOversizedPayload(kiroPayload, endpoint.Name)
 
-		for attempt := 0; attempt <= maxRetries; attempt++ {
-			httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(kiroPayload))
-			if err != nil {
-				return nil, upstreamTransportErr{cause: err}
+		// Bearer token authentication for all auth types (Builder ID, IDC, social, etc.)
+		setKiroAuthorization(httpReq, auth, accessToken)
+
+		var attrs map[string]string
+		if auth != nil {
+			attrs = auth.Attributes
+		}
+		applyCustomHeadersFromAttrs(httpReq, attrs)
+
+		var authID, authLabel, authType, authValue string
+		if auth != nil {
+			authID = auth.ID
+			authLabel = auth.Label
+			authType, authValue = auth.AccountInfo()
+		}
+		recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
+			URL:       url,
+			Method:    http.MethodPost,
+			Headers:   httpReq.Header.Clone(),
+			Body:      kiroPayload,
+			Provider:  e.Identifier(),
+			AuthID:    authID,
+			AuthLabel: authLabel,
+			AuthType:  authType,
+			AuthValue: authValue,
+		})
+
+		httpClient := kiroHTTPClientFor(ctx, e.cfg, auth, 0)
+		httpResp, err := httpClient.Do(httpReq)
+		if err != nil {
+			recordAPIResponseError(ctx, e.cfg, err)
+
+			// Enhanced socket retry for streaming: Check if error is retryable (network timeout, connection reset, etc.)
+			retryCfg := defaultRetryConfig()
+			if isRetryableError(err) && attempt < retryCfg.MaxRetries {
+				delay := calculateRetryDelay(attempt, retryCfg)
+				logRetryAttempt(attempt, retryCfg.MaxRetries, fmt.Sprintf("stream socket error: %v", err), delay, endpoint.Name)
+				if sleepErr := sleepWithContext(ctx, delay); sleepErr != nil {
+					return nil, sleepErr
+				}
+				continue
 			}
 
-			httpReq.Header.Set("Content-Type", kiroContentType)
-			httpReq.Header.Set("Accept", kiroAcceptStream)
-			// Only set X-Amz-Target if specified (Q endpoint doesn't require it)
-			if endpointConfig.AmzTarget != "" {
-				httpReq.Header.Set("X-Amz-Target", endpointConfig.AmzTarget)
+			return nil, normalizeTransportError(err)
+		}
+		recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+
+		// 429 goes straight back to CPA, which owns the per-credential backoff
+		// ladder and the failover to the next credential.
+		if httpResp.StatusCode == http.StatusTooManyRequests {
+			respBody, _ := io.ReadAll(httpResp.Body)
+			_ = httpResp.Body.Close()
+			appendAPIResponseChunk(ctx, e.cfg, respBody)
+			summary := summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)
+			log.Warnf("kiro: stream %s returned 429 for token %s, body: %s", endpoint.Name, tokenKey, summary)
+			return nil, statusErr{code: httpResp.StatusCode, msg: summary, retryAfter: retryAfterHeader(httpResp.Header)}
+		}
+
+		// Handle 5xx server errors with exponential backoff retry
+		// Enhanced: Use retryConfig for consistent retry behavior
+		if httpResp.StatusCode >= 500 && httpResp.StatusCode < 600 {
+			respBody, _ := io.ReadAll(httpResp.Body)
+			_ = httpResp.Body.Close()
+			appendAPIResponseChunk(ctx, e.cfg, respBody)
+
+			retryCfg := defaultRetryConfig()
+			// Check if this specific 5xx code is retryable (502, 503, 504)
+			if isRetryableHTTPStatus(httpResp.StatusCode) && attempt < retryCfg.MaxRetries {
+				delay := calculateRetryDelay(attempt, retryCfg)
+				logRetryAttempt(attempt, retryCfg.MaxRetries, fmt.Sprintf("stream HTTP %d", httpResp.StatusCode), delay, endpoint.Name)
+				if sleepErr := sleepWithContext(ctx, delay); sleepErr != nil {
+					return nil, sleepErr
+				}
+				continue
+			} else if attempt < maxRetries {
+				// Fallback for other 5xx errors (500, 501, etc.)
+				backoff := time.Duration(1<<attempt) * time.Second
+				if backoff > 30*time.Second {
+					backoff = 30 * time.Second
+				}
+				log.Warnf("kiro: stream server error %d, retrying in %v (attempt %d/%d)", httpResp.StatusCode, backoff, attempt+1, maxRetries)
+				if sleepErr := sleepWithContext(ctx, backoff); sleepErr != nil {
+					return nil, sleepErr
+				}
+				continue
 			}
-			// Kiro-specific headers
-			httpReq.Header.Set("x-amzn-kiro-agent-mode", kirocommon.AgentModeVibe)
-			httpReq.Header.Set("x-amzn-codewhisperer-optout", "true")
+			log.Errorf("kiro: stream server error %d after %d retries", httpResp.StatusCode, maxRetries)
+			return nil, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
+		}
 
-			applyKiroClientHeaders(httpReq, auth)
-			applyKiroProfileHeader(httpReq, profileArn)
-			applyKiroRetryHeaders(httpReq, attempt+1, maxRetries+1)
-			warnOnOversizedPayload(kiroPayload, endpointConfig.Name)
+		// Handle 400 errors - Credential/Validation issues
+		if httpResp.StatusCode == 400 {
+			respBody, _ := io.ReadAll(httpResp.Body)
+			_ = httpResp.Body.Close()
+			appendAPIResponseChunk(ctx, e.cfg, respBody)
 
-			// Bearer token authentication for all auth types (Builder ID, IDC, social, etc.)
-			setKiroAuthorization(httpReq, auth, accessToken)
+			log.Warnf("kiro: received 400 error (attempt %d/%d), body: %s", attempt+1, maxRetries+1, summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
 
-			var attrs map[string]string
-			if auth != nil {
-				attrs = auth.Attributes
-			}
-			applyCustomHeadersFromAttrs(httpReq, attrs)
-
-			var authID, authLabel, authType, authValue string
-			if auth != nil {
-				authID = auth.ID
-				authLabel = auth.Label
-				authType, authValue = auth.AccountInfo()
-			}
-			recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
-				URL:       url,
-				Method:    http.MethodPost,
-				Headers:   httpReq.Header.Clone(),
-				Body:      kiroPayload,
-				Provider:  e.Identifier(),
-				AuthID:    authID,
-				AuthLabel: authLabel,
-				AuthType:  authType,
-				AuthValue: authValue,
-			})
-
-			httpClient := kiroHTTPClientFor(ctx, e.cfg, auth, 0)
-			httpResp, err := httpClient.Do(httpReq)
-			if err != nil {
-				recordAPIResponseError(ctx, e.cfg, err)
-
-				// Enhanced socket retry for streaming: Check if error is retryable (network timeout, connection reset, etc.)
-				retryCfg := defaultRetryConfig()
-				if isRetryableError(err) && attempt < retryCfg.MaxRetries {
-					delay := calculateRetryDelay(attempt, retryCfg)
-					logRetryAttempt(attempt, retryCfg.MaxRetries, fmt.Sprintf("stream socket error: %v", err), delay, endpointConfig.Name)
-					time.Sleep(delay)
+			if attempt == 0 && isThinkingSignatureInvalid(respBody) {
+				if stripped, ok := stripInvalidReasoningHistory(body); ok {
+					body = stripped
+					kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, endpoint.Origin, from, opts.Metadata)
 					continue
 				}
-
-				lastEndpointErr = normalizeTransportError(err)
-				break
 			}
-			recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+			// Other 400 errors indicate request validation issues.
+			return nil, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
+		}
 
-			// Handle 429 errors (quota exhausted) - try next endpoint
-			// Each endpoint has its own quota pool, so we can try different endpoints
-			if httpResp.StatusCode == 429 {
-				respBody, _ := io.ReadAll(httpResp.Body)
-				_ = httpResp.Body.Close()
-				appendAPIResponseChunk(ctx, e.cfg, respBody)
-				cooldownDuration := kiroauth.CalculateCooldownFor429(attempt)
-
-				// Record failure and set cooldown for 429
-				if !coolingDisabled {
-					rateLimiter.MarkTokenFailed(tokenKey)
-					cooldownMgr.SetCooldown(tokenKey, cooldownDuration, kiroauth.CooldownReason429)
-					log.Warnf("kiro: stream rate limit hit (429), token %s set to cooldown for %v", tokenKey, cooldownDuration)
-				}
-
-				// Preserve last 429 so callers can correctly backoff when all endpoints are exhausted
-				last429Err = statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody), retryAfter: &cooldownDuration}
-
-				log.Warnf("kiro: stream %s endpoint quota exhausted (429), returning credential cooldown to CPA, body: %s",
-					endpointConfig.Name, summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
-
-				return nil, last429Err
+		// Handle 401 errors with token refresh and retry
+		// 401 = Unauthorized (token expired/invalid) - refresh token
+		if httpResp.StatusCode == 401 {
+			respBody, _ := io.ReadAll(httpResp.Body)
+			_ = httpResp.Body.Close()
+			appendAPIResponseChunk(ctx, e.cfg, respBody)
+			if isAPIKeyAuth(auth) {
+				log.Warnf("kiro: stream API key rejected with HTTP 401; returning without OAuth refresh")
+				return nil, statusErr{code: http.StatusUnauthorized, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 			}
 
-			// Handle 5xx server errors with exponential backoff retry
-			// Enhanced: Use retryConfig for consistent retry behavior
-			if httpResp.StatusCode >= 500 && httpResp.StatusCode < 600 {
-				respBody, _ := io.ReadAll(httpResp.Body)
-				_ = httpResp.Body.Close()
-				appendAPIResponseChunk(ctx, e.cfg, respBody)
-
-				retryCfg := defaultRetryConfig()
-				// Check if this specific 5xx code is retryable (502, 503, 504)
-				if isRetryableHTTPStatus(httpResp.StatusCode) && attempt < retryCfg.MaxRetries {
-					delay := calculateRetryDelay(attempt, retryCfg)
-					logRetryAttempt(attempt, retryCfg.MaxRetries, fmt.Sprintf("stream HTTP %d", httpResp.StatusCode), delay, endpointConfig.Name)
-					time.Sleep(delay)
-					continue
-				} else if attempt < maxRetries {
-					// Fallback for other 5xx errors (500, 501, etc.)
-					backoff := time.Duration(1<<attempt) * time.Second
-					if backoff > 30*time.Second {
-						backoff = 30 * time.Second
-					}
-					log.Warnf("kiro: stream server error %d, retrying in %v (attempt %d/%d)", httpResp.StatusCode, backoff, attempt+1, maxRetries)
-					time.Sleep(backoff)
-					continue
-				}
-				log.Errorf("kiro: stream server error %d after %d retries", httpResp.StatusCode, maxRetries)
-				lastEndpointErr = statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
-				break
-			}
-
-			// Handle 400 errors - Credential/Validation issues
-			// Do NOT switch endpoints - return error immediately
-			if httpResp.StatusCode == 400 {
-				respBody, _ := io.ReadAll(httpResp.Body)
-				_ = httpResp.Body.Close()
-				appendAPIResponseChunk(ctx, e.cfg, respBody)
-
-				log.Warnf("kiro: received 400 error (attempt %d/%d), body: %s", attempt+1, maxRetries+1, summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
-
-				if attempt == 0 && isThinkingSignatureInvalid(respBody) {
-					if stripped, ok := stripInvalidReasoningHistory(body); ok {
-						body = stripped
-						kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, from, opts.Metadata)
-						continue
-					}
-				}
-				// Other 400 errors indicate request validation issues.
+			log.Warnf("kiro: stream received 401 error, attempting token refresh")
+			refreshedAuth, refreshErr := e.Refresh(ctx, auth)
+			if refreshErr != nil {
+				log.Errorf("kiro: token refresh failed: %v", refreshErr)
 				return nil, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 			}
 
-			// Handle 401 errors with token refresh and retry
-			// 401 = Unauthorized (token expired/invalid) - refresh token
-			if httpResp.StatusCode == 401 {
-				respBody, _ := io.ReadAll(httpResp.Body)
-				_ = httpResp.Body.Close()
-				appendAPIResponseChunk(ctx, e.cfg, respBody)
-				if isAPIKeyAuth(auth) {
-					log.Warnf("kiro: stream API key rejected with HTTP 401; returning without OAuth refresh")
-					return nil, statusErr{code: http.StatusUnauthorized, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
+			if refreshedAuth != nil {
+				auth = refreshedAuth
+				// Persist the refreshed auth to file so subsequent requests use it
+				if persistErr := e.persistRefreshedAuth(auth); persistErr != nil {
+					log.Warnf("kiro: failed to persist refreshed auth: %v", persistErr)
+					// Continue anyway - the token is valid for this request
 				}
+				accessToken, profileArn = kiroRuntimeCredentials(auth)
+				// Rebuild payload with new profile ARN if changed
+				kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, endpoint.Origin, from, opts.Metadata)
+				if attempt < maxRetries {
+					log.Infof("kiro: token refreshed successfully, retrying stream request (attempt %d/%d)", attempt+1, maxRetries+1)
+					continue
+				}
+				log.Infof("kiro: token refreshed successfully, no retries remaining")
+			}
 
-				log.Warnf("kiro: stream received 401 error, attempting token refresh")
+			log.Warnf("kiro stream error, status: 401, body: %s", summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
+			return nil, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
+		}
+
+		// Handle 402 errors - Monthly Limit Reached.
+		if httpResp.StatusCode == 402 {
+			respBody, _ := io.ReadAll(httpResp.Body)
+			_ = httpResp.Body.Close()
+			appendAPIResponseChunk(ctx, e.cfg, respBody)
+
+			log.Warnf("kiro: stream received 402 (monthly limit). Upstream body: %s", summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
+
+			remaining := kiroauth.UntilNextUTCDay()
+			markUnavailable(auth, tokenKey, "monthly limit reached", remaining)
+			return nil, statusErr{code: http.StatusTooManyRequests, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody), retryAfter: &remaining}
+		}
+
+		// Handle 403 errors - Access Denied / Token Expired
+		if httpResp.StatusCode == 403 {
+			respBody, _ := io.ReadAll(httpResp.Body)
+			_ = httpResp.Body.Close()
+			appendAPIResponseChunk(ctx, e.cfg, respBody)
+
+			// Log the 403 error details for debugging
+			log.Warnf("kiro: stream received 403 error (attempt %d/%d), body: %s", attempt+1, maxRetries+1, summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
+
+			respBodyStr := string(respBody)
+
+			if isSuspendedBody(respBodyStr) {
+				markSuspended(auth, tokenKey)
+				return nil, statusErr{code: httpResp.StatusCode, msg: "account suspended: " + summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
+			}
+
+			// API keys are long-lived and cannot be refreshed. Return the actual
+			// upstream rejection instead of attempting an impossible OAuth refresh.
+			if isAPIKeyAuth(auth) {
+				log.Warnf("kiro: stream API key rejected with HTTP 403; returning without OAuth refresh")
+				return nil, statusErr{code: http.StatusForbidden, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
+			}
+
+			// Check if this looks like a token-related 403 (some APIs return 403 for expired tokens)
+			isTokenRelated := strings.Contains(respBodyStr, "token") ||
+				strings.Contains(respBodyStr, "expired") ||
+				strings.Contains(respBodyStr, "invalid") ||
+				strings.Contains(respBodyStr, "unauthorized")
+
+			if isTokenRelated && attempt < maxRetries {
+				log.Warnf("kiro: 403 appears token-related, attempting token refresh")
 				refreshedAuth, refreshErr := e.Refresh(ctx, auth)
 				if refreshErr != nil {
 					log.Errorf("kiro: token refresh failed: %v", refreshErr)
+					// Token refresh failed - return error immediately
 					return nil, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 				}
-
 				if refreshedAuth != nil {
 					auth = refreshedAuth
 					// Persist the refreshed auth to file so subsequent requests use it
@@ -1416,153 +1403,57 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 						// Continue anyway - the token is valid for this request
 					}
 					accessToken, profileArn = kiroRuntimeCredentials(auth)
-					// Rebuild payload with new profile ARN if changed
-					kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, from, opts.Metadata)
-					if attempt < maxRetries {
-						log.Infof("kiro: token refreshed successfully, retrying stream request (attempt %d/%d)", attempt+1, maxRetries+1)
-						continue
-					}
-					log.Infof("kiro: token refreshed successfully, no retries remaining")
+					kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, endpoint.Origin, from, opts.Metadata)
+					log.Infof("kiro: token refreshed for 403, retrying stream request")
+					continue
 				}
-
-				log.Warnf("kiro stream error, status: 401, body: %s", summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
-				return nil, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 			}
 
-			// Handle 402 errors - Monthly Limit Reached.
-			if httpResp.StatusCode == 402 {
-				respBody, _ := io.ReadAll(httpResp.Body)
-				_ = httpResp.Body.Close()
-				appendAPIResponseChunk(ctx, e.cfg, respBody)
+			// For non-token 403 or after max retries, return error immediately
+			log.Warnf("kiro: 403 error, returning immediately")
+			return nil, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
+		}
 
-				log.Warnf("kiro: stream received 402 (monthly limit). Upstream body: %s", summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
-
-				// Return upstream error body directly
-				remaining := kiroauth.CalculateCooldownUntilNextDay()
-				if !coolingDisabled {
-					cooldownMgr.SetCooldown(tokenKey, remaining, kiroauth.CooldownReasonQuotaExhausted)
-				}
-				return nil, statusErr{code: http.StatusTooManyRequests, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody), retryAfter: &remaining}
+		if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+			b, _ := io.ReadAll(httpResp.Body)
+			appendAPIResponseChunk(ctx, e.cfg, b)
+			summary := summarizeErrorBody(httpResp.Header.Get("Content-Type"), b)
+			log.Debugf("kiro stream error, status: %d, body: %s", httpResp.StatusCode, summary)
+			if errClose := httpResp.Body.Close(); errClose != nil {
+				log.Errorf("response body close error: %v", errClose)
 			}
+			return nil, statusErr{code: httpResp.StatusCode, msg: summary}
+		}
 
-			// Handle 403 errors - Access Denied / Token Expired
-			// Do NOT switch endpoints for 403 errors
-			if httpResp.StatusCode == 403 {
-				respBody, _ := io.ReadAll(httpResp.Body)
-				_ = httpResp.Body.Close()
-				appendAPIResponseChunk(ctx, e.cfg, respBody)
+		out := make(chan cliproxyexecutor.StreamChunk)
 
-				// Log the 403 error details for debugging
-				log.Warnf("kiro: stream received 403 error (attempt %d/%d), body: %s", attempt+1, maxRetries+1, summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
-
-				respBodyStr := string(respBody)
-
-				// Check for SUSPENDED status - return immediately without retry
-				if strings.Contains(respBodyStr, "SUSPENDED") || strings.Contains(respBodyStr, "TEMPORARILY_SUSPENDED") {
-					// Set long cooldown for suspended accounts
-					if !coolingDisabled {
-						rateLimiter.CheckAndMarkSuspended(tokenKey, respBodyStr)
-						cooldownMgr.SetCooldown(tokenKey, kiroauth.LongCooldown, kiroauth.CooldownReasonSuspended)
-						log.Errorf("kiro: stream account is suspended, token %s set to cooldown for %v", tokenKey, kiroauth.LongCooldown)
-					}
-					return nil, statusErr{code: httpResp.StatusCode, msg: "account suspended: " + summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
+		go func(resp *http.Response) {
+			defer close(out)
+			defer func() {
+				if r := recover(); r != nil {
+					log.Errorf("kiro: panic in stream handler: %v", r)
+					out <- cliproxyexecutor.StreamChunk{Err: streamStatusError("internal", "stream handler failed")}
 				}
-
-				// API keys are long-lived and cannot be refreshed. Return the actual
-				// upstream rejection instead of attempting an impossible OAuth refresh.
-				if isAPIKeyAuth(auth) {
-					log.Warnf("kiro: stream API key rejected with HTTP 403; returning without OAuth refresh")
-					return nil, statusErr{code: http.StatusForbidden, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
-				}
-
-				// Check if this looks like a token-related 403 (some APIs return 403 for expired tokens)
-				isTokenRelated := strings.Contains(respBodyStr, "token") ||
-					strings.Contains(respBodyStr, "expired") ||
-					strings.Contains(respBodyStr, "invalid") ||
-					strings.Contains(respBodyStr, "unauthorized")
-
-				if isTokenRelated && attempt < maxRetries {
-					log.Warnf("kiro: 403 appears token-related, attempting token refresh")
-					refreshedAuth, refreshErr := e.Refresh(ctx, auth)
-					if refreshErr != nil {
-						log.Errorf("kiro: token refresh failed: %v", refreshErr)
-						// Token refresh failed - return error immediately
-						return nil, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
-					}
-					if refreshedAuth != nil {
-						auth = refreshedAuth
-						// Persist the refreshed auth to file so subsequent requests use it
-						if persistErr := e.persistRefreshedAuth(auth); persistErr != nil {
-							log.Warnf("kiro: failed to persist refreshed auth: %v", persistErr)
-							// Continue anyway - the token is valid for this request
-						}
-						accessToken, profileArn = kiroRuntimeCredentials(auth)
-						kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, from, opts.Metadata)
-						log.Infof("kiro: token refreshed for 403, retrying stream request")
-						continue
-					}
-				}
-
-				// For non-token 403 or after max retries, return error immediately
-				// Do NOT switch endpoints for 403 errors
-				log.Warnf("kiro: 403 error, returning immediately (no endpoint switch)")
-				return nil, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
-			}
-
-			if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-				b, _ := io.ReadAll(httpResp.Body)
-				appendAPIResponseChunk(ctx, e.cfg, b)
-				summary := summarizeErrorBody(httpResp.Header.Get("Content-Type"), b)
-				log.Debugf("kiro stream error, status: %d, body: %s", httpResp.StatusCode, summary)
-				if errClose := httpResp.Body.Close(); errClose != nil {
+			}()
+			defer func() {
+				if errClose := resp.Body.Close(); errClose != nil {
 					log.Errorf("response body close error: %v", errClose)
 				}
-				return nil, statusErr{code: httpResp.StatusCode, msg: summary}
+			}()
+
+			requestPayload := opts.OriginalRequest
+			if len(bytes.TrimSpace(requestPayload)) == 0 {
+				requestPayload = req.Payload
 			}
+			if e.streamToChannel(ctx, resp.Body, out, from, payloadRequestedModel(opts, req.Model), requestPayload, body) {
+				log.Debugf("kiro: stream completed successfully for token %s", tokenKey)
+			}
+		}(httpResp)
 
-			out := make(chan cliproxyexecutor.StreamChunk)
-
-			go func(resp *http.Response) {
-				defer close(out)
-				defer func() {
-					if r := recover(); r != nil {
-						log.Errorf("kiro: panic in stream handler: %v", r)
-						out <- cliproxyexecutor.StreamChunk{Err: streamStatusError("internal", "stream handler failed")}
-					}
-				}()
-				defer func() {
-					if errClose := resp.Body.Close(); errClose != nil {
-						log.Errorf("response body close error: %v", errClose)
-					}
-				}()
-
-				requestPayload := opts.OriginalRequest
-				if len(bytes.TrimSpace(requestPayload)) == 0 {
-					requestPayload = req.Payload
-				}
-				if e.streamToChannel(ctx, resp.Body, out, from, payloadRequestedModel(opts, req.Model), requestPayload, body) {
-					if !coolingDisabled {
-						rateLimiter.MarkTokenSuccess(tokenKey)
-					}
-					log.Debugf("kiro: stream completed successfully, token %s marked as success", tokenKey)
-				}
-			}(httpResp)
-
-			return out, nil
-		}
-		// Inner retry loop exhausted for this endpoint, try next endpoint
-		// Note: This code is unreachable because all paths in the inner loop
-		// either return or continue. Kept as comment for documentation.
+		return out, nil
 	}
 
-	// All endpoints exhausted
-	if last429Err != nil {
-		return nil, last429Err
-	}
-	if lastEndpointErr != nil {
-		return nil, lastEndpointErr
-	}
-	return nil, statusErr{code: http.StatusServiceUnavailable, msg: "kiro: stream all endpoints exhausted"}
+	return nil, statusErr{code: http.StatusServiceUnavailable, msg: "kiro: stream retries exhausted"}
 }
 
 // kiroCredentials extracts access token and profile ARN from auth.
@@ -1601,40 +1492,28 @@ func kiroCredentials(auth *cliproxyauth.Auth) (accessToken, profileArn string) {
 }
 
 // kiroRuntimeCredentials returns credentials with the profile contract required
-// by the GenerateAssistantResponse runtime surface. Builder ID and social
-// credentials do not carry profileArn in their token file, but the runtime
-// payload still requires their public profile ARN.
+// by the GenerateAssistantResponse runtime surface.
 func kiroRuntimeCredentials(auth *cliproxyauth.Auth) (accessToken, profileArn string) {
 	accessToken, profileArn = kiroCredentials(auth)
 	return accessToken, effectiveGenerateProfileARN(auth, profileArn)
 }
 
 // effectiveGenerateProfileARN applies only the profile contract used by
-// generateAssistantResponse. Builder ID's control-plane APIs are profileless,
-// but its runtime payload still requires the public Builder ID profile.
+// generateAssistantResponse: the credential's own profile ARN when it has one,
+// nothing otherwise. Builder ID and social credentials usually carry none and
+// are served profileless; a placeholder ARN belonging to another AWS account
+// would identify the request as that account's, so none is ever substituted.
 func effectiveGenerateProfileARN(auth *cliproxyauth.Auth, profileArn string) string {
 	method := ""
 	if auth != nil && auth.Metadata != nil {
 		method, _ = auth.Metadata["auth_method"].(string)
 	}
-	method = strings.ToLower(strings.TrimSpace(method))
-	if method == "api_key" {
+	if strings.EqualFold(strings.TrimSpace(method), "api_key") {
 		// API-key requests are account-bound and the upstream Q surface rejects
 		// every profile ARN, including stale values imported from older files.
 		return ""
 	}
-	profileArn = strings.TrimSpace(profileArn)
-	if profileArn != "" {
-		return profileArn
-	}
-	switch method {
-	case "builder-id":
-		return kiroBuilderIDProfileARN
-	case "social":
-		return kiroSocialProfileARN
-	default:
-		return ""
-	}
+	return strings.TrimSpace(profileArn)
 }
 
 // mapModelToKiro returns the exact model advertised by Kiro. The CLIProxyAPI
@@ -3352,53 +3231,13 @@ func (e *KiroExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
 	// no AWS device registration. Parenthesised because the two arms are not
 	// interchangeable and precedence alone is easy to misread.
 	if authMethod == "social" || (authMethod == "imported" && clientID == "" && clientSecret == "") {
-		if region == "" {
-			region = "us-east-1"
+		tokenData, err = ssoClient.RefreshDesktopToken(ctx, refreshToken, region)
+		if tokenData != nil {
+			tokenData.AuthMethod, tokenData.Provider = authMethod, "CLIProxyAPI"
+			if tokenData.ProfileArn == "" {
+				tokenData.ProfileArn, _ = auth.Metadata["profile_arn"].(string)
+			}
 		}
-		if !awsRegionPattern.MatchString(region) {
-			return nil, statusErr{code: http.StatusBadRequest, msg: "kiro executor: invalid social region"}
-		}
-		endpoint := "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken"
-		payload, marshalErr := json.Marshal(map[string]string{"refreshToken": refreshToken})
-		if marshalErr != nil {
-			return nil, marshalErr
-		}
-		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
-		if reqErr != nil {
-			return nil, reqErr
-		}
-		req.Header.Set("Content-Type", "application/json")
-		response, doErr := (&http.Client{Timeout: 30 * time.Second}).Do(req)
-		if doErr != nil {
-			return nil, normalizeTransportError(doErr)
-		}
-		defer response.Body.Close()
-		body, readErr := io.ReadAll(io.LimitReader(response.Body, 1<<20))
-		if readErr != nil {
-			return nil, normalizeTransportError(readErr)
-		}
-		if response.StatusCode < 200 || response.StatusCode >= 300 {
-			return nil, statusErr{code: response.StatusCode, msg: fmt.Sprintf("kiro social refresh returned HTTP %d", response.StatusCode)}
-		}
-		var payloadResp struct {
-			AccessToken  string `json:"accessToken"`
-			RefreshToken string `json:"refreshToken"`
-			ExpiresIn    int    `json:"expiresIn"`
-		}
-		if json.Unmarshal(body, &payloadResp) != nil || payloadResp.AccessToken == "" {
-			return nil, statusErr{code: http.StatusBadGateway, msg: "kiro social refresh returned invalid token"}
-		}
-		if payloadResp.RefreshToken == "" {
-			payloadResp.RefreshToken = refreshToken
-		}
-		if payloadResp.ExpiresIn <= 0 {
-			payloadResp.ExpiresIn = 3600
-		}
-		profileArn, _ := auth.Metadata["profile_arn"].(string)
-		if authMethod == "social" && profileArn == "" {
-			profileArn = kiroSocialProfileARN
-		}
-		tokenData = &kiroauth.KiroTokenData{AccessToken: payloadResp.AccessToken, RefreshToken: payloadResp.RefreshToken, ProfileArn: profileArn, ExpiresAt: time.Now().UTC().Add(time.Duration(payloadResp.ExpiresIn) * time.Second).Format(time.RFC3339), AuthMethod: authMethod, Provider: "CLIProxyAPI", Region: region}
 	} else if authMethod == "external_idp" {
 		endpoint, _ := auth.Metadata["token_endpoint"].(string)
 		scopes, _ := auth.Metadata["scopes"].(string)
