@@ -23,7 +23,6 @@ package kiroroute
 
 import (
 	"fmt"
-	"regexp"
 	"strings"
 )
 
@@ -122,6 +121,15 @@ var runtimeHosts = map[string]string{
 
 // DefaultRegion is used when a credential names no region Kiro serves.
 const DefaultRegion = "us-east-1"
+
+// Templates for the two AWS-hosted authorities whose hostname carries the
+// region. Both are filled exclusively through SafeEndpoint.
+const (
+	amazonQTemplate = "https://q.%s.amazonaws.com"
+	// OIDCTemplate is IAM Identity Center's OIDC service, which issues and
+	// refreshes every AWS device-flow token.
+	OIDCTemplate = "https://oidc.%s.amazonaws.com"
+)
 
 // Origin values accepted by the two runtimes. These are capability switches, not
 // labels: see Account.Origin for the measurements behind the choice.
@@ -276,9 +284,6 @@ func socialProvider(label string) Provider {
 	}
 }
 
-// awsRegionPattern matches a syntactically valid AWS region.
-var awsRegionPattern = regexp.MustCompile(`^[a-z]{2}(?:-gov|-iso[a-z]?)?-[a-z]+-\d$`)
-
 // resolveRegion picks the first candidate region the credential's surface can
 // actually reach. The profile ARN outranks the OIDC region because the profile is
 // what the API is scoped to; an explicit operator override outranks both so a
@@ -292,7 +297,8 @@ var awsRegionPattern = regexp.MustCompile(`^[a-z]{2}(?:-gov|-iso[a-z]?)?-[a-z]+-
 func resolveRegion(c Credential, provider Provider) string {
 	acceptable := func(region string) bool {
 		if provider == ProviderAPIKey {
-			return awsRegionPattern.MatchString(region)
+			_, err := ValidateRegion(region)
+			return err == nil
 		}
 		_, ok := controlPlaneHosts[region]
 		return ok
@@ -355,7 +361,7 @@ func (a Account) MetadataURL(op Operation) (string, error) {
 		}
 		return host + "/" + path, nil
 	case SurfaceAmazonQ:
-		return "https://q." + a.Region + ".amazonaws.com/" + path, nil
+		return SafeEndpoint(amazonQTemplate, a.Region, "/"+path)
 	default:
 		return "", fmt.Errorf("kiroroute: unknown surface %q", a.MetadataSurface)
 	}
@@ -366,7 +372,7 @@ func (a Account) MetadataURL(op Operation) (string, error) {
 // served by the Kiro runtime.
 func (a Account) RuntimeURL() (string, error) {
 	if a.Provider == ProviderAPIKey {
-		return "https://q." + a.Region + ".amazonaws.com/generateAssistantResponse", nil
+		return SafeEndpoint(amazonQTemplate, a.Region, "/generateAssistantResponse")
 	}
 	host, ok := runtimeHosts[a.Region]
 	if !ok {

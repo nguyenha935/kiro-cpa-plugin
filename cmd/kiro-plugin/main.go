@@ -51,7 +51,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -1907,8 +1906,10 @@ func validateIDCInput(startURL, region string) error {
 	return nil
 }
 
+// validateRegion applies the shared region rule to operator and credential
+// input, keeping the connect form's wording for the rejection.
 func validateRegion(region string) error {
-	if matched, _ := regexp.MatchString(`^[a-z]{2}(?:-gov)?-[a-z]+-\d$`, region); !matched {
+	if _, err := kiroroute.ValidateRegion(region); err != nil {
 		return errors.New("Enter a valid AWS Region, for example us-east-1.")
 	}
 	return nil
