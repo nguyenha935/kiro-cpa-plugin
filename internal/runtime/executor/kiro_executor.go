@@ -65,9 +65,6 @@ const (
 	// matters, so the bar sits above the observed normal range.
 	kiroLargePayloadBytes = 2 << 20
 
-	kiroBuilderIDProfileARN = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
-	kiroSocialProfileARN    = "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
-
 	// Socket retry configuration constants
 	// Maximum number of retry attempts for socket/network errors
 	kiroSocketMaxRetries = 3
@@ -1595,40 +1592,28 @@ func kiroCredentials(auth *cliproxyauth.Auth) (accessToken, profileArn string) {
 }
 
 // kiroRuntimeCredentials returns credentials with the profile contract required
-// by the GenerateAssistantResponse runtime surface. Builder ID and social
-// credentials do not carry profileArn in their token file, but the runtime
-// payload still requires their public profile ARN.
+// by the GenerateAssistantResponse runtime surface.
 func kiroRuntimeCredentials(auth *cliproxyauth.Auth) (accessToken, profileArn string) {
 	accessToken, profileArn = kiroCredentials(auth)
 	return accessToken, effectiveGenerateProfileARN(auth, profileArn)
 }
 
 // effectiveGenerateProfileARN applies only the profile contract used by
-// generateAssistantResponse. Builder ID's control-plane APIs are profileless,
-// but its runtime payload still requires the public Builder ID profile.
+// generateAssistantResponse: the credential's own profile ARN when it has one,
+// nothing otherwise. Builder ID and social credentials usually carry none and
+// are served profileless; a placeholder ARN belonging to another AWS account
+// would identify the request as that account's, so none is ever substituted.
 func effectiveGenerateProfileARN(auth *cliproxyauth.Auth, profileArn string) string {
 	method := ""
 	if auth != nil && auth.Metadata != nil {
 		method, _ = auth.Metadata["auth_method"].(string)
 	}
-	method = strings.ToLower(strings.TrimSpace(method))
-	if method == "api_key" {
+	if strings.EqualFold(strings.TrimSpace(method), "api_key") {
 		// API-key requests are account-bound and the upstream Q surface rejects
 		// every profile ARN, including stale values imported from older files.
 		return ""
 	}
-	profileArn = strings.TrimSpace(profileArn)
-	if profileArn != "" {
-		return profileArn
-	}
-	switch method {
-	case "builder-id":
-		return kiroBuilderIDProfileARN
-	case "social":
-		return kiroSocialProfileARN
-	default:
-		return ""
-	}
+	return strings.TrimSpace(profileArn)
 }
 
 // mapModelToKiro returns the exact model advertised by Kiro. The CLIProxyAPI
@@ -3380,6 +3365,7 @@ func (e *KiroExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
 		var payloadResp struct {
 			AccessToken  string `json:"accessToken"`
 			RefreshToken string `json:"refreshToken"`
+			ProfileArn   string `json:"profileArn"`
 			ExpiresIn    int    `json:"expiresIn"`
 		}
 		if json.Unmarshal(body, &payloadResp) != nil || payloadResp.AccessToken == "" {
@@ -3392,8 +3378,8 @@ func (e *KiroExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
 			payloadResp.ExpiresIn = 3600
 		}
 		profileArn, _ := auth.Metadata["profile_arn"].(string)
-		if authMethod == "social" && profileArn == "" {
-			profileArn = kiroSocialProfileARN
+		if payloadResp.ProfileArn != "" {
+			profileArn = payloadResp.ProfileArn
 		}
 		tokenData = &kiroauth.KiroTokenData{AccessToken: payloadResp.AccessToken, RefreshToken: payloadResp.RefreshToken, ProfileArn: profileArn, ExpiresAt: time.Now().UTC().Add(time.Duration(payloadResp.ExpiresIn) * time.Second).Format(time.RFC3339), AuthMethod: authMethod, Provider: "CLIProxyAPI", Region: region}
 	} else if authMethod == "external_idp" {

@@ -26,10 +26,11 @@ import (
 // 200. It was previously sent only as a header, so the body omitted a field Kiro
 // CLI includes.
 type KiroPayload struct {
-	ConversationState            KiroConversationState `json:"conversationState"`
-	ProfileArn                   string                `json:"profileArn,omitempty"`
-	AgentMode                    string                `json:"agentMode,omitempty"`
-	AdditionalModelRequestFields map[string]any        `json:"additionalModelRequestFields,omitempty"`
+	ConversationState            KiroConversationState       `json:"conversationState"`
+	ProfileArn                   string                      `json:"profileArn,omitempty"`
+	AgentMode                    string                      `json:"agentMode,omitempty"`
+	InferenceConfig              *kirocommon.InferenceConfig `json:"inferenceConfig,omitempty"`
+	AdditionalModelRequestFields map[string]any              `json:"additionalModelRequestFields,omitempty"`
 }
 
 // KiroConversationState holds the conversation context
@@ -202,6 +203,7 @@ func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, cap
 		},
 		ProfileArn:                   profileArn,
 		AgentMode:                    kirocommon.AgentModeVibe,
+		InferenceConfig:              kirocommon.InferenceConfigFromRequest(claudeBody),
 		AdditionalModelRequestFields: capability.AdditionalFieldsForRequest(effort, gjson.GetBytes(claudeBody, "max_tokens").Int()),
 	}
 
