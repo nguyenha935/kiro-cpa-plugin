@@ -2,6 +2,7 @@ package modelcapabilities
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -72,6 +73,85 @@ func (c Capability) SupportsEffort(effort string) bool {
 		}
 	}
 	return false
+}
+
+// effortRank orders the effort labels CPA can hand a plugin from cheapest to
+// most expensive. Kiro schemas enumerate a subset of these names.
+var effortRank = []string{"minimal", "low", "medium", "high", "xhigh", "max"}
+
+func effortIndex(level string) int {
+	for index, known := range effortRank {
+		if known == level {
+			return index
+		}
+	}
+	return -1
+}
+
+// ResolveEffort maps the effort a client asked for onto what this model's
+// schema accepts. It never fails: reasoning effort is an optional enrichment,
+// and a request that would succeed without it must not be rejected because of
+// it.
+//
+//   - "" omits the field; "none" is forwarded only when the schema lists it,
+//     because Claude schemas usually omit "none" and reject it.
+//   - "auto" defers to the schema default, or omits the field when the schema
+//     declares none. Either way Kiro applies its own default, which is what
+//     "auto" asks for, so it is never reported as an adjustment.
+//   - a level the schema lists is forwarded as is.
+//   - a known level the schema omits is clamped to the highest listed level
+//     that does not exceed it, so a client never pays for more reasoning than
+//     it asked for; only when every listed level is above the request is the
+//     lowest of them used.
+//   - anything else, or any effort on a model without an effort enum, is
+//     dropped.
+//
+// The note is empty when the outcome matches the request and otherwise says
+// what changed, so the caller can log the degradation.
+func (c Capability) ResolveEffort(requested string) (effort string, note string) {
+	requested = strings.ToLower(strings.TrimSpace(requested))
+	switch requested {
+	case "":
+		return "", ""
+	case "none":
+		if c.SupportsEffort("none") {
+			return "none", ""
+		}
+		return "", ""
+	case "auto":
+		return c.DefaultEffort, ""
+	}
+	if c.EffortPath == EffortPathNone || len(c.EffortLevels) == 0 {
+		return "", "model declares no reasoning effort levels; effort " + strconv.Quote(requested) + " dropped"
+	}
+	if c.SupportsEffort(requested) {
+		return requested, ""
+	}
+	rank := effortIndex(requested)
+	if rank < 0 {
+		return "", strconv.Quote(requested) + " is not a reasoning effort level; dropped"
+	}
+	best, bestRank := "", -1
+	lowest, lowestRank := "", len(effortRank)
+	for _, level := range c.EffortLevels {
+		levelRank := effortIndex(level)
+		if levelRank < 0 {
+			continue
+		}
+		if levelRank <= rank && levelRank > bestRank {
+			best, bestRank = level, levelRank
+		}
+		if levelRank < lowestRank {
+			lowest, lowestRank = level, levelRank
+		}
+	}
+	if best == "" {
+		best = lowest
+	}
+	if best == "" {
+		return "", strconv.Quote(requested) + " is not among the levels this model declares; dropped"
+	}
+	return best, "effort " + strconv.Quote(requested) + " clamped to " + strconv.Quote(best)
 }
 
 func (c Capability) AdditionalFields(effort string) map[string]any {

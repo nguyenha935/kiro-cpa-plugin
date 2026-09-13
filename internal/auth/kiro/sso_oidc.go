@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nguyenha935/kiro-cpa-plugin/internal/kiroroute"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
 
@@ -100,17 +101,29 @@ type CreateTokenResponse struct {
 	ProfileArn   string `json:"profileArn"`
 }
 
-func getOIDCEndpoint(region string) string {
+// oidcEndpoint builds an OIDC operation URL. The region comes from credential
+// files and operator input, so it is validated and the final URL re-parsed
+// before any client secret or refresh token is addressed to it. A malformed
+// region is reported as a 400 so callers never retry it as a transient fault.
+func oidcEndpoint(region, path string) (string, error) {
 	if strings.TrimSpace(region) == "" {
 		region = defaultIDCRegion
 	}
-	return fmt.Sprintf("https://oidc.%s.amazonaws.com", region)
+	endpoint, err := kiroroute.SafeEndpoint(kiroroute.OIDCTemplate, region, path)
+	if err != nil {
+		return "", OIDCStatusError{Status: http.StatusBadRequest, Message: err.Error()}
+	}
+	return endpoint, nil
 }
 
 func (c *SSOOIDCClient) RegisterClientWithRegion(ctx context.Context, region string) (*RegisterClientResponse, error) {
+	endpoint, err := oidcEndpoint(region, "/client/register")
+	if err != nil {
+		return nil, fmt.Errorf("register IDC client: %w", err)
+	}
 	payload := kiroClientRegistrationPayload()
 	var response RegisterClientResponse
-	if err := c.postJSON(ctx, getOIDCEndpoint(region)+"/client/register", payload, nil, &response); err != nil {
+	if err := c.postJSON(ctx, endpoint, payload, nil, &response); err != nil {
 		return nil, fmt.Errorf("register IDC client: %w", err)
 	}
 	return &response, nil
@@ -127,27 +140,39 @@ func kiroClientRegistrationPayload() map[string]any {
 }
 
 func (c *SSOOIDCClient) StartDeviceAuthorizationWithIDC(ctx context.Context, clientID, clientSecret, startURL, region string) (*StartDeviceAuthResponse, error) {
+	endpoint, err := oidcEndpoint(region, "/device_authorization")
+	if err != nil {
+		return nil, fmt.Errorf("start IDC device authorization: %w", err)
+	}
 	payload := map[string]string{"clientId": clientID, "clientSecret": clientSecret, "startUrl": startURL}
 	var response StartDeviceAuthResponse
-	if err := c.postJSON(ctx, getOIDCEndpoint(region)+"/device_authorization", payload, nil, &response); err != nil {
+	if err := c.postJSON(ctx, endpoint, payload, nil, &response); err != nil {
 		return nil, fmt.Errorf("start IDC device authorization: %w", err)
 	}
 	return &response, nil
 }
 
 func (c *SSOOIDCClient) CreateTokenWithRegion(ctx context.Context, clientID, clientSecret, deviceCode, region string) (*CreateTokenResponse, error) {
+	endpoint, err := oidcEndpoint(region, "/token")
+	if err != nil {
+		return nil, err
+	}
 	payload := map[string]string{
 		"clientId": clientID, "clientSecret": clientSecret, "deviceCode": deviceCode,
 		"grantType": "urn:ietf:params:oauth:grant-type:device_code",
 	}
 	var response CreateTokenResponse
-	if err := c.postJSON(ctx, getOIDCEndpoint(region)+"/token", payload, nil, &response); err != nil {
+	if err := c.postJSON(ctx, endpoint, payload, nil, &response); err != nil {
 		return nil, err
 	}
 	return &response, nil
 }
 
 func (c *SSOOIDCClient) RefreshTokenWithRegion(ctx context.Context, clientID, clientSecret, refreshToken, region, startURL string) (*KiroTokenData, error) {
+	endpoint, err := oidcEndpoint(region, "/token")
+	if err != nil {
+		return nil, fmt.Errorf("refresh IDC token: %w", err)
+	}
 	payload := map[string]string{
 		"clientId": clientID, "clientSecret": clientSecret, "refreshToken": refreshToken, "grantType": "refresh_token",
 	}
@@ -157,7 +182,7 @@ func (c *SSOOIDCClient) RefreshTokenWithRegion(ctx context.Context, clientID, cl
 		"User-Agent":       []string{ClientUserAgent()},
 	}
 	var response CreateTokenResponse
-	if err := c.postJSON(ctx, getOIDCEndpoint(region)+"/token", payload, headers, &response); err != nil {
+	if err := c.postJSON(ctx, endpoint, payload, headers, &response); err != nil {
 		return nil, fmt.Errorf("refresh IDC token: %w", err)
 	}
 	if response.RefreshToken == "" {

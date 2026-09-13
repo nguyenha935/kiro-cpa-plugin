@@ -2,6 +2,7 @@ package kiro
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -66,5 +67,56 @@ func TestOIDCStatusErrorPreservesHTTPStatus(t *testing.T) {
 	err := OIDCStatusError{Status: http.StatusUnauthorized, Message: "rejected"}
 	if err.StatusCode() != http.StatusUnauthorized || err.Error() != "rejected" {
 		t.Fatalf("unexpected OIDC status error: %+v", err)
+	}
+}
+
+// A region taken from a credential file can rewrite the OIDC host. Every OIDC
+// operation must refuse before the transport is touched, because the request
+// body carries the client secret and refresh token.
+func TestOIDCOperationsRefuseHostileRegionBeforeSendingSecrets(t *testing.T) {
+	client := &SSOOIDCClient{httpClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		t.Fatalf("secrets were sent to %s", request.URL)
+		return nil, nil
+	})}}
+	ctx := context.Background()
+	for _, region := range []string{"us-east-1@attacker.example/", "us-east-1.attacker.example", "us-east-1:8443"} {
+		operations := map[string]func() error{
+			"RegisterClientWithRegion": func() error {
+				_, err := client.RegisterClientWithRegion(ctx, region)
+				return err
+			},
+			"StartDeviceAuthorizationWithIDC": func() error {
+				_, err := client.StartDeviceAuthorizationWithIDC(ctx, "client", "secret", "https://example.awsapps.com/start", region)
+				return err
+			},
+			"CreateTokenWithRegion": func() error {
+				_, err := client.CreateTokenWithRegion(ctx, "client", "secret", "device", region)
+				return err
+			},
+			"RefreshTokenWithRegion": func() error {
+				_, err := client.RefreshTokenWithRegion(ctx, "client", "secret", "refresh", region, "https://example.awsapps.com/start")
+				return err
+			},
+		}
+		for name, operation := range operations {
+			err := operation()
+			if err == nil {
+				t.Fatalf("%s accepted region %q", name, region)
+			}
+			var status OIDCStatusError
+			if !errors.As(err, &status) || status.Status != http.StatusBadRequest {
+				t.Fatalf("%s(%q) error = %T %v, want OIDCStatusError 400", name, region, err, err)
+			}
+		}
+	}
+}
+
+func TestOIDCEmptyRegionFallsBackToDefault(t *testing.T) {
+	endpoint, err := oidcEndpoint("", "/token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if endpoint != "https://oidc.us-east-1.amazonaws.com/token" {
+		t.Fatalf("endpoint = %s", endpoint)
 	}
 }

@@ -26,10 +26,11 @@ import (
 // 200. It was previously sent only as a header, so the body omitted a field Kiro
 // CLI includes.
 type KiroPayload struct {
-	ConversationState            KiroConversationState `json:"conversationState"`
-	ProfileArn                   string                `json:"profileArn,omitempty"`
-	AgentMode                    string                `json:"agentMode,omitempty"`
-	AdditionalModelRequestFields map[string]any        `json:"additionalModelRequestFields,omitempty"`
+	ConversationState            KiroConversationState       `json:"conversationState"`
+	ProfileArn                   string                      `json:"profileArn,omitempty"`
+	AgentMode                    string                      `json:"agentMode,omitempty"`
+	InferenceConfig              *kirocommon.InferenceConfig `json:"inferenceConfig,omitempty"`
+	AdditionalModelRequestFields map[string]any              `json:"additionalModelRequestFields,omitempty"`
 }
 
 // KiroConversationState holds the conversation context
@@ -202,6 +203,7 @@ func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, cap
 		},
 		ProfileArn:                   profileArn,
 		AgentMode:                    kirocommon.AgentModeVibe,
+		InferenceConfig:              kirocommon.InferenceConfigFromRequest(claudeBody),
 		AdditionalModelRequestFields: capability.AdditionalFieldsForRequest(effort, gjson.GetBytes(claudeBody, "max_tokens").Int()),
 	}
 
@@ -355,21 +357,27 @@ func normalizeOrigin(origin string) string {
 	}
 }
 
-// extractSystemPrompt extracts system prompt from Claude request
+// extractSystemPrompt extracts system prompt from Claude request. Claude Code
+// sends several text blocks (identity, then instructions); joining them with a
+// blank line keeps each block's last and first sentences from fusing.
 func extractSystemPrompt(claudeBody []byte) string {
 	systemField := gjson.GetBytes(claudeBody, "system")
-	if systemField.IsArray() {
-		var sb strings.Builder
-		for _, block := range systemField.Array() {
-			if block.Get("type").String() == "text" {
-				sb.WriteString(block.Get("text").String())
-			} else if block.Type == gjson.String {
-				sb.WriteString(block.String())
-			}
-		}
-		return sb.String()
+	if !systemField.IsArray() {
+		return systemField.String()
 	}
-	return systemField.String()
+	var parts []string
+	for _, block := range systemField.Array() {
+		text := ""
+		if block.Get("type").String() == "text" {
+			text = block.Get("text").String()
+		} else if block.Type == gjson.String {
+			text = block.String()
+		}
+		if text != "" {
+			parts = append(parts, text)
+		}
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 // convertClaudeToolsToKiro converts Claude tools to Kiro format

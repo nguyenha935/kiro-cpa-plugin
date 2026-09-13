@@ -19,6 +19,7 @@ import (
 
 	kiroauth "github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
@@ -118,7 +119,7 @@ func TestBuilderIDCatalogAndUsageIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load Builder ID integration token: %v", err)
 	}
-	if !isBuilderIDCredential(token) || strings.TrimSpace(token.ProfileArn) != "" {
+	if token.AuthMethod != "builder-id" || strings.TrimSpace(token.ProfileArn) != "" {
 		t.Fatalf("integration credential is not profileless Builder ID")
 	}
 	models, err := listAvailableModels(t.Context(), token)
@@ -334,6 +335,40 @@ func TestPluginUsesKiroDisplayNameAndStableProviderID(t *testing.T) {
 	if providerName != "kiro" {
 		t.Fatalf("provider ID = %q, want kiro", providerName)
 	}
+	// The plugin id must not collide with the official store's "kiro" plugin:
+	// a store install writes <id>.so and would overwrite this binary in place.
+	if pluginID != "kiro-ha" || pluginID == providerName {
+		t.Fatalf("plugin ID = %q, want kiro-ha distinct from provider %q", pluginID, providerName)
+	}
+}
+
+func TestLifecycleMethodsAreAcknowledged(t *testing.T) {
+	// Hot reload sends plugin.quiesce to the outgoing library and treats an
+	// unknown method as "quiesce unsupported"; both lifecycle methods must
+	// answer with an ok envelope and an empty result.
+	for _, method := range []string{pluginabi.MethodPluginQuiesce, pluginabi.MethodPluginShutdown} {
+		raw, err := handleMethod(method, []byte(`{}`))
+		if err != nil {
+			t.Fatalf("%s: %v", method, err)
+		}
+		var decoded envelope
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		if !decoded.OK || decoded.Error != nil || string(decoded.Result) != `{}` {
+			t.Fatalf("%s envelope = %s", method, raw)
+		}
+	}
+	// request.complete is only delivered to plugins advertising the request
+	// lifecycle capability, which this plugin does not; it stays unknown.
+	raw, _ := handleMethod(pluginabi.MethodRequestComplete, []byte(`{}`))
+	var decoded envelope
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.OK || decoded.Error == nil || decoded.Error.Code != "unknown_method" {
+		t.Fatalf("request.complete envelope = %s", raw)
+	}
 }
 
 func TestErrorEnvelopePreservesHTTPStatus(t *testing.T) {
@@ -347,10 +382,34 @@ func TestErrorEnvelopePreservesHTTPStatus(t *testing.T) {
 	}
 }
 
-type requestStatusError struct{ status int }
+func TestErrorEnvelopeCarriesRetryAfterInMilliseconds(t *testing.T) {
+	window := 90 * time.Minute
+	raw := errorEnvelopeFromError(requestStatusError{status: http.StatusTooManyRequests, retryAfter: &window})
+	var decoded envelope
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Error == nil || decoded.Error.RetryAfterMS != window.Milliseconds() || !decoded.Error.Retryable {
+		t.Fatalf("error envelope = %#v", decoded.Error)
+	}
+	if !bytes.Contains(raw, []byte(`"retry_after_ms":5400000`)) {
+		t.Fatalf("wire format lacks retry_after_ms: %s", raw)
+	}
 
-func (e requestStatusError) Error() string   { return "invalid request" }
-func (e requestStatusError) StatusCode() int { return e.status }
+	raw = errorEnvelopeFromError(requestStatusError{status: http.StatusTooManyRequests})
+	if bytes.Contains(raw, []byte("retry_after_ms")) {
+		t.Fatalf("retry_after_ms emitted without a window: %s", raw)
+	}
+}
+
+type requestStatusError struct {
+	status     int
+	retryAfter *time.Duration
+}
+
+func (e requestStatusError) Error() string              { return "invalid request" }
+func (e requestStatusError) StatusCode() int            { return e.status }
+func (e requestStatusError) RetryAfter() *time.Duration { return e.retryAfter }
 
 func TestNormalizeModelIDUsesUpstreamID(t *testing.T) {
 	tests := map[string]string{
@@ -624,12 +683,20 @@ func TestKiroAuthStoragePreservesCredentialSchemaOnRefresh(t *testing.T) {
 	}
 }
 
+// configureRequest wraps a config.yaml document the way the host sends it.
+func configureRequest(yamlDoc string) []byte {
+	payload, _ := json.Marshal(map[string][]byte{"config_yaml": []byte(yamlDoc)})
+	return payload
+}
+
+var testPluginSettings = pluginSettingsData{MinTokenInterval: "3s", MaxTokenInterval: "5s", SuspendCooldown: "2h"}
+
 func TestConfigurePluginMergesNestedAndPartialSettings(t *testing.T) {
 	original := pluginSettings
 	defer func() { pluginSettings = original }()
-	pluginSettings = pluginSettingsData{DailyMaxRequests: 777, MinTokenInterval: "3s", MaxTokenInterval: "5s", SuspendCooldown: "2h"}
-	configurePlugin([]byte(`{"config_yaml":"cGx1Z2luczoKICBjb25maWdzOgogICAga2lybzoKICAgICAgZGFpbHlfbWF4X3JlcXVlc3RzOiA4ODgK"}`))
-	if pluginSettings.DailyMaxRequests != 888 || pluginSettings.MinTokenInterval != "3s" || pluginSettings.MaxTokenInterval != "5s" || pluginSettings.SuspendCooldown != "2h" {
+	pluginSettings = testPluginSettings
+	configurePlugin(configureRequest("plugins:\n  configs:\n    kiro:\n      min_token_interval: 4s\n"))
+	if pluginSettings.MinTokenInterval != "4s" || pluginSettings.MaxTokenInterval != "5s" || pluginSettings.SuspendCooldown != "2h" {
 		t.Fatalf("nested partial config reset existing settings: %#v", pluginSettings)
 	}
 }
@@ -763,14 +830,32 @@ func TestParseRejectsIDCWhenRequiredProfileDiscoveryFails(t *testing.T) {
 	}
 }
 
+func TestConfigurePluginReadsPluginIDSectionBeforeProviderSection(t *testing.T) {
+	// The host files the plugin's settings under plugins.configs.<plugin id>,
+	// which is the library name kiro-ha, while older configs used the provider
+	// name. Both must be read, and the id-keyed section wins when both exist.
+	original := pluginSettings
+	defer func() { pluginSettings = original }()
+	pluginSettings = testPluginSettings
+	configurePlugin(configureRequest("plugins:\n  configs:\n    kiro-ha:\n      min_token_interval: 9s\n    kiro:\n      min_token_interval: 8s\n"))
+	if pluginSettings.MinTokenInterval != "9s" || pluginSettings.SuspendCooldown != "2h" {
+		t.Fatalf("plugin-id section did not win: %#v", pluginSettings)
+	}
+	pluginSettings = testPluginSettings
+	configurePlugin(configureRequest("outer:\n  kiro-ha:\n    suspend_cooldown: 6h\n"))
+	if pluginSettings.SuspendCooldown != "6h" || pluginSettings.MinTokenInterval != "3s" {
+		t.Fatalf("nested plugin-id section was not found: %#v", pluginSettings)
+	}
+}
+
 func TestConfigurePluginIgnoresNonSettingsKiroKeys(t *testing.T) {
 	// A real config.yaml holds two "kiro" keys: plugins.configs.kiro and the
 	// oauth-excluded-models list. The settings must come from the former.
 	original := pluginSettings
 	defer func() { pluginSettings = original }()
-	pluginSettings = pluginSettingsData{DailyMaxRequests: 777, MinTokenInterval: "3s", MaxTokenInterval: "5s", SuspendCooldown: "2h"}
-	configurePlugin([]byte(`{"config_yaml":"b2F1dGgtZXhjbHVkZWQtbW9kZWxzOgogIGtpcm86CiAgICAtIGNsYXVkZS1zb25uZXQtNAogICAgLSBraXJvL2F1dG8KcGx1Z2luczoKICBjb25maWdzOgogICAga2lybzoKICAgICAgZGFpbHlfbWF4X3JlcXVlc3RzOiA4ODgK"}`))
-	if pluginSettings.DailyMaxRequests != 888 || pluginSettings.SuspendCooldown != "2h" {
+	pluginSettings = testPluginSettings
+	configurePlugin(configureRequest("oauth-excluded-models:\n  kiro:\n    - claude-sonnet-4\n    - kiro/auto\nplugins:\n  configs:\n    kiro:\n      min_token_interval: 8s\n"))
+	if pluginSettings.MinTokenInterval != "8s" || pluginSettings.SuspendCooldown != "2h" {
 		t.Fatalf("excluded-models list interfered with settings: %#v", pluginSettings)
 	}
 }
@@ -780,11 +865,11 @@ func TestFindKiroConfigIsDeterministicAcrossCompetingKeys(t *testing.T) {
 	// resolve to the same one on every call.
 	original := pluginSettings
 	defer func() { pluginSettings = original }()
-	const payload = `{"config_yaml":"YWFhLWRlY295OgogIGtpcm86CiAgICBzdXNwZW5kX2Nvb2xkb3duOiA5aAp6enotZGVjb3k6CiAga2lybzoKICAgIHN1c3BlbmRfY29vbGRvd246IDRoCg=="}`
+	payload := configureRequest("aaa-decoy:\n  kiro:\n    suspend_cooldown: 9h\nzzz-decoy:\n  kiro:\n    suspend_cooldown: 4h\n")
 	first := ""
 	for i := 0; i < 40; i++ {
-		pluginSettings = pluginSettingsData{DailyMaxRequests: 777, MinTokenInterval: "3s", MaxTokenInterval: "5s", SuspendCooldown: "2h"}
-		configurePlugin([]byte(payload))
+		pluginSettings = testPluginSettings
+		configurePlugin(payload)
 		if i == 0 {
 			first = pluginSettings.SuspendCooldown
 			continue

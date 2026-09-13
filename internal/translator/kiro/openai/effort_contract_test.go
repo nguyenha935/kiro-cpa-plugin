@@ -32,6 +32,18 @@ func TestBuildKiroPayloadClampsSmallCompletionTokens(t *testing.T) {
 	}
 }
 
+func TestBuildKiroPayloadFromOpenAIForwardsSamplingInInferenceConfig(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"Reply briefly"}],"temperature":0,"top_p":0.95,"max_completion_tokens":64000}`)
+	payload, _ := BuildKiroPayloadFromOpenAI(body, "glm-5", "profile", "AI_EDITOR", modelcapabilities.Capability{ModelID: "glm-5"}, "")
+	if got := gjson.GetBytes(payload, "inferenceConfig").Raw; got != `{"temperature":0,"topP":0.95}` {
+		t.Fatalf("inferenceConfig = %s; payload=%s", got, payload)
+	}
+	plain, _ := BuildKiroPayloadFromOpenAI([]byte(`{"messages":[{"role":"user","content":"Reply briefly"}]}`), "glm-5", "profile", "AI_EDITOR", modelcapabilities.Capability{ModelID: "glm-5"}, "")
+	if gjson.GetBytes(plain, "inferenceConfig").Exists() {
+		t.Fatalf("inferenceConfig was sent without any sampling field: %s", plain)
+	}
+}
+
 func TestBuildKiroPayloadFromOpenAIOmitsTheFieldsWhenTheModelDeclaresNoBudget(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"user","content":"Reply briefly"}],"max_completion_tokens":64000}`)
 	payload, _ := BuildKiroPayloadFromOpenAI(body, "glm-5", "profile", "AI_EDITOR", modelcapabilities.Capability{ModelID: "glm-5"}, "")

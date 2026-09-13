@@ -23,10 +23,9 @@ func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) 
 	return f(request)
 }
 
-// A credential is valid on exactly one runtime, so resolution must yield exactly
-// one endpoint. The previous behaviour returned all three surfaces ordered by a
-// guess, which meant a rejection on the first surface was retried against
-// services the credential was never valid on.
+// A credential is valid on exactly one runtime. The previous behaviour returned
+// all three surfaces ordered by a guess, which meant a rejection on the first
+// surface was retried against services the credential was never valid on.
 func TestKiroResolvesExactlyOneEndpointPerAuthSurface(t *testing.T) {
 	tests := map[string]string{
 		"builder-id":   "https://runtime.us-east-1.kiro.dev/generateAssistantResponse",
@@ -37,12 +36,12 @@ func TestKiroResolvesExactlyOneEndpointPerAuthSurface(t *testing.T) {
 	}
 	for method, want := range tests {
 		auth := &cliproxyauth.Auth{Metadata: map[string]any{"auth_method": method, "region": "us-east-1"}}
-		got := getKiroEndpointConfigs(auth)
-		if len(got) != 1 {
-			t.Fatalf("%s resolved %d endpoints, want exactly 1", method, len(got))
+		got, err := kiroEndpointFor(auth)
+		if err != nil {
+			t.Fatalf("%s: %v", method, err)
 		}
-		if got[0].URL != want {
-			t.Fatalf("%s endpoint = %s, want %s", method, got[0].URL, want)
+		if got.URL != want {
+			t.Fatalf("%s endpoint = %s, want %s", method, got.URL, want)
 		}
 	}
 }
@@ -56,12 +55,12 @@ func TestKiroRuntimeFollowsProfileRegionNotLoginRegion(t *testing.T) {
 		"region":      "us-east-1",
 		"profile_arn": "arn:aws:codewhisperer:eu-central-1:111122223333:profile/EXAMPLEPROFILE",
 	}}
-	got := getKiroEndpointConfigs(auth)
-	if len(got) != 1 {
-		t.Fatalf("resolved %d endpoints, want 1", len(got))
+	got, err := kiroEndpointFor(auth)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if want := "https://runtime.eu-central-1.kiro.dev/generateAssistantResponse"; got[0].URL != want {
-		t.Fatalf("endpoint = %s, want %s", got[0].URL, want)
+	if want := "https://runtime.eu-central-1.kiro.dev/generateAssistantResponse"; got.URL != want {
+		t.Fatalf("endpoint = %s, want %s", got.URL, want)
 	}
 }
 
@@ -71,10 +70,12 @@ func TestKiroNeverResolvesToTheCodeWhispererHost(t *testing.T) {
 	for _, method := range []string{"builder-id", "social", "idc", "external_idp", "imported", "api_key"} {
 		for _, region := range []string{"us-east-1", "eu-central-1"} {
 			auth := &cliproxyauth.Auth{Metadata: map[string]any{"auth_method": method, "region": region}}
-			for _, config := range getKiroEndpointConfigs(auth) {
-				if strings.Contains(config.URL, "codewhisperer.") {
-					t.Fatalf("%s in %s resolved to %s", method, region, config.URL)
-				}
+			endpoint, err := kiroEndpointFor(auth)
+			if err != nil {
+				t.Fatalf("%s in %s: %v", method, region, err)
+			}
+			if strings.Contains(endpoint.URL, "codewhisperer.") {
+				t.Fatalf("%s in %s resolved to %s", method, region, endpoint.URL)
 			}
 		}
 	}
@@ -97,12 +98,12 @@ func TestAPIKeyUsesConfiguredRegion(t *testing.T) {
 	if got := resolveKiroAccount(auth).Region; got != "eu-west-1" {
 		t.Fatalf("API-key region = %q, want eu-west-1", got)
 	}
-	endpoints := getKiroEndpointConfigs(auth)
-	if len(endpoints) != 1 {
-		t.Fatalf("resolved %d endpoints, want 1", len(endpoints))
+	endpoint, err := kiroEndpointFor(auth)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(endpoints[0].URL, "q.eu-west-1.amazonaws.com") {
-		t.Fatalf("API-key endpoint ignored configured region: %s", endpoints[0].URL)
+	if !strings.Contains(endpoint.URL, "q.eu-west-1.amazonaws.com") {
+		t.Fatalf("API-key endpoint ignored configured region: %s", endpoint.URL)
 	}
 }
 
@@ -186,6 +187,166 @@ func TestQuotaErrorsStopAtCredentialBoundary(t *testing.T) {
 				t.Fatalf("quota error made %d upstream requests, want 1", requests)
 			}
 		})
+	}
+}
+
+// stubUpstream routes every executor request to handler for the test's duration
+// and shrinks the per-credential pacing so repeated calls do not sleep.
+func stubUpstream(t *testing.T, handler func(*http.Request) (*http.Response, error)) {
+	t.Helper()
+	original := kiroHTTPClientFor
+	kiroauth.ConfigureGlobalRateLimiter(kiroauth.RateLimiterConfig{MinTokenInterval: time.Millisecond, MaxTokenInterval: 2 * time.Millisecond})
+	t.Cleanup(func() {
+		kiroHTTPClientFor = original
+		kiroauth.ConfigureGlobalRateLimiter(kiroauth.RateLimiterConfig{})
+	})
+	kiroHTTPClientFor = func(context.Context, *config.Config, *cliproxyauth.Auth, time.Duration) *http.Client {
+		return &http.Client{Transport: roundTripFunc(handler)}
+	}
+}
+
+func upstreamStatus(status int, header http.Header, body string) *http.Response {
+	if header == nil {
+		header = make(http.Header)
+	}
+	return &http.Response{StatusCode: status, Header: header, Body: io.NopCloser(strings.NewReader(body))}
+}
+
+func builderIDAuth(id string) *cliproxyauth.Auth {
+	return &cliproxyauth.Auth{ID: id, Metadata: map[string]any{
+		"access_token": "token", "auth_method": "builder-id", "region": "us-east-1",
+	}}
+}
+
+var executorTestRequest = func() (cliproxyexecutor.Request, cliproxyexecutor.Options) {
+	body := []byte("{\"model\":\"claude-haiku-4.5\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply OK.\"}],\"max_tokens\":16}")
+	return cliproxyexecutor.Request{Model: "claude-haiku-4.5", Payload: body, Format: sdktranslator.FromString("openai")},
+		cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai"), OriginalRequest: body}
+}
+
+// A 429 belongs to CPA's backoff ladder. The plugin forwards the upstream
+// Retry-After window when Kiro sends one and otherwise leaves it unset, and it
+// never parks the credential itself, so the next request still goes upstream.
+func TestUpstream429IsForwardedWithoutPluginCooldown(t *testing.T) {
+	requests := 0
+	stubUpstream(t, func(*http.Request) (*http.Response, error) {
+		requests++
+		header := http.Header{}
+		if requests == 1 {
+			header.Set("Retry-After", "7")
+		}
+		return upstreamStatus(http.StatusTooManyRequests, header, "{\"message\":\"slow down\"}"), nil
+	})
+	auth := builderIDAuth("upstream-429")
+	request, options := executorTestRequest()
+
+	_, err := NewKiroExecutor(nil).Execute(t.Context(), auth, request, options)
+	retryAfter, ok := err.(interface{ RetryAfter() *time.Duration })
+	if !ok || retryAfter.RetryAfter() == nil || *retryAfter.RetryAfter() != 7*time.Second {
+		t.Fatalf("first 429 = %T %v, want Retry-After 7s forwarded", err, err)
+	}
+
+	_, err = NewKiroExecutor(nil).Execute(t.Context(), auth, request, options)
+	retryAfter, ok = err.(interface{ RetryAfter() *time.Duration })
+	if !ok || retryAfter.RetryAfter() != nil {
+		t.Fatalf("second 429 = %T %v, want no retry-after when upstream sends none", err, err)
+	}
+	if requests != 2 {
+		t.Fatalf("plugin made %d upstream requests, want 2 (no local 429 cooldown)", requests)
+	}
+}
+
+// A 402 monthly limit and a 403 suspension are the two conditions the plugin
+// must remember itself: the host's ladder would retry within seconds and the
+// retry-after does not cross the RPC boundary. The credential is refused
+// locally with a 429 until the window ends.
+func TestMonthlyLimitAndSuspensionParkTheCredentialLocally(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		status int
+		body   string
+		reason string
+	}{
+		{name: "402 monthly limit", status: http.StatusPaymentRequired, body: "{\"message\":\"MONTHLY_REQUEST_COUNT\"}", reason: "monthly limit reached"},
+		{name: "403 suspended", status: http.StatusForbidden, body: "{\"reason\":\"TEMPORARILY_SUSPENDED\"}", reason: "account suspended"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			requests := 0
+			stubUpstream(t, func(*http.Request) (*http.Response, error) {
+				requests++
+				return upstreamStatus(test.status, nil, test.body), nil
+			})
+			auth := builderIDAuth(strings.ReplaceAll(test.name, " ", "-"))
+			request, options := executorTestRequest()
+
+			if _, err := NewKiroExecutor(nil).Execute(t.Context(), auth, request, options); err == nil {
+				t.Fatal("upstream rejection returned no error")
+			}
+			_, err := NewKiroExecutor(nil).ExecuteStream(t.Context(), auth, request, options)
+			statusErr, ok := err.(interface{ StatusCode() int })
+			if !ok || statusErr.StatusCode() != http.StatusTooManyRequests || !strings.Contains(err.Error(), test.reason) {
+				t.Fatalf("parked credential = %T %v, want local 429 mentioning %q", err, err, test.reason)
+			}
+			retryAfter, ok := err.(interface{ RetryAfter() *time.Duration })
+			if !ok || retryAfter.RetryAfter() == nil || *retryAfter.RetryAfter() <= 0 {
+				t.Fatalf("parked credential carries no retry-after: %v", err)
+			}
+			if requests != 1 {
+				t.Fatalf("parked credential reached upstream %d times, want 1", requests)
+			}
+
+			disabled := builderIDAuth(auth.ID + "-cooling-off")
+			disabled.Attributes = map[string]string{"disable_cooling": "true"}
+			NewKiroExecutor(nil).Execute(t.Context(), disabled, request, options)
+			NewKiroExecutor(nil).Execute(t.Context(), disabled, request, options)
+			if requests != 3 {
+				t.Fatalf("disable_cooling credential reached upstream %d times, want 3", requests)
+			}
+		})
+	}
+}
+
+// Retry sleeps end with the caller: a client that disconnects while the plugin
+// waits out a 503 gets 499 immediately instead of holding the credential.
+func TestRetryBackoffStopsWhenTheClientDisconnects(t *testing.T) {
+	stubUpstream(t, func(*http.Request) (*http.Response, error) {
+		return upstreamStatus(http.StatusServiceUnavailable, nil, "{\"message\":\"busy\"}"), nil
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	request, options := executorTestRequest()
+	start := time.Now()
+	_, err := NewKiroExecutor(nil).Execute(ctx, builderIDAuth("backoff-cancel"), request, options)
+	statusErr, ok := err.(interface{ StatusCode() int })
+	if !ok || statusErr.StatusCode() != 499 {
+		t.Fatalf("canceled retry = %T %v, want 499", err, err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("retry kept sleeping for %v after the client left", elapsed)
+	}
+}
+
+func TestRetryAfterHeaderParsesSecondsAndDates(t *testing.T) {
+	header := http.Header{}
+	if got := retryAfterHeader(header); got != nil {
+		t.Fatalf("absent header = %v, want nil", *got)
+	}
+	header.Set("Retry-After", "120")
+	if got := retryAfterHeader(header); got == nil || *got != 2*time.Minute {
+		t.Fatalf("delay-seconds = %v, want 2m", got)
+	}
+	header.Set("Retry-After", time.Now().Add(time.Hour).UTC().Format(http.TimeFormat))
+	if got := retryAfterHeader(header); got == nil || *got < 59*time.Minute || *got > time.Hour {
+		t.Fatalf("HTTP-date = %v, want about 1h", got)
+	}
+	for _, bad := range []string{"soon", "-5", "0"} {
+		header.Set("Retry-After", bad)
+		if got := retryAfterHeader(header); got != nil {
+			t.Fatalf("Retry-After %q = %v, want nil", bad, *got)
+		}
 	}
 }
 

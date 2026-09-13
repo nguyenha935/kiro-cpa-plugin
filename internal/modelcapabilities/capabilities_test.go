@@ -44,6 +44,47 @@ func TestAdditionalFieldsUsesDeclaredPath(t *testing.T) {
 	}
 }
 
+func TestResolveEffortFitsTheRequestToTheSchema(t *testing.T) {
+	claude := Capability{EffortPath: EffortPathOutputConfig, EffortLevels: []string{"low", "medium", "high", "max"}, DefaultEffort: "high"}
+	gpt := Capability{EffortPath: EffortPathReasoning, EffortLevels: []string{"none", "low", "medium", "high", "xhigh"}}
+	highOnly := Capability{EffortPath: EffortPathOutputConfig, EffortLevels: []string{"high", "max"}}
+	none := Capability{}
+	for _, test := range []struct {
+		name       string
+		capability Capability
+		requested  string
+		want       string
+		adjusted   bool
+	}{
+		{"empty stays empty", claude, "", "", false},
+		{"listed level passes", claude, "medium", "medium", false},
+		{"case and space are normalised", claude, " High ", "high", false},
+		{"auto takes the schema default", claude, "auto", "high", false},
+		{"auto without a default omits the field", gpt, "auto", "", false},
+		{"auto without a schema omits the field", none, "auto", "", false},
+		{"none passes when listed", gpt, "none", "none", false},
+		{"none is omitted when not listed", claude, "none", "", false},
+		{"none without a schema is omitted", none, "none", "", false},
+		{"xhigh clamps down to high on claude", claude, "xhigh", "high", true},
+		{"max clamps down to xhigh on gpt", gpt, "max", "xhigh", true},
+		{"minimal clamps down to low", claude, "minimal", "low", true},
+		{"minimal on a gpt schema does not clamp to none", gpt, "minimal", "low", true},
+		{"below the whole range takes the lowest level", highOnly, "low", "high", true},
+		{"level without a schema is dropped", none, "high", "", true},
+		{"garbage is dropped", claude, "turbo", "", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, note := test.capability.ResolveEffort(test.requested)
+			if got != test.want {
+				t.Fatalf("ResolveEffort(%q) = %q, want %q", test.requested, got, test.want)
+			}
+			if (note != "") != test.adjusted {
+				t.Fatalf("ResolveEffort(%q) note = %q, adjusted want %v", test.requested, note, test.adjusted)
+			}
+		})
+	}
+}
+
 func TestNormalizeMaxTokensEnforcesKiroMinimumWithoutSchema(t *testing.T) {
 	if got := (Capability{}).NormalizeMaxTokens(64); got != DefaultMinimumOutputTokens {
 		t.Fatalf("normalized max tokens = %d, want %d", got, DefaultMinimumOutputTokens)

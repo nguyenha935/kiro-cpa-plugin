@@ -41,6 +41,21 @@ func TestBuildKiroPayloadClampsSmallMaxTokens(t *testing.T) {
 	}
 }
 
+func TestBuildKiroPayloadForwardsSamplingInInferenceConfig(t *testing.T) {
+	// Sampling knobs live in the top-level inferenceConfig block, apart from the
+	// schema-gated additionalModelRequestFields, so a schema-less model still
+	// receives them and max_tokens never leaks into the block.
+	body := []byte(`{"messages":[{"role":"user","content":"Reply briefly"}],"temperature":0.3,"top_p":0.8,"max_tokens":64000}`)
+	payload, _ := BuildKiroPayload(body, "claude-sonnet-4.5", "profile", "AI_EDITOR", modelcapabilities.Capability{ModelID: "claude-sonnet-4.5"}, "")
+	if got := gjson.GetBytes(payload, "inferenceConfig").Raw; got != `{"temperature":0.3,"topP":0.8}` {
+		t.Fatalf("inferenceConfig = %s; payload=%s", got, payload)
+	}
+	plain, _ := BuildKiroPayload([]byte(`{"messages":[{"role":"user","content":"Reply briefly"}]}`), "claude-sonnet-4.5", "profile", "AI_EDITOR", modelcapabilities.Capability{ModelID: "claude-sonnet-4.5"}, "")
+	if gjson.GetBytes(plain, "inferenceConfig").Exists() {
+		t.Fatalf("inferenceConfig was sent without any sampling field: %s", plain)
+	}
+}
+
 func TestBuildKiroPayloadOmitsTheFieldsWhenTheModelDeclaresNoBudget(t *testing.T) {
 	// A schema-less model rejects the whole additionalModelRequestFields object,
 	// so neither the budget nor the container may appear.
