@@ -65,7 +65,7 @@ func TestBuildKiroPayloadAnchorsSystemInstructionsToFirstUserTurn(t *testing.T) 
 	t.Parallel()
 
 	body := []byte(`{
-		"system": [{"type":"text","text":"Follow the repository rules."}],
+		"system": [{"type":"text","text":"You are Claude Code."},{"type":"text","text":"Follow the repository rules."}],
 		"messages": [
 			{"role":"user","content":"Run pwd"},
 			{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"exec_command","input":{"cmd":"pwd"}}]},
@@ -79,7 +79,7 @@ func TestBuildKiroPayloadAnchorsSystemInstructionsToFirstUserTurn(t *testing.T) 
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		t.Fatal(err)
 	}
-	if got := payload.ConversationState.History[0].UserInputMessage.Content; got != "Follow the repository rules.\n\nRun pwd" {
+	if got := payload.ConversationState.History[0].UserInputMessage.Content; got != "You are Claude Code.\n\nFollow the repository rules.\n\nRun pwd" {
 		t.Fatalf("first user content = %q", got)
 	}
 	if got := payload.ConversationState.CurrentMessage.UserInputMessage.Content; got != "" {
