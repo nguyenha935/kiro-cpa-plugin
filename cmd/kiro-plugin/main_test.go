@@ -334,6 +334,11 @@ func TestPluginUsesKiroDisplayNameAndStableProviderID(t *testing.T) {
 	if providerName != "kiro" {
 		t.Fatalf("provider ID = %q, want kiro", providerName)
 	}
+	// The plugin id must not collide with the official store's "kiro" plugin:
+	// a store install writes <id>.so and would overwrite this binary in place.
+	if pluginID != "kiro-ha" || pluginID == providerName {
+		t.Fatalf("plugin ID = %q, want kiro-ha distinct from provider %q", pluginID, providerName)
+	}
 }
 
 func TestErrorEnvelopePreservesHTTPStatus(t *testing.T) {
@@ -760,6 +765,28 @@ func TestParseRejectsIDCWhenRequiredProfileDiscoveryFails(t *testing.T) {
 	discover := func(context.Context, *kiroauth.KiroTokenData) error { return errors.New("forbidden") }
 	if err := reconcileParsedProfile(context.Background(), token, discover); err == nil {
 		t.Fatal("IDC credential without a discoverable profile was accepted")
+	}
+}
+
+func TestConfigurePluginReadsPluginIDSectionBeforeProviderSection(t *testing.T) {
+	// The host files the plugin's settings under plugins.configs.<plugin id>,
+	// which is the library name kiro-ha, while older configs used the provider
+	// name. Both must be read, and the id-keyed section wins when both exist.
+	original := pluginSettings
+	defer func() { pluginSettings = original }()
+	encode := func(yamlDoc string) []byte {
+		payload, _ := json.Marshal(map[string][]byte{"config_yaml": []byte(yamlDoc)})
+		return payload
+	}
+	pluginSettings = pluginSettingsData{DailyMaxRequests: 777, MinTokenInterval: "3s", MaxTokenInterval: "5s", SuspendCooldown: "2h"}
+	configurePlugin(encode("plugins:\n  configs:\n    kiro-ha:\n      daily_max_requests: 999\n    kiro:\n      daily_max_requests: 888\n"))
+	if pluginSettings.DailyMaxRequests != 999 || pluginSettings.SuspendCooldown != "2h" {
+		t.Fatalf("plugin-id section did not win: %#v", pluginSettings)
+	}
+	pluginSettings = pluginSettingsData{DailyMaxRequests: 777, MinTokenInterval: "3s", MaxTokenInterval: "5s", SuspendCooldown: "2h"}
+	configurePlugin(encode("outer:\n  kiro-ha:\n    suspend_cooldown: 6h\n"))
+	if pluginSettings.SuspendCooldown != "6h" || pluginSettings.DailyMaxRequests != 777 {
+		t.Fatalf("nested plugin-id section was not found: %#v", pluginSettings)
 	}
 }
 

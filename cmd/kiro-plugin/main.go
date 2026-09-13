@@ -74,8 +74,19 @@ import (
 )
 
 const (
+	// pluginID is the host's identity for this plugin: the shared-library file
+	// name without extension, the plugins.configs key and the prefix of every
+	// browser-navigable resource route. It deliberately differs from
+	// providerName because the official store already publishes a plugin with
+	// id "kiro", and a store install writes <id>.so, so sharing the id would let
+	// an unrelated install overwrite this binary in place.
+	pluginID = "kiro-ha"
+	// providerName is the executor/auth provider key: the credential type,
+	// the model owner and the key of oauth-model-alias and the like. It stays
+	// "kiro" so existing credential files and config stay valid.
 	providerName      = "kiro"
 	pluginDisplayName = "Kiro"
+	resourceBasePath  = "/v0/resource/plugins/" + pluginID
 	maxPages          = 10
 )
 
@@ -320,8 +331,11 @@ func configurePlugin(raw []byte) {
 			} `yaml:"plugins"`
 		}
 		if yaml.Unmarshal(req.ConfigYAML, &full) == nil {
-			if configured, ok := full.Plugins.Configs[providerName]; ok && !configured.isZero() {
-				next = mergePluginSettings(next, configured)
+			for _, key := range settingsKeys {
+				if configured, ok := full.Plugins.Configs[key]; ok && !configured.isZero() {
+					next = mergePluginSettings(next, configured)
+					break
+				}
 			}
 		}
 		var root map[string]any
@@ -359,6 +373,12 @@ func mergePluginSettings(base, update pluginSettingsData) pluginSettingsData {
 	return base
 }
 
+// settingsKeys are the plugins.configs keys this plugin reads its settings
+// from, most specific first: the plugin id the host actually files the
+// section under, then the provider name kept for configs written before the
+// id changed.
+var settingsKeys = []string{pluginID, providerName}
+
 // findKiroConfig locates this plugin's settings inside an arbitrarily shaped
 // host config document.
 //
@@ -369,8 +389,10 @@ func mergePluginSettings(base, update pluginSettingsData) pluginSettingsData {
 // restarts; the child keys are therefore visited in sorted order.
 func findKiroConfig(value any) (map[string]any, bool) {
 	if object, ok := value.(map[string]any); ok {
-		if kiro, ok := object["kiro"].(map[string]any); ok {
-			return kiro, true
+		for _, key := range settingsKeys {
+			if kiro, ok := object[key].(map[string]any); ok {
+				return kiro, true
+			}
 		}
 		keys := make([]string, 0, len(object))
 		for key := range object {
@@ -1871,7 +1893,7 @@ func handleManagement(raw []byte) ([]byte, error) {
 		return handleConnectAPI(req)
 	case "/v0/management/plugins/kiro/usage":
 		return handleUsagePage(req)
-	case "/v0/resource/plugins/kiro/capabilities":
+	case resourceBasePath + "/capabilities":
 		capabilities := modelcapabilities.Snapshot()
 		sort.Slice(capabilities, func(i, j int) bool { return capabilities[i].ModelID < capabilities[j].ModelID })
 		body, _ := json.Marshal(map[string]any{"provider": providerName, "models": capabilities})
@@ -1885,7 +1907,7 @@ func handleManagement(raw []byte) ([]byte, error) {
 			Body: body,
 		})
 	}
-	if req.Path == "/v0/resource/plugins/kiro"+usageResourcePath {
+	if req.Path == resourceBasePath+usageResourcePath {
 		return handleUsagePage(req)
 	}
 	return okEnvelope(pluginapi.ManagementResponse{StatusCode: http.StatusNotFound, Headers: http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}}, Body: []byte("Not found")})

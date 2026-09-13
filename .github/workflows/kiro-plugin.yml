@@ -65,18 +65,18 @@ jobs:
           $version = if ($env:GITHUB_REF -like 'refs/tags/v*') { $env:GITHUB_REF_NAME.TrimStart('v') } else { "dev-$($env:GITHUB_SHA.Substring(0,7))" }
           go build -trimpath -buildmode=c-shared `
             -ldflags "-X github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro.clientVersion=2.19.0 -X main.pluginVersion=$version" `
-            -o package/kiro.dll ./cmd/kiro-plugin
-          $hash = (Get-FileHash -Algorithm SHA256 package/kiro.dll).Hash.ToLowerInvariant()
-          "$hash  kiro.dll" | Set-Content -NoNewline -Encoding ascii package/kiro.dll.sha256
-          Compress-Archive -Path package/* -DestinationPath kiro-windows-amd64.zip
-          $archiveHash = (Get-FileHash -Algorithm SHA256 kiro-windows-amd64.zip).Hash.ToLowerInvariant()
-          "$archiveHash  kiro-windows-amd64.zip" | Set-Content -NoNewline -Encoding ascii kiro-windows-amd64.zip.sha256
+            -o package/kiro-ha.dll ./cmd/kiro-plugin
+          $hash = (Get-FileHash -Algorithm SHA256 package/kiro-ha.dll).Hash.ToLowerInvariant()
+          "$hash  kiro-ha.dll" | Set-Content -NoNewline -Encoding ascii package/kiro-ha.dll.sha256
+          Compress-Archive -Path package/* -DestinationPath kiro-ha-windows-amd64.zip
+          $archiveHash = (Get-FileHash -Algorithm SHA256 kiro-ha-windows-amd64.zip).Hash.ToLowerInvariant()
+          "$archiveHash  kiro-ha-windows-amd64.zip" | Set-Content -NoNewline -Encoding ascii kiro-ha-windows-amd64.zip.sha256
       - uses: actions/upload-artifact@v7
         with:
-          name: kiro-windows-amd64
+          name: kiro-ha-windows-amd64
           path: |
-            kiro-windows-amd64.zip
-            kiro-windows-amd64.zip.sha256
+            kiro-ha-windows-amd64.zip
+            kiro-ha-windows-amd64.zip.sha256
           if-no-files-found: error
 
   linux:
@@ -110,18 +110,18 @@ jobs:
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then version="${GITHUB_REF_NAME#v}"; fi
           go build -trimpath -buildmode=c-shared \
             -ldflags "-X github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro.clientVersion=2.19.0 -X main.pluginVersion=$version" \
-            -o package/kiro.so ./cmd/kiro-plugin
-          strings package/kiro.so | grep -Fq "$version"
-          nm -D package/kiro.so | grep -Fq 'cliproxy_plugin_init'
-          sha256sum package/kiro.so | sed 's#package/##' > package/kiro.so.sha256
-          tar -C package -czf "kiro-linux-${GOARCH}.tar.gz" kiro.so kiro.h kiro.so.sha256
-          sha256sum "kiro-linux-${GOARCH}.tar.gz" > "kiro-linux-${GOARCH}.tar.gz.sha256"
+            -o package/kiro-ha.so ./cmd/kiro-plugin
+          strings package/kiro-ha.so | grep -Fq "$version"
+          nm -D package/kiro-ha.so | grep -Fq 'cliproxy_plugin_init'
+          sha256sum package/kiro-ha.so | sed 's#package/##' > package/kiro-ha.so.sha256
+          tar -C package -czf "kiro-ha-linux-${GOARCH}.tar.gz" kiro-ha.so kiro-ha.h kiro-ha.so.sha256
+          sha256sum "kiro-ha-linux-${GOARCH}.tar.gz" > "kiro-ha-linux-${GOARCH}.tar.gz.sha256"
       - uses: actions/upload-artifact@v7
         with:
-          name: kiro-linux-${{ matrix.arch }}
+          name: kiro-ha-linux-${{ matrix.arch }}
           path: |
-            kiro-linux-${{ matrix.arch }}.tar.gz
-            kiro-linux-${{ matrix.arch }}.tar.gz.sha256
+            kiro-ha-linux-${{ matrix.arch }}.tar.gz
+            kiro-ha-linux-${{ matrix.arch }}.tar.gz.sha256
           if-no-files-found: error
 
   release:
@@ -133,7 +133,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v7
         with:
-          pattern: kiro-*
+          pattern: kiro-ha-*
           path: dist
           merge-multiple: true
       - name: Publish plugin release
