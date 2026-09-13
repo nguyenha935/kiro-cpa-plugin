@@ -1793,26 +1793,53 @@ func handleExecuteStream(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	if req.StreamID == "" {
-		chunks := make([]pluginapi.ExecutorStreamChunk, 0)
-		for chunk := range result.Chunks {
-			chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: chunk.Payload, Err: chunk.Err})
-		}
-		return okEnvelope(synchronousStreamResponse{Headers: result.Headers, Chunks: chunks})
+		return collectStream(result)
 	}
 	go pumpStream(req.StreamID, result.Chunks)
 	return okEnvelope(synchronousStreamResponse{Headers: result.Headers})
 }
 
+// collectStream serves hosts that open no stream bridge. ExecutorStreamChunk.Err
+// is an interface with no JSON tag, so an error cannot ride inside the chunk
+// array: the first error becomes the envelope error and the partial payload is
+// discarded, which is what the host would do with a truncated stream anyway.
+func collectStream(result *coreexec.StreamResult) ([]byte, error) {
+	chunks := make([]pluginapi.ExecutorStreamChunk, 0)
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			drainStream(result.Chunks)
+			return nil, chunk.Err
+		}
+		if len(chunk.Payload) > 0 {
+			chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: chunk.Payload})
+		}
+	}
+	return okEnvelope(synchronousStreamResponse{Headers: result.Headers, Chunks: chunks})
+}
+
+// pumpStream forwards executor chunks to the host bridge. The executor goroutine
+// sends on an unbuffered channel and only closes the upstream body once it
+// finishes, so every exit path must keep receiving until the channel closes:
+// returning early would park that goroutine and its connection for good.
 func pumpStream(streamID string, chunks <-chan coreexec.StreamChunk) {
-	defer streamClose(streamID)
+	var streamErr error
+	defer func() {
+		drainStream(chunks)
+		streamClose(streamID, streamErr)
+	}()
 	for chunk := range chunks {
 		if chunk.Err != nil {
-			streamEmitError(streamID, chunk.Err.Error())
+			streamErr = chunk.Err
 			return
 		}
 		if len(chunk.Payload) > 0 && streamEmit(streamID, chunk.Payload) != nil {
 			return
 		}
+	}
+}
+
+func drainStream(chunks <-chan coreexec.StreamChunk) {
+	for range chunks {
 	}
 }
 
@@ -1913,20 +1940,34 @@ func hostCall(method string, request []byte) ([]byte, error) {
 	return out, nil
 }
 
+// hostStreamMessage mirrors the host's stream.emit and stream.close request
+// shapes. The host reads a stream error only from the top-level "error" field;
+// anything placed in "payload" is delivered to the client as ordinary bytes.
+type hostStreamMessage struct {
+	StreamID string `json:"stream_id"`
+	Payload  []byte `json:"payload,omitempty"`
+	Error    string `json:"error,omitempty"`
+}
+
+// streamHostCall is swapped by tests that drive pumpStream without a host.
+var streamHostCall = hostCall
+
 func streamEmit(streamID string, payload []byte) error {
-	body, _ := json.Marshal(map[string]any{"stream_id": streamID, "payload": payload})
-	_, err := hostCall(pluginabi.MethodHostStreamEmit, body)
+	body, _ := json.Marshal(hostStreamMessage{StreamID: streamID, Payload: payload})
+	_, err := streamHostCall(pluginabi.MethodHostStreamEmit, body)
 	return err
 }
 
-func streamEmitError(streamID, message string) {
-	payload, _ := json.Marshal(map[string]any{"error": map[string]any{"message": message}})
-	_ = streamEmit(streamID, payload)
-}
-
-func streamClose(streamID string) {
-	body, _ := json.Marshal(map[string]any{"stream_id": streamID})
-	_, _ = hostCall(pluginabi.MethodHostStreamClose, body)
+// streamClose ends the host stream. A non-nil err is queued by the host as a
+// terminal error chunk after every payload already emitted, so the client sees
+// the failure and the host records it against the credential.
+func streamClose(streamID string, err error) {
+	message := hostStreamMessage{StreamID: streamID}
+	if err != nil {
+		message.Error = err.Error()
+	}
+	body, _ := json.Marshal(message)
+	_, _ = streamHostCall(pluginabi.MethodHostStreamClose, body)
 }
 
 func defaultString(value, fallback string) string {
