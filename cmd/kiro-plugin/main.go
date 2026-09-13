@@ -136,10 +136,11 @@ type envelope struct {
 }
 
 type envelopeError struct {
-	Code       string `json:"code"`
-	Message    string `json:"message"`
-	Retryable  bool   `json:"retryable,omitempty"`
-	HTTPStatus int    `json:"http_status,omitempty"`
+	Code         string `json:"code"`
+	Message      string `json:"message"`
+	Retryable    bool   `json:"retryable,omitempty"`
+	HTTPStatus   int    `json:"http_status,omitempty"`
+	RetryAfterMS int64  `json:"retry_after_ms,omitempty"`
 }
 
 type registration struct {
@@ -359,14 +360,10 @@ func configurePlugin(raw []byte) {
 }
 
 // mergePluginSettings overlays only the fields the host actually set, treating
-// a zero value as "not configured". Two consequences are deliberate:
-// daily_max_requests cannot be set to 0 through config (0 means unlimited via
-// the default), and removing a key from config.yaml does not revert the setting
-// until the process restarts, because nothing in the update says to clear it.
+// an empty value as "not configured". One consequence is deliberate: removing a
+// key from config.yaml does not revert the setting until the process restarts,
+// because nothing in the update says to clear it.
 func mergePluginSettings(base, update pluginSettingsData) pluginSettingsData {
-	if update.DailyMaxRequests != 0 {
-		base.DailyMaxRequests = update.DailyMaxRequests
-	}
 	if update.MinTokenInterval != "" {
 		base.MinTokenInterval = update.MinTokenInterval
 	}
@@ -2029,11 +2026,22 @@ func errorEnvelopeFromError(err error) []byte {
 	if errors.As(err, &statusError) {
 		status = statusError.StatusCode()
 	}
+	// The host's rpcError (7.2.151) does not read retry_after_ms yet; the field
+	// is emitted so a host that learns it can honor the plugin's window instead
+	// of starting its own backoff ladder at one second.
+	var retryAfterMS int64
+	var retryAfterError interface{ RetryAfter() *time.Duration }
+	if errors.As(err, &retryAfterError) {
+		if retryAfter := retryAfterError.RetryAfter(); retryAfter != nil && *retryAfter > 0 {
+			retryAfterMS = retryAfter.Milliseconds()
+		}
+	}
 	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{
-		Code:       "plugin_error",
-		Message:    err.Error(),
-		Retryable:  status == http.StatusTooManyRequests || status >= http.StatusInternalServerError,
-		HTTPStatus: status,
+		Code:         "plugin_error",
+		Message:      err.Error(),
+		Retryable:    status == http.StatusTooManyRequests || status >= http.StatusInternalServerError,
+		HTTPStatus:   status,
+		RetryAfterMS: retryAfterMS,
 	}})
 	return raw
 }

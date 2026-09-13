@@ -8,19 +8,17 @@ import (
 )
 
 type pluginSettingsData struct {
-	DailyMaxRequests int    `yaml:"daily_max_requests"`
 	MinTokenInterval string `yaml:"min_token_interval"`
 	MaxTokenInterval string `yaml:"max_token_interval"`
 	SuspendCooldown  string `yaml:"suspend_cooldown"`
 }
 
 func (s pluginSettingsData) isZero() bool {
-	return s.DailyMaxRequests == 0 && s.MinTokenInterval == "" && s.MaxTokenInterval == "" && s.SuspendCooldown == ""
+	return s.MinTokenInterval == "" && s.MaxTokenInterval == "" && s.SuspendCooldown == ""
 }
 
 func defaultPluginSettings() pluginSettingsData {
 	return pluginSettingsData{
-		DailyMaxRequests: kiroauth.DefaultDailyMaxRequests,
 		MinTokenInterval: kiroauth.DefaultMinTokenInterval.String(),
 		MaxTokenInterval: kiroauth.DefaultMaxTokenInterval.String(),
 		SuspendCooldown:  kiroauth.DefaultSuspendCooldown.String(),
@@ -29,9 +27,6 @@ func defaultPluginSettings() pluginSettingsData {
 
 func (s pluginSettingsData) normalized() pluginSettingsData {
 	defaults := defaultPluginSettings()
-	if s.DailyMaxRequests <= 0 {
-		s.DailyMaxRequests = defaults.DailyMaxRequests
-	}
 	minInterval, minErr := time.ParseDuration(s.MinTokenInterval)
 	if minErr != nil || minInterval <= 0 {
 		s.MinTokenInterval = defaults.MinTokenInterval
@@ -54,7 +49,6 @@ func (s pluginSettingsData) rateLimiterConfig() kiroauth.RateLimiterConfig {
 	maxInterval, _ := time.ParseDuration(s.MaxTokenInterval)
 	suspendCooldown, _ := time.ParseDuration(s.SuspendCooldown)
 	return kiroauth.RateLimiterConfig{
-		DailyMaxRequests: s.DailyMaxRequests,
 		MinTokenInterval: minInterval,
 		MaxTokenInterval: maxInterval,
 		SuspendCooldown:  suspendCooldown,
@@ -63,9 +57,8 @@ func (s pluginSettingsData) rateLimiterConfig() kiroauth.RateLimiterConfig {
 
 func pluginConfigFields() []pluginapi.ConfigField {
 	return []pluginapi.ConfigField{
-		{Name: "daily_max_requests", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum requests per Kiro credential per day. Default: 500."},
 		{Name: "min_token_interval", Type: pluginapi.ConfigFieldTypeString, Description: "Minimum delay between requests for one credential. Default: 1s."},
 		{Name: "max_token_interval", Type: pluginapi.ConfigFieldTypeString, Description: "Maximum jittered delay between requests for one credential. Default: 2s."},
-		{Name: "suspend_cooldown", Type: pluginapi.ConfigFieldTypeString, Description: "Protection cooldown after a suspension signal. Default: 1h."},
+		{Name: "suspend_cooldown", Type: pluginapi.ConfigFieldTypeString, Description: "How long a credential stays out of rotation after Kiro reports it suspended. Default: 1h."},
 	}
 }

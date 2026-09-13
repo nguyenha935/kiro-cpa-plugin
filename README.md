@@ -63,7 +63,7 @@ Builder ID and IAM Identity Center use Kiro CLI's remote device flow, so they al
 
 The plugin stores credentials through the CLIProxyAPI authentication mechanism. Do not put passwords, management keys, access tokens, refresh tokens, or client secrets in the configuration or repository.
 
-Kiro's account-protection limiter is independent from CPA scheduler cooldown. CPA remains responsible for selecting credentials and round-robin failover; Kiro returns status-aware errors (429/403/401) so CPA can move to another account.
+CPA owns credential selection, failover and the 429 backoff ladder; the plugin returns status-aware errors (429/403/401) and forwards an upstream `Retry-After` when Kiro sends one. The plugin keeps only the protection CPA cannot provide: it paces requests per credential (`min_token_interval`/`max_token_interval`, default 1–2s with jitter), remembers a 402 monthly limit until the next UTC day, and takes a credential Kiro reports as suspended out of rotation for `suspend_cooldown` (default 1h). These settings live under `plugins.configs.kiro-ha`; a credential with `disable_cooling: true` opts out of all of them.
 
 ## Model capabilities
 
