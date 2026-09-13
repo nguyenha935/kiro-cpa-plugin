@@ -228,6 +228,12 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
 		configurePlugin(request)
 		return okEnvelope(pluginRegistration())
+	case pluginabi.MethodPluginQuiesce, pluginabi.MethodPluginShutdown:
+		// Hot reload announces the replacement to the outgoing library, and the
+		// host waits out in-flight calls itself before the C shutdown export
+		// severs the host API. The plugin keeps no state worth winding down, so
+		// an acknowledgement is the whole contract.
+		return okEnvelope(struct{}{})
 	case pluginabi.MethodModelStatic:
 		// File-backed credentials supply their own catalog through model.for_auth.
 		// Keep the ABI response valid without advertising unauthenticated models.

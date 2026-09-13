@@ -19,6 +19,7 @@ import (
 
 	kiroauth "github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
@@ -338,6 +339,35 @@ func TestPluginUsesKiroDisplayNameAndStableProviderID(t *testing.T) {
 	// a store install writes <id>.so and would overwrite this binary in place.
 	if pluginID != "kiro-ha" || pluginID == providerName {
 		t.Fatalf("plugin ID = %q, want kiro-ha distinct from provider %q", pluginID, providerName)
+	}
+}
+
+func TestLifecycleMethodsAreAcknowledged(t *testing.T) {
+	// Hot reload sends plugin.quiesce to the outgoing library and treats an
+	// unknown method as "quiesce unsupported"; both lifecycle methods must
+	// answer with an ok envelope and an empty result.
+	for _, method := range []string{pluginabi.MethodPluginQuiesce, pluginabi.MethodPluginShutdown} {
+		raw, err := handleMethod(method, []byte(`{}`))
+		if err != nil {
+			t.Fatalf("%s: %v", method, err)
+		}
+		var decoded envelope
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		if !decoded.OK || decoded.Error != nil || string(decoded.Result) != `{}` {
+			t.Fatalf("%s envelope = %s", method, raw)
+		}
+	}
+	// request.complete is only delivered to plugins advertising the request
+	// lifecycle capability, which this plugin does not; it stays unknown.
+	raw, _ := handleMethod(pluginabi.MethodRequestComplete, []byte(`{}`))
+	var decoded envelope
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.OK || decoded.Error == nil || decoded.Error.Code != "unknown_method" {
+		t.Fatalf("request.complete envelope = %s", raw)
 	}
 }
 
