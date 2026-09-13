@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
@@ -415,18 +414,13 @@ func carryHostOwnedFields(from *kiroauth.KiroTokenData, to *kiroauth.KiroTokenDa
 
 func refreshKiroCredentialTransport(ctx context.Context, token *kiroauth.KiroTokenData) (*kiroauth.KiroTokenData, error) {
 	if token != nil && strings.EqualFold(token.AuthMethod, "social") {
-		return refreshSocialCredential(ctx, token)
+		if strings.TrimSpace(token.RefreshToken) == "" {
+			return nil, pluginStatusError{status: http.StatusUnauthorized, message: "Kiro social refresh token is missing"}
+		}
+		return refreshDesktopCredential(ctx, token, "social")
 	}
 	if isDesktopImportedCredential(token) {
-		refreshed, err := desktopTokenRefresher(ctx, token.RefreshToken, token.Region)
-		if err != nil {
-			return nil, err
-		}
-		refreshed.AuthMethod, refreshed.Provider = "imported", token.Provider
-		if refreshed.ProfileArn == "" {
-			refreshed.ProfileArn = token.ProfileArn
-		}
-		return refreshed, nil
+		return refreshDesktopCredential(ctx, token, "imported")
 	}
 	if token != nil && strings.EqualFold(token.AuthMethod, "api_key") {
 		return token, nil
@@ -486,63 +480,24 @@ func isDesktopImportedCredential(token *kiroauth.KiroTokenData) bool {
 		strings.TrimSpace(token.ClientSecret) == ""
 }
 
-func refreshSocialCredential(ctx context.Context, token *kiroauth.KiroTokenData) (*kiroauth.KiroTokenData, error) {
-	if token == nil || strings.TrimSpace(token.RefreshToken) == "" {
-		return nil, pluginStatusError{status: http.StatusUnauthorized, message: "Kiro social refresh token is missing"}
-	}
-	region := strings.TrimSpace(token.Region)
-	if region == "" {
-		region = "us-east-1"
-	}
-	if err := validateRegion(region); err != nil {
-		return nil, err
-	}
-	payload, err := json.Marshal(map[string]string{"refreshToken": token.RefreshToken})
+// refreshDesktopCredential rotates a Kiro desktop credential (social login or
+// imported refresh token) and keeps every stored field the auth service does
+// not return. method is fixed by the caller because it is what routes the next
+// refresh back here instead of to AWS SSO OIDC.
+func refreshDesktopCredential(ctx context.Context, token *kiroauth.KiroTokenData, method string) (*kiroauth.KiroTokenData, error) {
+	rotated, err := desktopTokenRefresher(ctx, token.RefreshToken, token.Region)
 	if err != nil {
 		return nil, err
-	}
-	endpoint := "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
-	if err != nil {
-		return nil, pluginStatusError{status: http.StatusBadGateway, message: "refresh Kiro social token: " + err.Error()}
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, pluginStatusError{status: http.StatusBadGateway, message: "read Kiro social refresh response"}
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		status := resp.StatusCode
-		if status == http.StatusBadRequest || status == http.StatusForbidden {
-			status = http.StatusUnauthorized
-		}
-		return nil, pluginStatusError{status: status, message: fmt.Sprintf("Kiro social refresh returned HTTP %d", resp.StatusCode)}
-	}
-	var result struct {
-		AccessToken  string `json:"accessToken"`
-		RefreshToken string `json:"refreshToken"`
-		ExpiresIn    int    `json:"expiresIn"`
-	}
-	if err := json.Unmarshal(body, &result); err != nil || strings.TrimSpace(result.AccessToken) == "" {
-		return nil, pluginStatusError{status: http.StatusBadGateway, message: "Kiro social refresh returned invalid token"}
-	}
-	if result.RefreshToken == "" {
-		result.RefreshToken = token.RefreshToken
-	}
-	if result.ExpiresIn <= 0 {
-		result.ExpiresIn = 3600
 	}
 	refreshed := *token
-	refreshed.AccessToken = result.AccessToken
-	refreshed.RefreshToken = result.RefreshToken
-	refreshed.ExpiresAt = time.Now().UTC().Add(time.Duration(result.ExpiresIn) * time.Second).Format(time.RFC3339)
-	refreshed.Region = region
-	refreshed.AuthMethod = "social"
+	refreshed.AccessToken, refreshed.RefreshToken, refreshed.ExpiresAt = rotated.AccessToken, rotated.RefreshToken, rotated.ExpiresAt
+	refreshed.AuthMethod = method
+	if rotated.Region != "" {
+		refreshed.Region = rotated.Region
+	}
+	if rotated.ProfileArn != "" {
+		refreshed.ProfileArn = rotated.ProfileArn
+	}
 	return &refreshed, nil
 }
 

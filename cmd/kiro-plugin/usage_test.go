@@ -195,6 +195,41 @@ func TestRefreshExternalIDPSendsConfidentialClientSecret(t *testing.T) {
 	}
 }
 
+// Social logins and imported desktop tokens share one auth service. The
+// transport hands back token material only, so every routing field a social
+// credential was stored with must come through untouched.
+func TestRefreshSocialCredentialUsesKiroAuthServiceAndKeepsStoredFields(t *testing.T) {
+	originalRefresher := desktopTokenRefresher
+	desktopTokenRefresher = func(_ context.Context, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
+		if refreshToken != "social-refresh" || region != "eu-west-1" {
+			t.Fatalf("desktop refresh input = %q/%q", refreshToken, region)
+		}
+		return &kiroauth.KiroTokenData{AccessToken: "new-access", RefreshToken: "rotated", ExpiresAt: time.Now().UTC().Add(time.Hour).Format(time.RFC3339), Region: region}, nil
+	}
+	t.Cleanup(func() { desktopTokenRefresher = originalRefresher })
+
+	token := &kiroauth.KiroTokenData{
+		AccessToken: "old-access", RefreshToken: "social-refresh", AuthMethod: "social",
+		Provider: "Google", Region: "eu-west-1", ProfileArn: "arn:profile", Email: "owner@example.test", Priority: 3,
+	}
+	refreshed, err := refreshKiroCredential(context.Background(), token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.AccessToken != "new-access" || refreshed.RefreshToken != "rotated" {
+		t.Fatalf("token material was not rotated: %+v", refreshed)
+	}
+	if refreshed.AuthMethod != "social" || refreshed.Provider != "Google" || refreshed.ProfileArn != "arn:profile" || refreshed.Email != "owner@example.test" || refreshed.Priority != 3 {
+		t.Fatalf("stored fields were lost: %+v", refreshed)
+	}
+
+	_, err = refreshKiroCredential(context.Background(), &kiroauth.KiroTokenData{AuthMethod: "social", Region: "eu-west-1"})
+	var status interface{ StatusCode() int }
+	if !errors.As(err, &status) || status.StatusCode() != http.StatusUnauthorized {
+		t.Fatalf("missing social refresh token error = %T %v, want 401", err, err)
+	}
+}
+
 func TestRefreshImportedDesktopCredentialUsesKiroAuthService(t *testing.T) {
 	originalRefresher := desktopTokenRefresher
 	desktopTokenRefresher = func(_ context.Context, refreshToken, region string) (*kiroauth.KiroTokenData, error) {

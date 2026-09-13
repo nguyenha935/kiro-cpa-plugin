@@ -317,55 +317,7 @@ func importRefreshToken(ctx context.Context, values url.Values) (*kiroauth.KiroT
 }
 
 func refreshDesktopToken(ctx context.Context, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
-	payload, err := json.Marshal(map[string]string{"refreshToken": refreshToken})
-	if err != nil {
-		return nil, err
-	}
-	// The desktop auth service is hosted in us-east-1 regardless of the
-	// account's IDC/API region (same contract used by the Kiro IDE and 9router).
-	endpoint := "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(payload)))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
-	if err != nil {
-		return nil, pluginStatusError{status: http.StatusBadGateway, message: "refresh Kiro desktop token: " + err.Error()}
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, pluginStatusError{status: http.StatusBadGateway, message: "read Kiro desktop refresh response"}
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		status := resp.StatusCode
-		if status == http.StatusBadRequest || status == http.StatusForbidden {
-			status = http.StatusUnauthorized
-		}
-		return nil, pluginStatusError{status: status, message: fmt.Sprintf("Kiro desktop refresh returned HTTP %d", resp.StatusCode)}
-	}
-	var result struct {
-		AccessToken  string `json:"accessToken"`
-		RefreshToken string `json:"refreshToken"`
-		ProfileArn   string `json:"profileArn"`
-		ExpiresIn    int    `json:"expiresIn"`
-	}
-	if err := json.Unmarshal(body, &result); err != nil || strings.TrimSpace(result.AccessToken) == "" {
-		return nil, pluginStatusError{status: http.StatusBadGateway, message: "Kiro desktop refresh returned invalid token"}
-	}
-	if result.RefreshToken == "" {
-		result.RefreshToken = refreshToken
-	}
-	if result.ExpiresIn <= 0 {
-		result.ExpiresIn = 3600
-	}
-	return &kiroauth.KiroTokenData{
-		AccessToken: result.AccessToken, RefreshToken: result.RefreshToken, ProfileArn: result.ProfileArn,
-		ExpiresAt: time.Now().UTC().Add(time.Duration(result.ExpiresIn) * time.Second).Format(time.RFC3339),
-		Region:    region,
-	}, nil
+	return kiroauth.NewSSOOIDCClient(pluginConfig).RefreshDesktopToken(ctx, refreshToken, region)
 }
 
 type externalIDPJSON struct {

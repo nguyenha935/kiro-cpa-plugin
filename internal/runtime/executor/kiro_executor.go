@@ -3231,57 +3231,13 @@ func (e *KiroExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
 	// no AWS device registration. Parenthesised because the two arms are not
 	// interchangeable and precedence alone is easy to misread.
 	if authMethod == "social" || (authMethod == "imported" && clientID == "" && clientSecret == "") {
-		if region == "" {
-			region = kiroDefaultRegion
+		tokenData, err = ssoClient.RefreshDesktopToken(ctx, refreshToken, region)
+		if tokenData != nil {
+			tokenData.AuthMethod, tokenData.Provider = authMethod, "CLIProxyAPI"
+			if tokenData.ProfileArn == "" {
+				tokenData.ProfileArn, _ = auth.Metadata["profile_arn"].(string)
+			}
 		}
-		// The desktop auth service is fixed in us-east-1, so the region is not
-		// part of this URL; it is still validated because it is written back into
-		// the credential's metadata and later reaches URL-building paths.
-		if _, regionErr := kiroroute.ValidateRegion(region); regionErr != nil {
-			return nil, statusErr{code: http.StatusBadRequest, msg: "kiro executor: " + regionErr.Error()}
-		}
-		endpoint := "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken"
-		payload, marshalErr := json.Marshal(map[string]string{"refreshToken": refreshToken})
-		if marshalErr != nil {
-			return nil, marshalErr
-		}
-		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
-		if reqErr != nil {
-			return nil, reqErr
-		}
-		req.Header.Set("Content-Type", "application/json")
-		response, doErr := (&http.Client{Timeout: 30 * time.Second}).Do(req)
-		if doErr != nil {
-			return nil, normalizeTransportError(doErr)
-		}
-		defer response.Body.Close()
-		body, readErr := io.ReadAll(io.LimitReader(response.Body, 1<<20))
-		if readErr != nil {
-			return nil, normalizeTransportError(readErr)
-		}
-		if response.StatusCode < 200 || response.StatusCode >= 300 {
-			return nil, statusErr{code: response.StatusCode, msg: fmt.Sprintf("kiro social refresh returned HTTP %d", response.StatusCode)}
-		}
-		var payloadResp struct {
-			AccessToken  string `json:"accessToken"`
-			RefreshToken string `json:"refreshToken"`
-			ProfileArn   string `json:"profileArn"`
-			ExpiresIn    int    `json:"expiresIn"`
-		}
-		if json.Unmarshal(body, &payloadResp) != nil || payloadResp.AccessToken == "" {
-			return nil, statusErr{code: http.StatusBadGateway, msg: "kiro social refresh returned invalid token"}
-		}
-		if payloadResp.RefreshToken == "" {
-			payloadResp.RefreshToken = refreshToken
-		}
-		if payloadResp.ExpiresIn <= 0 {
-			payloadResp.ExpiresIn = 3600
-		}
-		profileArn, _ := auth.Metadata["profile_arn"].(string)
-		if payloadResp.ProfileArn != "" {
-			profileArn = payloadResp.ProfileArn
-		}
-		tokenData = &kiroauth.KiroTokenData{AccessToken: payloadResp.AccessToken, RefreshToken: payloadResp.RefreshToken, ProfileArn: profileArn, ExpiresAt: time.Now().UTC().Add(time.Duration(payloadResp.ExpiresIn) * time.Second).Format(time.RFC3339), AuthMethod: authMethod, Provider: "CLIProxyAPI", Region: region}
 	} else if authMethod == "external_idp" {
 		endpoint, _ := auth.Metadata["token_endpoint"].(string)
 		scopes, _ := auth.Metadata["scopes"].(string)
