@@ -75,20 +75,29 @@ func TestManagementRegistrationAndIncorrectResourcePath(t *testing.T) {
 	if !found {
 		t.Fatalf("Kiro Usage resource was not registered at the process capability path: %+v", registration.Resources)
 	}
-	request, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodGet, Path: "/v0/resource/plugins/kiro" + usageResourcePath + "x"})
-	responseRaw, err := handleManagement(request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := json.Unmarshal(responseRaw, &envelope); err != nil {
-		t.Fatal(err)
-	}
-	var response pluginapi.ManagementResponse
-	if err := json.Unmarshal(envelope.Result, &response); err != nil {
-		t.Fatal(err)
-	}
-	if response.StatusCode != http.StatusNotFound {
-		t.Fatalf("incorrect resource path returned HTTP %d", response.StatusCode)
+	// The host prefixes resource routes with its own id for the plugin, which is
+	// the shared-library name, not the provider name.
+	for path, want := range map[string]int{
+		resourceBasePath + usageResourcePath + "x":      http.StatusNotFound,
+		"/v0/resource/plugins/kiro" + usageResourcePath: http.StatusNotFound,
+		"/v0/resource/plugins/kiro/capabilities":        http.StatusNotFound,
+		resourceBasePath + "/capabilities":              http.StatusOK,
+	} {
+		request, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodGet, Path: path})
+		responseRaw, err := handleManagement(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(responseRaw, &envelope); err != nil {
+			t.Fatal(err)
+		}
+		var response pluginapi.ManagementResponse
+		if err := json.Unmarshal(envelope.Result, &response); err != nil {
+			t.Fatal(err)
+		}
+		if response.StatusCode != want {
+			t.Fatalf("%s returned HTTP %d, want %d", path, response.StatusCode, want)
+		}
 	}
 }
 

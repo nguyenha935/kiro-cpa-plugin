@@ -32,23 +32,25 @@ The plugin:
 go test ./...
 go vet ./...
 New-Item -ItemType Directory -Force dist | Out-Null
-go build -trimpath -buildmode=c-shared -o dist/kiro.dll ./cmd/kiro-plugin
-$hash = (Get-FileHash dist/kiro.dll -Algorithm SHA256).Hash.ToLowerInvariant()
-"$hash  kiro.dll" | Set-Content -NoNewline -Encoding ascii dist/kiro.dll.sha256
+go build -trimpath -buildmode=c-shared -o dist/kiro-ha.dll ./cmd/kiro-plugin
+$hash = (Get-FileHash dist/kiro-ha.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+"$hash  kiro-ha.dll" | Set-Content -NoNewline -Encoding ascii dist/kiro-ha.dll.sha256
 ```
 
-The GitHub Actions workflow tests Windows and Linux, then publishes archives for Windows amd64, Linux amd64, and Linux arm64. Each archive and plugin binary has a SHA-256 checksum. Linux packages contain `kiro.so`; Windows packages contain `kiro.dll`.
+The GitHub Actions workflow tests Windows and Linux, then publishes archives for Windows amd64, Linux amd64, and Linux arm64. Each archive and plugin binary has a SHA-256 checksum. Linux packages contain `kiro-ha.so`; Windows packages contain `kiro-ha.dll`.
+
+The library is named `kiro-ha` because CLIProxyAPI derives the plugin ID from the file name and the official plugin store already publishes a plugin with ID `kiro`. Keeping a distinct ID means a store install of that plugin cannot overwrite this binary. The provider name stays `kiro`, so credential files, `oauth-model-alias` and `oauth-excluded-models` entries are unchanged.
 
 ## Install
 
-Stop CLIProxyAPI before replacing the plugin. Back up the existing binary and configuration, then copy `kiro.dll` on Windows or `kiro.so` on Linux to the configured plugin directory.
+Stop CLIProxyAPI before replacing the plugin. Back up the existing binary and configuration, then copy `kiro-ha.dll` on Windows or `kiro-ha.so` on Linux to the configured plugin directory. When upgrading from a build named `kiro.so`, move the old file out of the plugin directory first: two libraries registering the same provider are both loaded and the later one silently wins.
 
 ```yaml
 plugins:
   enabled: true
   dir: plugins
   configs:
-    kiro:
+    kiro-ha:
       enabled: true
       priority: 1
 ```
@@ -67,7 +69,7 @@ Kiro's account-protection limiter is independent from CPA scheduler cooldown. CP
 
 Reasoning controls are advertised only when the authenticated account's Kiro model schema declares an `effort` enum. Claude models currently use `additionalModelRequestFields.output_config.effort`; GPT models use `additionalModelRequestFields.reasoning.effort`. The plugin forwards the selected level through that declared path for OpenAI Responses, Chat Completions, and Anthropic Messages.
 
-The loopback resource `/v0/resource/plugins/kiro/capabilities` exposes only the intersection of non-secret model capability metadata discovered for the connected accounts. Local catalog synchronizers can use it instead of maintaining guessed model lists. It contains no account identifiers, profile ARNs, tokens, or quota data.
+The loopback resource `/v0/resource/plugins/kiro-ha/capabilities` exposes only the intersection of non-secret model capability metadata discovered for the connected accounts. Local catalog synchronizers can use it instead of maintaining guessed model lists. It contains no account identifiers, profile ARNs, tokens, or quota data.
 
 ## Kiro Usage
 
