@@ -2,6 +2,11 @@ name: Kiro plugin
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v* tag to build and release (leave empty for a dev build of the selected ref)
+        required: false
+        default: ""
   push:
     branches: [main]
     tags: ["v*"]
@@ -19,6 +24,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
@@ -46,37 +53,54 @@ jobs:
             throw 'Potential secret found in tracked files.'
           }
 
-  # Build jobs upload straight into a draft release instead of going through
-  # actions/upload-artifact, so the account's artifact storage quota never
-  # blocks a release. The draft is published only after every target uploaded.
+  # Release assets go straight to a draft GitHub release instead of through
+  # actions/upload-artifact, so the account's artifact storage quota can never
+  # block a release. The draft is published only after every target uploaded.
+  # A tag push releases that tag; workflow_dispatch with `tag` releases an
+  # existing tag without moving it.
   prepare-release:
-    if: startsWith(github.ref, 'refs/tags/v')
     needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
     steps:
+      - id: resolve
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          tag=""
+          if [[ -n "$INPUT_TAG" ]]; then tag="$INPUT_TAG"; fi
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then tag="$GITHUB_REF_NAME"; fi
+          if [[ -n "$tag" && "$tag" != v* ]]; then echo "tag must start with v: $tag" >&2; exit 1; fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
       - name: Create draft release
+        if: steps.resolve.outputs.tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.resolve.outputs.tag }}
         run: |
-          if ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$GITHUB_REF_NAME" \
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --draft \
               --verify-tag \
-              --title "Kiro plugin $GITHUB_REF_NAME" \
+              --title "Kiro plugin $TAG" \
               --generate-notes
           fi
 
   windows-amd64:
-    needs: [test, prepare-release]
-    if: ${{ !cancelled() && needs.test.result == 'success' && needs.prepare-release.result != 'failure' }}
+    needs: prepare-release
     runs-on: windows-latest
     permissions:
       contents: write
+    env:
+      RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
@@ -88,7 +112,7 @@ jobs:
           $env:GOOS = 'windows'
           $env:GOARCH = 'amd64'
           $env:CGO_ENABLED = '1'
-          $version = if ($env:GITHUB_REF -like 'refs/tags/v*') { $env:GITHUB_REF_NAME.TrimStart('v') } else { "dev-$($env:GITHUB_SHA.Substring(0,7))" }
+          $version = if ($env:RELEASE_TAG) { $env:RELEASE_TAG.TrimStart('v') } else { "dev-$((git rev-parse HEAD).Substring(0,7))" }
           go build -trimpath -buildmode=c-shared `
             -ldflags "-X github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro.clientVersion=2.19.0 -X main.pluginVersion=$version" `
             -o package/kiro-ha.dll ./cmd/kiro-plugin
@@ -98,15 +122,14 @@ jobs:
           $archiveHash = (Get-FileHash -Algorithm SHA256 kiro-ha-windows-amd64.zip).Hash.ToLowerInvariant()
           "$archiveHash  kiro-ha-windows-amd64.zip" | Set-Content -NoNewline -Encoding ascii kiro-ha-windows-amd64.zip.sha256
       - name: Upload release assets
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: env.RELEASE_TAG != ''
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload $env:GITHUB_REF_NAME kiro-ha-windows-amd64.zip kiro-ha-windows-amd64.zip.sha256 --repo $env:GITHUB_REPOSITORY --clobber
+        run: gh release upload $env:RELEASE_TAG kiro-ha-windows-amd64.zip kiro-ha-windows-amd64.zip.sha256 --repo $env:GITHUB_REPOSITORY --clobber
 
   linux:
-    needs: [test, prepare-release]
-    if: ${{ !cancelled() && needs.test.result == 'success' && needs.prepare-release.result != 'failure' }}
+    needs: prepare-release
     strategy:
       matrix:
         include:
@@ -117,8 +140,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
@@ -134,8 +161,8 @@ jobs:
           CC: ${{ matrix.cc }}
         run: |
           mkdir -p package
-          version="dev-${GITHUB_SHA::7}"
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then version="${GITHUB_REF_NAME#v}"; fi
+          version="dev-$(git rev-parse --short=7 HEAD)"
+          if [[ -n "$RELEASE_TAG" ]]; then version="${RELEASE_TAG#v}"; fi
           go build -trimpath -buildmode=c-shared \
             -ldflags "-X github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro.clientVersion=2.19.0 -X main.pluginVersion=$version" \
             -o package/kiro-ha.so ./cmd/kiro-plugin
@@ -145,14 +172,14 @@ jobs:
           tar -C package -czf "kiro-ha-linux-${GOARCH}.tar.gz" kiro-ha.so kiro-ha.h kiro-ha.so.sha256
           sha256sum "kiro-ha-linux-${GOARCH}.tar.gz" > "kiro-ha-linux-${GOARCH}.tar.gz.sha256"
       - name: Upload release assets
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: env.RELEASE_TAG != ''
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$GITHUB_REF_NAME" "kiro-ha-linux-${{ matrix.arch }}.tar.gz" "kiro-ha-linux-${{ matrix.arch }}.tar.gz.sha256" --repo "$GITHUB_REPOSITORY" --clobber
+        run: gh release upload "$RELEASE_TAG" "kiro-ha-linux-${{ matrix.arch }}.tar.gz" "kiro-ha-linux-${{ matrix.arch }}.tar.gz.sha256" --repo "$GITHUB_REPOSITORY" --clobber
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [windows-amd64, linux]
+    if: needs.prepare-release.outputs.tag != ''
+    needs: [prepare-release, windows-amd64, linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -160,4 +187,5 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
