@@ -122,6 +122,10 @@ func TestIdentityCenterProfileIsSentUpstream(t *testing.T) {
 	}
 }
 
+// A credential without a profile ARN is served profileless, the way the Kiro
+// CLI itself serves Builder ID logins. Substituting a placeholder ARN from an
+// unrelated AWS account would label the request as that account's, so no
+// credential type ever gets one invented for it.
 func TestGenerateProfileContractMatchesCredentialType(t *testing.T) {
 	const accountProfile = "arn:aws:codewhisperer:eu-west-1:123456789012:profile/account"
 	tests := []struct {
@@ -129,8 +133,9 @@ func TestGenerateProfileContractMatchesCredentialType(t *testing.T) {
 		stored   string
 		expected string
 	}{
-		{method: "builder-id", expected: kiroBuilderIDProfileARN},
-		{method: "social", expected: kiroSocialProfileARN},
+		{method: "builder-id", expected: ""},
+		{method: "social", expected: ""},
+		{method: "social", stored: accountProfile, expected: accountProfile},
 		{method: "idc", stored: accountProfile, expected: accountProfile},
 		{method: "external_idp", stored: accountProfile, expected: accountProfile},
 		{method: "imported", stored: accountProfile, expected: accountProfile},
