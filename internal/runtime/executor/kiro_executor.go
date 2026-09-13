@@ -571,23 +571,20 @@ func prepareModelCapability(auth *cliproxyauth.Auth, modelID string, opts *clipr
 		authID = auth.ID
 	}
 	opts.Metadata["_kiro_auth_id"] = authID
-	effort, _ := opts.Metadata[cliproxyexecutor.ReasoningEffortMetadataKey].(string)
-	effort = strings.ToLower(strings.TrimSpace(effort))
-	capability, ok := modelcapabilities.ForAuth(authID, modelID)
-	// CPA represents Anthropic thinking.type=disabled as effort "none". Claude
-	// Kiro schemas often omit "none" entirely; in that case disabled means omit
-	// the reasoning field, not reject the request.
-	if effort == "none" && ok && !capability.SupportsEffort(effort) {
-		effort = ""
+	requested, _ := opts.Metadata[cliproxyexecutor.ReasoningEffortMetadataKey].(string)
+	// Reasoning effort is an optional enrichment, so a request is never refused
+	// over it: the effort is fitted to what the selected account's schema for
+	// this model accepts, and any change is logged. A model with no schema at
+	// all (every Builder ID model measured on 2026-09-13) simply carries no
+	// effort field, which is also what happens for "auto".
+	capability, _ := modelcapabilities.ForAuth(authID, modelID)
+	effort, note := capability.ResolveEffort(requested)
+	if note != "" {
+		log.WithFields(log.Fields{"model": modelID, "auth_id": authID, "requested": requested, "effort": effort}).Info("kiro: reasoning effort adjusted: " + note)
+	}
+	if effort == "" {
 		delete(opts.Metadata, cliproxyexecutor.ReasoningEffortMetadataKey)
-	}
-	if !ok && effort != "" {
-		return requestValidationErr{msg: fmt.Sprintf("Kiro capabilities are unavailable for model %q and the selected account", modelID)}
-	}
-	if effort != "" && !capability.SupportsEffort(effort) {
-		return requestValidationErr{msg: fmt.Sprintf("Kiro model %q does not support reasoning effort %q", modelID, effort)}
-	}
-	if effort != "" {
+	} else {
 		opts.Metadata[cliproxyexecutor.ReasoningEffortMetadataKey] = effort
 	}
 	// Output budgets are normalized while building the final Kiro payload. This
