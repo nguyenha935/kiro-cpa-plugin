@@ -539,7 +539,7 @@ func TestConcurrentUsageRefreshesAndPersistsOnce(t *testing.T) {
 		group.Add(1)
 		go func(index int) {
 			defer group.Done()
-			results[index] = loadUsageAccount(context.Background(), entry, false)
+			results[index] = loadUsageCredential(context.Background(), resolveUsageCredentials([]pluginapi.HostAuthFileEntry{entry})[0], false)
 		}(index)
 	}
 	group.Wait()

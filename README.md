@@ -16,11 +16,11 @@ The plugin:
 - preserves system and developer instructions exactly once, anchored to the first user turn, because the upstream `systemPrompt` field is feature-gated;
 - provides a read-only `Kiro Usage` page for subscription usage.
 
-`Kiro` is the name shown in the CLIProxyAPI interface. The stable provider ID, configuration key, and DLL filename use `kiro`.
+`Kiro` is the name shown in the CLIProxyAPI interface. The provider ID stays `kiro`; the plugin ID, library filename, and `plugins.configs` key are `kiro-ha` (see [Build](#build)).
 
 ## Requirements
 
-- CLIProxyAPI 7.2.143
+- CLIProxyAPI 7.2.151 (plugin SDK v7.2.151, RPC schema 5)
 - Windows amd64, Linux amd64, or Linux arm64
 - Go 1.26
 - A C compiler available to CGO
@@ -28,16 +28,18 @@ The plugin:
 
 ## Build
 
-```powershell
+```bash
 go test ./...
 go vet ./...
-New-Item -ItemType Directory -Force dist | Out-Null
-go build -trimpath -buildmode=c-shared -o dist/kiro-ha.dll ./cmd/kiro-plugin
-$hash = (Get-FileHash dist/kiro-ha.dll -Algorithm SHA256).Hash.ToLowerInvariant()
-"$hash  kiro-ha.dll" | Set-Content -NoNewline -Encoding ascii dist/kiro-ha.dll.sha256
+CGO_ENABLED=1 go build -trimpath -buildmode=c-shared \
+  -ldflags "-X github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro.clientVersion=2.19.0 -X main.pluginVersion=0.9.1" \
+  -o package/kiro-ha.so ./cmd/kiro-plugin
+sha256sum package/kiro-ha.so > package/kiro-ha.so.sha256
 ```
 
-The GitHub Actions workflow tests Windows and Linux, then publishes archives for Windows amd64, Linux amd64, and Linux arm64. Each archive and plugin binary has a SHA-256 checksum. Linux packages contain `kiro-ha.so`; Windows packages contain `kiro-ha.dll`.
+On Windows use the same flags with `-o package/kiro-ha.dll`. The two `-ldflags -X` values are what the release workflow pins: `clientVersion` is the Kiro CLI release the plugin identifies as, and `pluginVersion` is reported to CPA as the plugin version (it defaults to `dev` when omitted).
+
+The GitHub Actions workflow tests Windows and Linux, then publishes archives for Windows amd64, Linux amd64, and Linux arm64 on every `v*` tag. Each archive and plugin binary has a SHA-256 checksum. Linux packages contain `kiro-ha.so`; Windows packages contain `kiro-ha.dll`.
 
 The library is named `kiro-ha` because CLIProxyAPI derives the plugin ID from the file name and the official plugin store already publishes a plugin with ID `kiro`. Keeping a distinct ID means a store install of that plugin cannot overwrite this binary. The provider name stays `kiro`, so credential files, `oauth-model-alias` and `oauth-excluded-models` entries are unchanged.
 
@@ -75,7 +77,7 @@ The loopback resource `/v0/resource/plugins/kiro-ha/capabilities` exposes only t
 
 Open `Kiro Usage` from the plugin menu in the Management Center. The plugin renders one card per connected Kiro account with the plan, usage buckets, balance, renewal date, and overage information returned by Kiro.
 
-The page is read-only and contains no JavaScript. Its 192-bit random route is generated when CLIProxyAPI starts and is revealed only through the authenticated plugin list. The route changes after a process restart. Results remain in memory for 60 seconds, and a manual refresh is limited to one upstream call per account every 10 seconds.
+The page is read-only. Its only script, allowed by a nonce-based Content-Security-Policy, formats dates in the browser locale, updates renewal countdowns, and toggles account detail rows; it makes no network requests. Its 192-bit random route is generated when CLIProxyAPI starts and is revealed only through the authenticated plugin list. The route changes after a process restart. Results remain in memory for 60 seconds, and a manual refresh is limited to one upstream call per account every 10 seconds.
 
 Quota data and credentials are never written by the page. If Kiro changes or rejects its private usage endpoint, the affected account displays an error instead of an estimated value.
 
