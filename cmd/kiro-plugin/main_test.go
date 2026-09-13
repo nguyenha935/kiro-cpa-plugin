@@ -119,7 +119,7 @@ func TestBuilderIDCatalogAndUsageIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load Builder ID integration token: %v", err)
 	}
-	if !isBuilderIDCredential(token) || strings.TrimSpace(token.ProfileArn) != "" {
+	if token.AuthMethod != "builder-id" || strings.TrimSpace(token.ProfileArn) != "" {
 		t.Fatalf("integration credential is not profileless Builder ID")
 	}
 	models, err := listAvailableModels(t.Context(), token)

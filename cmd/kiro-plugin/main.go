@@ -1269,18 +1269,6 @@ func intValue(value any, fallback int) int {
 	return fallback
 }
 
-func isKiroAuthorizationError(err error) bool {
-	if err == nil {
-		return false
-	}
-	message := err.Error()
-	return strings.Contains(message, "HTTP 401") || strings.Contains(message, "HTTP 403")
-}
-
-func isBuilderIDCredential(token *kiroauth.KiroTokenData) bool {
-	return token != nil && strings.EqualFold(strings.TrimSpace(token.AuthMethod), "builder-id")
-}
-
 func normalizeModelID(id string) string {
 	id = strings.TrimSpace(id)
 	if strings.EqualFold(id, "auto") {
@@ -1569,15 +1557,6 @@ func reconcileIdentityBestEffort(ctx context.Context, token *kiroauth.KiroTokenD
 		token.ProfileName = name
 	}
 	token.Identity = credentialIdentity(token)
-}
-
-func reconcileProfileBestEffort(ctx context.Context, token *kiroauth.KiroTokenData, phase string) {
-	if token == nil || strings.TrimSpace(token.ProfileArn) != "" {
-		return
-	}
-	if err := reconcileProfile(ctx, token); err != nil {
-		log.Printf("kiro: profile discovery %s unavailable: %v; continuing without profile ARN", phase, err)
-	}
 }
 
 func listAvailableProfiles(ctx context.Context, client *http.Client, endpoint, accessToken string) ([]availableProfile, error) {

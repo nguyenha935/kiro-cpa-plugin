@@ -673,13 +673,6 @@ func usageEntryRank(entry pluginapi.HostAuthFileEntry) int {
 	return 2
 }
 
-func loadUsageAccount(ctx context.Context, entry pluginapi.HostAuthFileEntry, force bool) usageAccountView {
-	credential := usageCredential{entry: entry}
-	credential.authRecord, credential.raw, credential.token, credential.err = getHostKiroAuth(entry.AuthIndex)
-	credential.cacheKey = usageCredentialKey(credential.token, entry.AuthIndex, entry.Name)
-	return loadUsageCredential(ctx, credential, force)
-}
-
 // loadUsageCredential decorates whatever the transport or the cache produced:
 // credential facts are cheap, language-neutral and must also appear on cached,
 // disabled and failed accounts.
@@ -747,14 +740,6 @@ func loadUsageCredentialView(ctx context.Context, credential usageCredential, fo
 	}
 	storeCachedUsage(credential.cacheKey, account)
 	return account
-}
-
-func fetchUsageForAuth(ctx context.Context, entry pluginapi.HostAuthFileEntry) (usageAccountView, error) {
-	authRecord, raw, token, err := getHostKiroAuth(entry.AuthIndex)
-	if err != nil {
-		return usageAccountView{}, err
-	}
-	return fetchUsageForCredential(ctx, usageCredential{entry: entry, authRecord: authRecord, raw: raw, token: token})
 }
 
 func fetchUsageForCredential(ctx context.Context, credential usageCredential) (usageAccountView, error) {
