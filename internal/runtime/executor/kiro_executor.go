@@ -17,7 +17,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -89,8 +88,6 @@ var retryableHTTPStatusCodes = map[int]bool{
 	503: true, // Service Unavailable - server temporarily overloaded
 	504: true, // Gateway Timeout - upstream server timeout
 }
-
-var awsRegionPattern = regexp.MustCompile("^[a-z]{2}(?:-gov)?-[a-z]+-\\d$")
 
 // retryConfig holds configuration for socket retry logic.
 // Based on kiro2Api Python implementation patterns.
@@ -3353,10 +3350,13 @@ func (e *KiroExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
 	// interchangeable and precedence alone is easy to misread.
 	if authMethod == "social" || (authMethod == "imported" && clientID == "" && clientSecret == "") {
 		if region == "" {
-			region = "us-east-1"
+			region = kiroDefaultRegion
 		}
-		if !awsRegionPattern.MatchString(region) {
-			return nil, statusErr{code: http.StatusBadRequest, msg: "kiro executor: invalid social region"}
+		// The desktop auth service is fixed in us-east-1, so the region is not
+		// part of this URL; it is still validated because it is written back into
+		// the credential's metadata and later reaches URL-building paths.
+		if _, regionErr := kiroroute.ValidateRegion(region); regionErr != nil {
+			return nil, statusErr{code: http.StatusBadRequest, msg: "kiro executor: " + regionErr.Error()}
 		}
 		endpoint := "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken"
 		payload, marshalErr := json.Marshal(map[string]string{"refreshToken": refreshToken})
