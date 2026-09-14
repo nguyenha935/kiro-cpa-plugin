@@ -65,6 +65,14 @@ const (
 	// matters, so the bar sits above the observed normal range.
 	kiroLargePayloadBytes = 2 << 20
 
+	// Public profile ARNs the Kiro clients send for logins that have no profile
+	// of their own. generateAssistantResponse rejects an empty profileArn
+	// ("profileArn is required for this request") while accepting these shared
+	// values, so they are the runtime contract for Builder ID and social logins,
+	// not an account identity.
+	kiroBuilderIDProfileARN = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
+	kiroSocialProfileARN    = "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
+
 	// Socket retry configuration constants
 	// Maximum number of retry attempts for socket/network errors
 	kiroSocketMaxRetries = 3
@@ -1500,20 +1508,31 @@ func kiroRuntimeCredentials(auth *cliproxyauth.Auth) (accessToken, profileArn st
 
 // effectiveGenerateProfileARN applies only the profile contract used by
 // generateAssistantResponse: the credential's own profile ARN when it has one,
-// nothing otherwise. Builder ID and social credentials usually carry none and
-// are served profileless; a placeholder ARN belonging to another AWS account
-// would identify the request as that account's, so none is ever substituted.
+// otherwise the public profile the Kiro clients send for that login type.
+// Builder ID's control-plane APIs are profileless, but its runtime payload is
+// rejected without a profileArn, so the shared public value stands in.
 func effectiveGenerateProfileARN(auth *cliproxyauth.Auth, profileArn string) string {
 	method := ""
 	if auth != nil && auth.Metadata != nil {
 		method, _ = auth.Metadata["auth_method"].(string)
 	}
-	if strings.EqualFold(strings.TrimSpace(method), "api_key") {
+	method = strings.ToLower(strings.TrimSpace(method))
+	if method == "api_key" {
 		// API-key requests are account-bound and the upstream Q surface rejects
 		// every profile ARN, including stale values imported from older files.
 		return ""
 	}
-	return strings.TrimSpace(profileArn)
+	if profileArn = strings.TrimSpace(profileArn); profileArn != "" {
+		return profileArn
+	}
+	switch method {
+	case "builder-id":
+		return kiroBuilderIDProfileARN
+	case "social":
+		return kiroSocialProfileARN
+	default:
+		return ""
+	}
 }
 
 // mapModelToKiro returns the exact model advertised by Kiro. The CLIProxyAPI
