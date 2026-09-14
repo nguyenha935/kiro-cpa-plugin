@@ -11,7 +11,9 @@ import (
 // Only one predicate may decide whether a credential goes through profile
 // discovery. Two call sites used a hand-rolled "not an API key and not Builder ID"
 // test, which let social credentials through to a discovery step that refuses
-// them, so listing models failed outright for social.
+// them, so listing models failed outright for social. profileRequired is the
+// same predicate seen from the plugin binary, so it must agree for every kind,
+// and it must tolerate a nil token because callers pass parsed input through.
 func TestOnlyProfileBearingKindsEnterDiscovery(t *testing.T) {
 	discoverable := map[string]bool{
 		"idc":          true,
@@ -20,12 +22,20 @@ func TestOnlyProfileBearingKindsEnterDiscovery(t *testing.T) {
 		"builder-id":   false,
 		"social":       false,
 		"api_key":      false,
+		"":             false,
+		"unknown":      false,
 	}
 	for method, want := range discoverable {
-		got := resolveAccount(&kiroauth.KiroTokenData{AuthMethod: method}).ProfileDiscoverable()
-		if got != want {
+		token := &kiroauth.KiroTokenData{AuthMethod: method}
+		if got := resolveAccount(token).ProfileDiscoverable(); got != want {
 			t.Fatalf("auth method %q discoverable = %v, want %v", method, got, want)
 		}
+		if got := profileRequired(token); got != want {
+			t.Fatalf("auth method %q profileRequired = %v, want %v", method, got, want)
+		}
+	}
+	if profileRequired(nil) {
+		t.Fatal("a nil token must not require a profile")
 	}
 }
 

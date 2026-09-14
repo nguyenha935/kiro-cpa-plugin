@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"testing"
@@ -79,7 +80,7 @@ func TestPumpStreamReportsErrorInCloseErrorField(t *testing.T) {
 		coreexec.StreamChunk{Err: errors.New("upstream 429 throttled")},
 		coreexec.StreamChunk{Payload: []byte("data: never\n\n")},
 	)
-	pumpStream("s1", chunks)
+	pumpStream("s1", chunks, func() {})
 	waitClosed(t, done, "error chunk")
 
 	if len(recorder.emits) != 1 || string(recorder.emits[0].Payload) != "data: one\n\n" {
@@ -96,18 +97,36 @@ func TestPumpStreamReportsErrorInCloseErrorField(t *testing.T) {
 	}
 }
 
-func TestPumpStreamDrainsWhenHostRejectsEmit(t *testing.T) {
+// A failed emit is the only signal the ABI gives that the client is gone. The
+// upstream request must be cancelled before the drain so the executor stops
+// reading Kiro's response instead of finishing it for nobody.
+func TestPumpStreamCancelsUpstreamWhenHostRejectsEmit(t *testing.T) {
 	recorder := &hostStreamRecorder{failEmits: true}
 	installStreamRecorder(t, recorder)
 
-	chunks, done := producer(
-		coreexec.StreamChunk{Payload: []byte("data: one\n\n")},
-		coreexec.StreamChunk{Payload: []byte("data: two\n\n")},
-		coreexec.StreamChunk{Payload: []byte("data: three\n\n")},
-	)
-	pumpStream("s2", chunks)
+	ctx, cancel := context.WithCancel(context.Background())
+	out := make(chan coreexec.StreamChunk)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer close(out)
+		out <- coreexec.StreamChunk{Payload: []byte("data: one\n\n")}
+		select {
+		case <-ctx.Done():
+		case <-time.After(2 * time.Second):
+			out <- coreexec.StreamChunk{Payload: []byte("data: still generating\n\n")}
+		}
+	}()
+	start := time.Now()
+	pumpStream("s2", out, cancel)
 	waitClosed(t, done, "host emit failure")
 
+	if ctx.Err() == nil {
+		t.Fatal("upstream context was not cancelled after the host rejected the emit")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("pumpStream waited %v for upstream to finish instead of cancelling it", elapsed)
+	}
 	if recorder.close == nil || recorder.close.Error != "" {
 		t.Fatalf("close = %+v, want a clean close after the host abandoned the stream", recorder.close)
 	}
@@ -122,7 +141,7 @@ func TestPumpStreamClosesCleanlyOnSuccess(t *testing.T) {
 		coreexec.StreamChunk{Payload: nil},
 		coreexec.StreamChunk{Payload: []byte("data: two\n\n")},
 	)
-	pumpStream("s3", chunks)
+	pumpStream("s3", chunks, func() {})
 	waitClosed(t, done, "success")
 
 	if len(recorder.emits) != 2 {
@@ -139,7 +158,7 @@ func TestCollectStreamReturnsErrorInsteadOfEncodingIt(t *testing.T) {
 		coreexec.StreamChunk{Err: errors.New("boom")},
 		coreexec.StreamChunk{Payload: []byte("after")},
 	)
-	raw, err := collectStream(&coreexec.StreamResult{Chunks: chunks})
+	raw, err := collectStream(&coreexec.StreamResult{Chunks: chunks}, func() {})
 	waitClosed(t, done, "collectStream error")
 	if err == nil || err.Error() != "boom" || raw != nil {
 		t.Fatalf("collectStream = (%s, %v), want the stream error as the envelope error", raw, err)
@@ -149,7 +168,7 @@ func TestCollectStreamReturnsErrorInsteadOfEncodingIt(t *testing.T) {
 		coreexec.StreamChunk{Payload: []byte("a")},
 		coreexec.StreamChunk{Payload: []byte("b")},
 	)
-	raw, err = collectStream(&coreexec.StreamResult{Chunks: chunks})
+	raw, err = collectStream(&coreexec.StreamResult{Chunks: chunks}, func() {})
 	waitClosed(t, done, "collectStream success")
 	if err != nil {
 		t.Fatalf("collectStream error = %v", err)

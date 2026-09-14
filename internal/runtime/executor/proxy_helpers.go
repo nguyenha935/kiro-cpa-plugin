@@ -15,18 +15,19 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-// httpClientCache caches HTTP clients by proxy URL to enable connection reuse
+// proxyTransportCache shares one transport per proxy URL so TCP/TLS connections
+// are reused. Only the transport is cached: http.Client.Timeout belongs to the
+// individual request path (120s non-stream, none for streams), so a client is
+// built fresh around the shared transport on every call.
 var (
-	httpClientCache      = make(map[string]*http.Client)
-	httpClientCacheMutex sync.RWMutex
+	proxyTransportCache      = make(map[string]*http.Transport)
+	proxyTransportCacheMutex sync.RWMutex
 )
 
 // newProxyAwareHTTPClient creates an HTTP client with proper proxy configuration priority:
 // 1. Use auth.ProxyURL if configured (highest priority)
 // 2. Use cfg.ProxyURL if auth proxy is not configured
 // 3. Use RoundTripper from context if neither are configured
-//
-// This function caches HTTP clients by proxy URL to enable TCP/TLS connection reuse.
 //
 // Parameters:
 //   - ctx: The context containing optional RoundTripper
@@ -48,58 +49,35 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		proxyURL = strings.TrimSpace(cfg.ProxyURL)
 	}
 
-	// Build cache key from proxy URL (empty string for no proxy)
-	cacheKey := proxyURL
+	return &http.Client{Transport: proxyAwareTransport(ctx, proxyURL), Timeout: timeout}
+}
 
-	// Check cache first
-	httpClientCacheMutex.RLock()
-	if cachedClient, ok := httpClientCache[cacheKey]; ok {
-		httpClientCacheMutex.RUnlock()
-		// Return a wrapper with the requested timeout but shared transport
-		if timeout > 0 {
-			return &http.Client{
-				Transport: cachedClient.Transport,
-				Timeout:   timeout,
-			}
-		}
-		return cachedClient
-	}
-	httpClientCacheMutex.RUnlock()
-
-	// Create new client
-	httpClient := &http.Client{}
-	if timeout > 0 {
-		httpClient.Timeout = timeout
-	}
-
-	// If we have a proxy URL configured, set up the transport
+// proxyAwareTransport returns the shared transport for proxyURL, building and
+// caching it on first use. Without a usable proxy it falls back to the host's
+// context RoundTripper, or nil for Go's default transport; those are not cached
+// because they belong to the caller, not to a proxy URL.
+func proxyAwareTransport(ctx context.Context, proxyURL string) http.RoundTripper {
 	if proxyURL != "" {
-		transport := buildProxyTransport(proxyURL)
-		if transport != nil {
-			httpClient.Transport = transport
-			// Cache the client
-			httpClientCacheMutex.Lock()
-			httpClientCache[cacheKey] = httpClient
-			httpClientCacheMutex.Unlock()
-			return httpClient
+		proxyTransportCacheMutex.RLock()
+		transport, ok := proxyTransportCache[proxyURL]
+		proxyTransportCacheMutex.RUnlock()
+		if ok {
+			return transport
 		}
-		// If proxy setup failed, log and fall through to context RoundTripper
+		if transport := buildProxyTransport(proxyURL); transport != nil {
+			proxyTransportCacheMutex.Lock()
+			proxyTransportCache[proxyURL] = transport
+			proxyTransportCacheMutex.Unlock()
+			return transport
+		}
 		log.Debugf("failed to setup proxy from URL: %s, falling back to context transport", proxyURL)
 	}
 
 	// Priority 3: Use RoundTripper from context (typically from RoundTripperFor)
 	if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
-		httpClient.Transport = rt
+		return rt
 	}
-
-	// Cache the client for no-proxy case
-	if proxyURL == "" {
-		httpClientCacheMutex.Lock()
-		httpClientCache[cacheKey] = httpClient
-		httpClientCacheMutex.Unlock()
-	}
-
-	return httpClient
+	return nil
 }
 
 // buildProxyTransport creates an HTTP transport configured for the given proxy URL.

@@ -28,12 +28,12 @@ import (
 
 // Provider is Kiro's own account taxonomy, extracted from the credential struct
 // compiled into Kiro CLI 2.21.1, whose provider field enumerates exactly:
-// Enterprise, Internal, ExternalIdp, BuilderId, Google, Github.
+// Enterprise, Internal, ExternalIdp, BuilderId, Google, Github. Internal is
+// Amazon-employee only and no credential this plugin accepts resolves to it.
 type Provider string
 
 const (
 	ProviderEnterprise  Provider = "Enterprise"
-	ProviderInternal    Provider = "Internal"
 	ProviderExternalIdp Provider = "ExternalIdp"
 	ProviderBuilderID   Provider = "BuilderId"
 	ProviderGoogle      Provider = "Google"
@@ -328,7 +328,8 @@ func RegionFromProfileARN(arn string) string {
 // credential. Builder ID, social and API key credentials answer 403 "User is not
 // authorized to access this feature.", so the call is skipped rather than sent
 // and rejected. Suppressing requests that can only fail keeps the account's
-// request history clean.
+// request history clean. The same kinds are the ones that cannot operate
+// without a profile ARN, so this is also the "profile required" predicate.
 func (a Account) ProfileDiscoverable() bool {
 	switch a.AuthMethod {
 	case "idc", "external_idp", "imported":
@@ -336,12 +337,6 @@ func (a Account) ProfileDiscoverable() bool {
 	default:
 		return false
 	}
-}
-
-// RequiresProfile reports whether the credential cannot operate without a
-// profile ARN.
-func (a Account) RequiresProfile() bool {
-	return a.ProfileDiscoverable()
 }
 
 // MetadataURL builds the URL for a metadata operation on the surface this

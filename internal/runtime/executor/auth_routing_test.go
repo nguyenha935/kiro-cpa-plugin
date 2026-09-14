@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -326,6 +327,70 @@ func TestRetryBackoffStopsWhenTheClientDisconnects(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
 		t.Fatalf("retry kept sleeping for %v after the client left", elapsed)
+	}
+}
+
+// The retry budget is the loop bound: three retryable 5xx in a row use every
+// attempt and the caller receives the last upstream status and body, not a
+// generic 503. Both request paths share the rule.
+func TestRetryExhaustionReturnsTheLastUpstreamStatus(t *testing.T) {
+	originalDelay := calculateRetryDelay
+	calculateRetryDelay = func(int) time.Duration { return time.Millisecond }
+	t.Cleanup(func() { calculateRetryDelay = originalDelay })
+
+	statuses := []int{http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout}
+	for _, test := range []struct {
+		name    string
+		execute func(context.Context, *cliproxyauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) error
+	}{
+		{name: "non-stream", execute: func(ctx context.Context, auth *cliproxyauth.Auth, request cliproxyexecutor.Request, options cliproxyexecutor.Options) error {
+			_, err := NewKiroExecutor(nil).Execute(ctx, auth, request, options)
+			return err
+		}},
+		{name: "stream", execute: func(ctx context.Context, auth *cliproxyauth.Auth, request cliproxyexecutor.Request, options cliproxyexecutor.Options) error {
+			_, err := NewKiroExecutor(nil).ExecuteStream(ctx, auth, request, options)
+			return err
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			requests := 0
+			stubUpstream(t, func(*http.Request) (*http.Response, error) {
+				status := statuses[requests]
+				requests++
+				return upstreamStatus(status, nil, fmt.Sprintf("{\"message\":\"upstream %d\"}", status)), nil
+			})
+			request, options := executorTestRequest()
+
+			err := test.execute(t.Context(), builderIDAuth("retry-exhausted-"+test.name), request, options)
+			statusErr, ok := err.(interface{ StatusCode() int })
+			if !ok || statusErr.StatusCode() != http.StatusGatewayTimeout || err.Error() != "upstream 504" {
+				t.Fatalf("exhausted retries = %T %v, want the final 504 with its body", err, err)
+			}
+			if requests != len(statuses) {
+				t.Fatalf("plugin made %d upstream requests, want %d", requests, len(statuses))
+			}
+		})
+	}
+}
+
+// With a proxy configured, the cache must share the transport and nothing
+// else: a stream client requested after a 120s non-stream client carries no
+// timeout, and both reuse the same connection pool.
+func TestProxyClientCacheSharesTransportNotTimeout(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.ProxyURL = "http://127.0.0.1:9"
+	ctx := context.Background()
+
+	nonStream := newKiroHTTPClientWithPooling(ctx, cfg, nil, 120*time.Second)
+	stream := newKiroHTTPClientWithPooling(ctx, cfg, nil, 0)
+	if nonStream.Timeout != 120*time.Second || stream.Timeout != 0 {
+		t.Fatalf("timeouts = %v then %v, want 120s then none", nonStream.Timeout, stream.Timeout)
+	}
+	if nonStream.Transport == nil || nonStream.Transport != stream.Transport {
+		t.Fatalf("proxy transport not shared: %p vs %p", nonStream.Transport, stream.Transport)
+	}
+	if nonStream == stream {
+		t.Fatal("cache handed out the same client to both paths")
 	}
 }
 
