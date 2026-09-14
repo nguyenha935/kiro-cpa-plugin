@@ -1340,7 +1340,7 @@ func newModelCatalogRequest(ctx context.Context, token *kiroauth.KiroTokenData, 
 	// the Amazon Q surface when its profile has not been discovered yet. Q would
 	// reject the OAuth token, and the failure would look like a bad credential
 	// rather than incomplete setup.
-	if account.RequiresProfile() && strings.TrimSpace(token.ProfileArn) == "" {
+	if account.ProfileDiscoverable() && strings.TrimSpace(token.ProfileArn) == "" {
 		return nil, pluginStatusError{status: http.StatusUnauthorized, message: "Kiro profile ARN is required for this credential type"}
 	}
 	endpoint, err := account.MetadataURL(kiroroute.OpListAvailableModels)
@@ -1398,7 +1398,22 @@ func routingCredential(token *kiroauth.KiroTokenData) kiroroute.Credential {
 		Provider:   token.Provider,
 		ProfileARN: token.ProfileArn,
 		OIDCRegion: token.Region,
+		APIRegion:  apiRegionOverride(token),
 	}
+}
+
+// apiRegionOverride reads the operator's api_region pin from the same places
+// the executor sees it: the live host record first, then the credential
+// document, whose unknown fields authMetadata promotes into that record.
+func apiRegionOverride(token *kiroauth.KiroTokenData) string {
+	if value, ok := token.HostMetadata["api_region"].(string); ok && strings.TrimSpace(value) != "" {
+		return strings.TrimSpace(value)
+	}
+	var value string
+	if raw, ok := token.Extra["api_region"]; ok && json.Unmarshal(raw, &value) == nil {
+		return strings.TrimSpace(value)
+	}
+	return ""
 }
 
 func thinkingSupport(capability modelcapabilities.Capability) *pluginapi.ThinkingSupport {
@@ -1520,16 +1535,11 @@ func reconcileParsedProfile(ctx context.Context, token *kiroauth.KiroTokenData, 
 	return nil
 }
 
+// profileRequired reports whether the credential kind cannot operate without a
+// profile ARN. The kinds that can discover a profile are exactly the kinds that
+// need one, so routing owns the single definition.
 func profileRequired(token *kiroauth.KiroTokenData) bool {
-	if token == nil {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(token.AuthMethod)) {
-	case "idc", "external_idp", "imported":
-		return true
-	default:
-		return false
-	}
+	return token != nil && resolveAccount(token).ProfileDiscoverable()
 }
 
 // reconcileIdentityBestEffort resolves who a freshly obtained credential belongs
@@ -1791,14 +1801,20 @@ func handleExecuteStream(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	result, err := kiroExecutor.ExecuteStream(context.Background(), auth, coreRequest(req.ExecutorRequest), coreOptions(req.ExecutorRequest))
+	// The ABI has no host-to-plugin cancellation call. A client that leaves is
+	// signalled by the host closing its side of the bridge, which surfaces here
+	// as a failed emit; that failure cancels the upstream request so the response
+	// is not read to completion for nobody.
+	ctx, cancel := context.WithCancel(context.Background())
+	result, err := kiroExecutor.ExecuteStream(ctx, auth, coreRequest(req.ExecutorRequest), coreOptions(req.ExecutorRequest))
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	if req.StreamID == "" {
-		return collectStream(result)
+		return collectStream(result, cancel)
 	}
-	go pumpStream(req.StreamID, result.Chunks)
+	go pumpStream(req.StreamID, result.Chunks, cancel)
 	return okEnvelope(synchronousStreamResponse{Headers: result.Headers})
 }
 
@@ -1806,10 +1822,12 @@ func handleExecuteStream(raw []byte) ([]byte, error) {
 // is an interface with no JSON tag, so an error cannot ride inside the chunk
 // array: the first error becomes the envelope error and the partial payload is
 // discarded, which is what the host would do with a truncated stream anyway.
-func collectStream(result *coreexec.StreamResult) ([]byte, error) {
+func collectStream(result *coreexec.StreamResult, cancel context.CancelFunc) ([]byte, error) {
+	defer cancel()
 	chunks := make([]pluginapi.ExecutorStreamChunk, 0)
 	for chunk := range result.Chunks {
 		if chunk.Err != nil {
+			cancel()
 			drainStream(result.Chunks)
 			return nil, chunk.Err
 		}
@@ -1824,9 +1842,11 @@ func collectStream(result *coreexec.StreamResult) ([]byte, error) {
 // sends on an unbuffered channel and only closes the upstream body once it
 // finishes, so every exit path must keep receiving until the channel closes:
 // returning early would park that goroutine and its connection for good.
-func pumpStream(streamID string, chunks <-chan coreexec.StreamChunk) {
+// Cancelling first makes that finish now rather than when Kiro stops generating.
+func pumpStream(streamID string, chunks <-chan coreexec.StreamChunk, cancel context.CancelFunc) {
 	var streamErr error
 	defer func() {
+		cancel()
 		drainStream(chunks)
 		streamClose(streamID, streamErr)
 	}()

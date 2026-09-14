@@ -73,60 +73,24 @@ const (
 	kiroBuilderIDProfileARN = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
 	kiroSocialProfileARN    = "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
 
-	// Socket retry configuration constants
-	// Maximum number of retry attempts for socket/network errors
-	kiroSocketMaxRetries = 3
-	// Base delay between retry attempts (uses exponential backoff: delay * 2^attempt)
+	// Exponential backoff between retries of the same request: base * 2^attempt,
+	// capped, with jitter. The retry budget itself is the loop bound in
+	// executeWithRetry and executeStreamWithRetry.
 	kiroSocketBaseRetryDelay = 1 * time.Second
-	// Maximum delay between retry attempts (cap for exponential backoff)
-	kiroSocketMaxRetryDelay = 30 * time.Second
-	// First token timeout for streaming responses (how long to wait for first response)
-	kiroFirstTokenTimeout = 15 * time.Second
-	// Streaming read timeout (how long to wait between chunks)
-	kiroStreamingReadTimeout = 300 * time.Second
+	kiroSocketMaxRetryDelay  = 30 * time.Second
 )
 
-// retryableHTTPStatusCodes defines HTTP status codes that are considered retryable.
-// Based on kiro2Api reference: 502 (Bad Gateway), 503 (Service Unavailable), 504 (Gateway Timeout)
-var retryableHTTPStatusCodes = map[int]bool{
-	502: true, // Bad Gateway - upstream server error
-	503: true, // Service Unavailable - server temporarily overloaded
-	504: true, // Gateway Timeout - upstream server timeout
-}
-
-// retryConfig holds configuration for socket retry logic.
-// Based on kiro2Api Python implementation patterns.
-type retryConfig struct {
-	MaxRetries      int           // Maximum number of retry attempts
-	BaseDelay       time.Duration // Base delay between retries (exponential backoff)
-	MaxDelay        time.Duration // Maximum delay cap
-	RetryableErrors []string      // List of retryable error patterns
-	RetryableStatus map[int]bool  // HTTP status codes to retry
-	FirstTokenTmout time.Duration // Timeout for first token in streaming
-	StreamReadTmout time.Duration // Timeout between stream chunks
-}
-
-// defaultRetryConfig returns the default retry configuration for Kiro socket operations.
-func defaultRetryConfig() retryConfig {
-	return retryConfig{
-		MaxRetries:      kiroSocketMaxRetries,
-		BaseDelay:       kiroSocketBaseRetryDelay,
-		MaxDelay:        kiroSocketMaxRetryDelay,
-		RetryableStatus: retryableHTTPStatusCodes,
-		RetryableErrors: []string{
-			"connection reset",
-			"connection refused",
-			"broken pipe",
-			"EOF",
-			"timeout",
-			"temporary failure",
-			"no such host",
-			"network is unreachable",
-			"i/o timeout",
-		},
-		FirstTokenTmout: kiroFirstTokenTimeout,
-		StreamReadTmout: kiroStreamingReadTimeout,
-	}
+// retryableErrorPatterns are transport error messages worth a second attempt,
+// matched against the lowercased error text.
+var retryableErrorPatterns = []string{
+	"connection reset",
+	"connection refused",
+	"broken pipe",
+	"timeout",
+	"temporary failure",
+	"no such host",
+	"network is unreachable",
+	"i/o timeout",
 }
 
 // isRetryableError checks if an error is retryable based on error type and message.
@@ -190,8 +154,7 @@ func isRetryableError(err error) bool {
 
 	// Check error message for retryable patterns
 	errMsg := strings.ToLower(err.Error())
-	cfg := defaultRetryConfig()
-	for _, pattern := range cfg.RetryableErrors {
+	for _, pattern := range retryableErrorPatterns {
 		if strings.Contains(errMsg, pattern) {
 			log.Debugf("kiro: isRetryableError: pattern '%s' matched in error: %s", pattern, errMsg)
 			return true
@@ -207,17 +170,10 @@ func isRetryableError(err error) bool {
 	return false
 }
 
-// isRetryableHTTPStatus checks if an HTTP status code is retryable.
-// Based on kiro2Api: 502, 503, 504 are retryable server errors.
-func isRetryableHTTPStatus(statusCode int) bool {
-	return retryableHTTPStatusCodes[statusCode]
-}
-
-// calculateRetryDelay calculates the delay for the next retry attempt using exponential backoff.
-// delay = min(baseDelay * 2^attempt, maxDelay)
-// Adds ±30% jitter to prevent thundering herd.
-func calculateRetryDelay(attempt int, cfg retryConfig) time.Duration {
-	return kiroauth.ExponentialBackoffWithJitter(attempt, cfg.BaseDelay, cfg.MaxDelay)
+// calculateRetryDelay is the wait before retrying the same request. Tests
+// override it so exhaustion paths run without real backoff sleeps.
+var calculateRetryDelay = func(attempt int) time.Duration {
+	return kiroauth.ExponentialBackoffWithJitter(attempt, kiroSocketBaseRetryDelay, kiroSocketMaxRetryDelay)
 }
 
 // logRetryAttempt logs a retry attempt with relevant context.
@@ -327,9 +283,10 @@ type kiroEndpointConfig struct {
 // Used when no region is specified in auth metadata.
 const kiroDefaultRegion = "us-east-1"
 
-// kiroRoutingCredential lifts the routing facts out of CPA auth metadata so the
-// executor and the plugin binary resolve endpoints through the same code.
-func kiroRoutingCredential(auth *cliproxyauth.Auth) kiroroute.Credential {
+// RoutingCredential lifts the routing facts out of CPA auth metadata so the
+// executor and the plugin binary resolve endpoints through the same code. It is
+// exported so the plugin binary can assert parity with its stored-credential view.
+func RoutingCredential(auth *cliproxyauth.Auth) kiroroute.Credential {
 	credential := kiroroute.Credential{}
 	if auth == nil || auth.Metadata == nil {
 		return credential
@@ -350,7 +307,7 @@ func kiroRoutingCredential(auth *cliproxyauth.Auth) kiroroute.Credential {
 
 // resolveKiroAccount resolves the routing context for a credential.
 func resolveKiroAccount(auth *cliproxyauth.Auth) kiroroute.Account {
-	return kiroroute.Resolve(kiroRoutingCredential(auth))
+	return kiroroute.Resolve(RoutingCredential(auth))
 }
 
 // kiroEndpointFor resolves the single runtime a credential is valid on. There
@@ -887,11 +844,9 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 
 			recordAPIResponseError(ctx, e.cfg, err)
 
-			// Enhanced socket retry: Check if error is retryable (network timeout, connection reset, etc.)
-			retryCfg := defaultRetryConfig()
-			if isRetryableError(err) && attempt < retryCfg.MaxRetries {
-				delay := calculateRetryDelay(attempt, retryCfg)
-				logRetryAttempt(attempt, retryCfg.MaxRetries, fmt.Sprintf("socket error: %v", err), delay, endpoint.Name)
+			if isRetryableError(err) && attempt < maxRetries {
+				delay := calculateRetryDelay(attempt)
+				logRetryAttempt(attempt, maxRetries, fmt.Sprintf("socket error: %v", err), delay, endpoint.Name)
 				if sleepErr := sleepWithContext(ctx, delay); sleepErr != nil {
 					return resp, sleepErr
 				}
@@ -913,30 +868,15 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 			return resp, statusErr{code: httpResp.StatusCode, msg: summary, retryAfter: retryAfterHeader(httpResp.Header)}
 		}
 
-		// Handle 5xx server errors with exponential backoff retry
-		// Enhanced: Use retryConfig for consistent retry behavior
 		if httpResp.StatusCode >= 500 && httpResp.StatusCode < 600 {
 			respBody, _ := io.ReadAll(httpResp.Body)
 			_ = httpResp.Body.Close()
 			appendAPIResponseChunk(ctx, e.cfg, respBody)
 
-			retryCfg := defaultRetryConfig()
-			// Check if this specific 5xx code is retryable (502, 503, 504)
-			if isRetryableHTTPStatus(httpResp.StatusCode) && attempt < retryCfg.MaxRetries {
-				delay := calculateRetryDelay(attempt, retryCfg)
-				logRetryAttempt(attempt, retryCfg.MaxRetries, fmt.Sprintf("HTTP %d", httpResp.StatusCode), delay, endpoint.Name)
+			if attempt < maxRetries {
+				delay := calculateRetryDelay(attempt)
+				logRetryAttempt(attempt, maxRetries, fmt.Sprintf("HTTP %d", httpResp.StatusCode), delay, endpoint.Name)
 				if sleepErr := sleepWithContext(ctx, delay); sleepErr != nil {
-					return resp, sleepErr
-				}
-				continue
-			} else if attempt < maxRetries {
-				// Fallback for other 5xx errors (500, 501, etc.)
-				backoff := time.Duration(1<<attempt) * time.Second
-				if backoff > 30*time.Second {
-					backoff = 30 * time.Second
-				}
-				log.Warnf("kiro: server error %d, retrying in %v (attempt %d/%d)", httpResp.StatusCode, backoff, attempt+1, maxRetries)
-				if sleepErr := sleepWithContext(ctx, backoff); sleepErr != nil {
 					return resp, sleepErr
 				}
 				continue
@@ -1108,6 +1048,8 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 		return resp, nil
 	}
 
+	// Every continue above is gated on attempt < maxRetries, so the loop only
+	// ends through a return; this satisfies the compiler, not a runtime path.
 	return resp, statusErr{code: http.StatusServiceUnavailable, msg: "kiro: retries exhausted"}
 }
 
@@ -1237,11 +1179,9 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 		if err != nil {
 			recordAPIResponseError(ctx, e.cfg, err)
 
-			// Enhanced socket retry for streaming: Check if error is retryable (network timeout, connection reset, etc.)
-			retryCfg := defaultRetryConfig()
-			if isRetryableError(err) && attempt < retryCfg.MaxRetries {
-				delay := calculateRetryDelay(attempt, retryCfg)
-				logRetryAttempt(attempt, retryCfg.MaxRetries, fmt.Sprintf("stream socket error: %v", err), delay, endpoint.Name)
+			if isRetryableError(err) && attempt < maxRetries {
+				delay := calculateRetryDelay(attempt)
+				logRetryAttempt(attempt, maxRetries, fmt.Sprintf("stream socket error: %v", err), delay, endpoint.Name)
 				if sleepErr := sleepWithContext(ctx, delay); sleepErr != nil {
 					return nil, sleepErr
 				}
@@ -1263,30 +1203,15 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 			return nil, statusErr{code: httpResp.StatusCode, msg: summary, retryAfter: retryAfterHeader(httpResp.Header)}
 		}
 
-		// Handle 5xx server errors with exponential backoff retry
-		// Enhanced: Use retryConfig for consistent retry behavior
 		if httpResp.StatusCode >= 500 && httpResp.StatusCode < 600 {
 			respBody, _ := io.ReadAll(httpResp.Body)
 			_ = httpResp.Body.Close()
 			appendAPIResponseChunk(ctx, e.cfg, respBody)
 
-			retryCfg := defaultRetryConfig()
-			// Check if this specific 5xx code is retryable (502, 503, 504)
-			if isRetryableHTTPStatus(httpResp.StatusCode) && attempt < retryCfg.MaxRetries {
-				delay := calculateRetryDelay(attempt, retryCfg)
-				logRetryAttempt(attempt, retryCfg.MaxRetries, fmt.Sprintf("stream HTTP %d", httpResp.StatusCode), delay, endpoint.Name)
+			if attempt < maxRetries {
+				delay := calculateRetryDelay(attempt)
+				logRetryAttempt(attempt, maxRetries, fmt.Sprintf("stream HTTP %d", httpResp.StatusCode), delay, endpoint.Name)
 				if sleepErr := sleepWithContext(ctx, delay); sleepErr != nil {
-					return nil, sleepErr
-				}
-				continue
-			} else if attempt < maxRetries {
-				// Fallback for other 5xx errors (500, 501, etc.)
-				backoff := time.Duration(1<<attempt) * time.Second
-				if backoff > 30*time.Second {
-					backoff = 30 * time.Second
-				}
-				log.Warnf("kiro: stream server error %d, retrying in %v (attempt %d/%d)", httpResp.StatusCode, backoff, attempt+1, maxRetries)
-				if sleepErr := sleepWithContext(ctx, backoff); sleepErr != nil {
 					return nil, sleepErr
 				}
 				continue
@@ -1461,6 +1386,8 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 		return out, nil
 	}
 
+	// Every continue above is gated on attempt < maxRetries, so the loop only
+	// ends through a return; this satisfies the compiler, not a runtime path.
 	return nil, statusErr{code: http.StatusServiceUnavailable, msg: "kiro: stream retries exhausted"}
 }
 
@@ -2260,7 +2187,7 @@ func (e *KiroExecutor) extractEventTypeFromBytes(headers []byte) string {
 // Buffers official toolUseEvent input fragments without repairing malformed JSON.
 // Extracts stop_reason from upstream events when available.
 func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out chan<- cliproxyexecutor.StreamChunk, targetFormat sdktranslator.Format, model string, originalReq, claudeBody []byte) bool {
-	reader := bufio.NewReaderSize(body, 20*1024*1024) // 20MB buffer to match other providers
+	reader := bufio.NewReader(body)
 	var totalUsage usage.Detail
 	var outputForUsage strings.Builder
 	var hasToolUses bool          // Track if any tool uses were emitted
@@ -2488,66 +2415,6 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 			log.Errorf("kiro: streamToChannel received invalidStateEvent: %s", errMsg)
 			out <- cliproxyexecutor.StreamChunk{Err: streamStatusError("invalid state", errMsg)}
 			return false
-
-		default:
-			// Check for upstream usage events from Kiro API
-			// Format: {"unit":"credit","unitPlural":"credits","usage":1.458}
-			if unit, ok := event["unit"].(string); ok && unit == "credit" {
-				if usage, ok := event["usage"].(float64); ok {
-					upstreamCreditUsage = usage
-					hasUpstreamUsage = true
-					log.Debugf("kiro: received upstream credit usage: %.4f", upstreamCreditUsage)
-				}
-			}
-			// Format: {"contextUsagePercentage":78.56}
-			if ctxPct, ok := event["contextUsagePercentage"].(float64); ok {
-				upstreamContextPercentage = ctxPct
-				log.Debugf("kiro: received upstream context usage: %.2f%%", upstreamContextPercentage)
-			}
-
-			// Check for token counts in unknown events
-			if inputTokens, ok := event["inputTokens"].(float64); ok {
-				totalUsage.InputTokens = int64(inputTokens)
-				hasUpstreamUsage = true
-				log.Debugf("kiro: streamToChannel found inputTokens in event %s: %d", eventType, totalUsage.InputTokens)
-			}
-			if outputTokens, ok := event["outputTokens"].(float64); ok {
-				totalUsage.OutputTokens = int64(outputTokens)
-				hasUpstreamUsage = true
-				log.Debugf("kiro: streamToChannel found outputTokens in event %s: %d", eventType, totalUsage.OutputTokens)
-			}
-			if totalTokens, ok := event["totalTokens"].(float64); ok {
-				totalUsage.TotalTokens = int64(totalTokens)
-				log.Debugf("kiro: streamToChannel found totalTokens in event %s: %d", eventType, totalUsage.TotalTokens)
-			}
-
-			// Check for usage object in unknown events (OpenAI/Claude format)
-			if usageObj, ok := event["usage"].(map[string]interface{}); ok {
-				if inputTokens, ok := usageObj["input_tokens"].(float64); ok {
-					totalUsage.InputTokens = int64(inputTokens)
-					hasUpstreamUsage = true
-				} else if inputTokens, ok := usageObj["prompt_tokens"].(float64); ok {
-					totalUsage.InputTokens = int64(inputTokens)
-					hasUpstreamUsage = true
-				}
-				if outputTokens, ok := usageObj["output_tokens"].(float64); ok {
-					totalUsage.OutputTokens = int64(outputTokens)
-					hasUpstreamUsage = true
-				} else if outputTokens, ok := usageObj["completion_tokens"].(float64); ok {
-					totalUsage.OutputTokens = int64(outputTokens)
-					hasUpstreamUsage = true
-				}
-				if totalTokens, ok := usageObj["total_tokens"].(float64); ok {
-					totalUsage.TotalTokens = int64(totalTokens)
-				}
-				log.Debugf("kiro: streamToChannel found usage object in event %s: input=%d, output=%d, total=%d",
-					eventType, totalUsage.InputTokens, totalUsage.OutputTokens, totalUsage.TotalTokens)
-			}
-
-			// Log unknown event types for debugging (to discover new event formats)
-			if eventType != "" {
-				log.Debugf("kiro: streamToChannel unknown event type: %s", eventType)
-			}
 
 		case "assistantResponseEvent":
 			var contentDelta string
@@ -3019,6 +2886,66 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 				}
 				log.Debugf("kiro: streamToChannel found metricsEvent: input=%d, output=%d",
 					totalUsage.InputTokens, totalUsage.OutputTokens)
+			}
+
+		default:
+			// Check for upstream usage events from Kiro API
+			// Format: {"unit":"credit","unitPlural":"credits","usage":1.458}
+			if unit, ok := event["unit"].(string); ok && unit == "credit" {
+				if usage, ok := event["usage"].(float64); ok {
+					upstreamCreditUsage = usage
+					hasUpstreamUsage = true
+					log.Debugf("kiro: received upstream credit usage: %.4f", upstreamCreditUsage)
+				}
+			}
+			// Format: {"contextUsagePercentage":78.56}
+			if ctxPct, ok := event["contextUsagePercentage"].(float64); ok {
+				upstreamContextPercentage = ctxPct
+				log.Debugf("kiro: received upstream context usage: %.2f%%", upstreamContextPercentage)
+			}
+
+			// Check for token counts in unknown events
+			if inputTokens, ok := event["inputTokens"].(float64); ok {
+				totalUsage.InputTokens = int64(inputTokens)
+				hasUpstreamUsage = true
+				log.Debugf("kiro: streamToChannel found inputTokens in event %s: %d", eventType, totalUsage.InputTokens)
+			}
+			if outputTokens, ok := event["outputTokens"].(float64); ok {
+				totalUsage.OutputTokens = int64(outputTokens)
+				hasUpstreamUsage = true
+				log.Debugf("kiro: streamToChannel found outputTokens in event %s: %d", eventType, totalUsage.OutputTokens)
+			}
+			if totalTokens, ok := event["totalTokens"].(float64); ok {
+				totalUsage.TotalTokens = int64(totalTokens)
+				log.Debugf("kiro: streamToChannel found totalTokens in event %s: %d", eventType, totalUsage.TotalTokens)
+			}
+
+			// Check for usage object in unknown events (OpenAI/Claude format)
+			if usageObj, ok := event["usage"].(map[string]interface{}); ok {
+				if inputTokens, ok := usageObj["input_tokens"].(float64); ok {
+					totalUsage.InputTokens = int64(inputTokens)
+					hasUpstreamUsage = true
+				} else if inputTokens, ok := usageObj["prompt_tokens"].(float64); ok {
+					totalUsage.InputTokens = int64(inputTokens)
+					hasUpstreamUsage = true
+				}
+				if outputTokens, ok := usageObj["output_tokens"].(float64); ok {
+					totalUsage.OutputTokens = int64(outputTokens)
+					hasUpstreamUsage = true
+				} else if outputTokens, ok := usageObj["completion_tokens"].(float64); ok {
+					totalUsage.OutputTokens = int64(outputTokens)
+					hasUpstreamUsage = true
+				}
+				if totalTokens, ok := usageObj["total_tokens"].(float64); ok {
+					totalUsage.TotalTokens = int64(totalTokens)
+				}
+				log.Debugf("kiro: streamToChannel found usage object in event %s: input=%d, output=%d, total=%d",
+					eventType, totalUsage.InputTokens, totalUsage.OutputTokens, totalUsage.TotalTokens)
+			}
+
+			// Log unknown event types for debugging (to discover new event formats)
+			if eventType != "" {
+				log.Debugf("kiro: streamToChannel unknown event type: %s", eventType)
 			}
 		}
 

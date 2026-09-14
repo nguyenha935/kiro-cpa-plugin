@@ -18,6 +18,7 @@ import (
 	"time"
 
 	kiroauth "github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro"
+	kiroexecutor "github.com/nguyenha935/kiro-cpa-plugin/internal/runtime/executor"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -657,6 +658,50 @@ func TestBuildCoreAuthMergesHostExecutorSettings(t *testing.T) {
 	}
 	if kind, value := auth.AccountInfo(); kind != "api_key" || value != "key" {
 		t.Fatalf("AccountInfo() = %q, %q", kind, value)
+	}
+}
+
+// An api_region pin must route the stored credential (profile discovery, model
+// listing, usage) and the runtime request (executor) to the same region,
+// whether the operator put it in the credential document or the host record.
+func TestAPIRegionOverrideRoutesStoredAndRuntimePathsAlike(t *testing.T) {
+	const profile = "arn:aws:codewhisperer:eu-central-1:111122223333:profile/EXAMPLEPROFILE"
+	for _, test := range []struct {
+		name         string
+		storage      string
+		hostMetadata map[string]any
+	}{
+		{name: "credential document", storage: `{"type":"kiro","authMethod":"idc","accessToken":"token","region":"us-east-1","profileArn":"` + profile + `","api_region":" us-east-1 "}`},
+		{name: "host record", storage: `{"type":"kiro","authMethod":"idc","accessToken":"token","region":"us-east-1","profileArn":"` + profile + `"}`, hostMetadata: map[string]any{"api_region": "us-east-1"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			req := pluginapi.ExecutorRequest{AuthID: "kiro-idc-test.json", StorageJSON: []byte(test.storage), AuthMetadata: test.hostMetadata}
+			token, err := decodeToken(req.StorageJSON)
+			if err != nil {
+				t.Fatal(err)
+			}
+			applyHostOwnedSettings(token, req.AuthMetadata, req.AuthAttributes)
+			auth, err := buildCoreAuth(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stored := routingCredential(token)
+			runtime := kiroexecutor.RoutingCredential(auth)
+			if stored != runtime {
+				t.Fatalf("stored credential %+v differs from runtime credential %+v", stored, runtime)
+			}
+			if stored.APIRegion != "us-east-1" || resolveAccount(token).Region != "us-east-1" {
+				t.Fatalf("api_region override lost: credential %+v resolved to %s", stored, resolveAccount(token).Region)
+			}
+		})
+	}
+
+	unpinned, err := decodeToken([]byte(`{"type":"kiro","authMethod":"idc","accessToken":"token","region":"us-east-1","profileArn":"` + profile + `","api_region":7}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resolveAccount(unpinned).Region; got != "eu-central-1" {
+		t.Fatalf("non-string api_region changed the region to %s, want the profile's eu-central-1", got)
 	}
 }
 

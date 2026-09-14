@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
+	"io"
 	"strings"
 	"testing"
+	"time"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -146,6 +149,95 @@ func TestStreamClosesSignedReasoningBeforeDedicatedToolUse(t *testing.T) {
 	}
 	if thinkingStopPosition < 0 || toolStartPosition < 0 || thinkingStopPosition >= toolStartPosition {
 		t.Fatalf("thinking stop position=%d tool start position=%d", thinkingStopPosition, toolStartPosition)
+	}
+}
+
+// A frame whose prelude announces more than the 10 MiB cap is refused as
+// malformed before any of its body is read or allocated, on both the streaming
+// and the buffered path. The body here is deliberately short: a reader that got
+// past the check would fail on the truncated body instead, as a fatal error.
+// Cancelling the request context stops the stream reader between frames and
+// reports the cancellation, so a client that left does not keep the upstream
+// body draining until Kiro finishes generating. The upstream here never stops
+// sending: only the cancellation can end the read.
+func TestStreamStopsReadingWhenTheContextIsCancelled(t *testing.T) {
+	t.Parallel()
+
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	frame := kiroEvent("assistantResponseEvent", `{"assistantResponseEvent":{"content":"more"}}`)
+	go func() {
+		for {
+			if _, err := writer.Write(frame); err != nil {
+				return
+			}
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := make(chan cliproxyexecutor.StreamChunk)
+	finished := make(chan bool, 1)
+	go func() {
+		finished <- (&KiroExecutor{}).streamToChannel(ctx, reader, out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil)
+	}()
+
+	var streamErr error
+	delivered := 0
+	timeout := time.After(2 * time.Second)
+	for {
+		select {
+		case chunk := <-out:
+			delivered++
+			if chunk.Err != nil {
+				streamErr = chunk.Err
+			}
+			if delivered == 3 {
+				cancel()
+			}
+			continue
+		case ok := <-finished:
+			if ok {
+				t.Fatal("streamToChannel reported success for a cancelled stream")
+			}
+		case <-timeout:
+			t.Fatal("streamToChannel kept reading after the context was cancelled")
+		}
+		break
+	}
+	statusErr, ok := streamErr.(interface{ StatusCode() int })
+	if !ok || statusErr.StatusCode() != 499 {
+		t.Fatalf("stream error = %v, want 499 client canceled", streamErr)
+	}
+}
+
+func TestOversizedEventStreamFrameIsRejectedAsMalformed(t *testing.T) {
+	t.Parallel()
+
+	frame := make([]byte, 12)
+	binary.BigEndian.PutUint32(frame[0:4], uint32(maxEventStreamMsgSize+1))
+	binary.BigEndian.PutUint32(frame[4:8], 0)
+	frame = append(frame, make([]byte, 64)...)
+
+	out := make(chan cliproxyexecutor.StreamChunk, 4)
+	if ok := (&KiroExecutor{}).streamToChannel(context.Background(), bytes.NewReader(frame), out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil); ok {
+		t.Fatal("streamToChannel reported success for an oversized frame")
+	}
+	close(out)
+	var streamErr error
+	for chunk := range out {
+		if chunk.Err != nil {
+			streamErr = chunk.Err
+		}
+	}
+	if streamErr == nil || !strings.Contains(streamErr.Error(), "message too large") {
+		t.Fatalf("stream error = %v, want a malformed 'message too large' rejection", streamErr)
+	}
+
+	_, _, _, _, _, err := (&KiroExecutor{}).parseEventStream(bytes.NewReader(frame))
+	var eventErr *EventStreamError
+	if !errors.As(err, &eventErr) || eventErr.Type != ErrStreamMalformed || !strings.Contains(eventErr.Message, "message too large") {
+		t.Fatalf("parseEventStream error = %v, want %s 'message too large'", err, ErrStreamMalformed)
 	}
 }
 
