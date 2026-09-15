@@ -15,6 +15,11 @@ import (
 // stream.emit/stream.close call with the same wire shape the host uses
 // (internal/pluginhost/stream_bridge.go: rpcStreamEmitRequest,
 // rpcStreamCloseRequest) so a field placed in the wrong slot fails the test.
+//
+// Replies follow the host's C callback (host_callbacks_unix.go): a failed call
+// still returns rc=0, so the Go error stays nil and the failure travels in an
+// ok:false envelope body. A stub that returned a Go error instead would pass a
+// plugin that never reads the body.
 type hostStreamRecorder struct {
 	emits     []hostStreamMessage
 	close     *hostStreamMessage
@@ -29,7 +34,7 @@ func (r *hostStreamRecorder) call(method string, request []byte) ([]byte, error)
 	switch method {
 	case pluginabi.MethodHostStreamEmit:
 		if r.failEmits {
-			return nil, errors.New("stream is not open")
+			return errorEnvelope("host_call_failed", "stream "+message.StreamID+" is not open"), nil
 		}
 		r.emits = append(r.emits, message)
 	case pluginabi.MethodHostStreamClose:
@@ -37,7 +42,7 @@ func (r *hostStreamRecorder) call(method string, request []byte) ([]byte, error)
 	default:
 		return nil, errors.New("unexpected host method " + method)
 	}
-	return nil, nil
+	return okEnvelope(struct{}{})
 }
 
 func installStreamRecorder(t *testing.T, recorder *hostStreamRecorder) {
@@ -94,6 +99,26 @@ func TestPumpStreamReportsErrorInCloseErrorField(t *testing.T) {
 	}
 	if recorder.close.StreamID != "s1" || recorder.close.Error != "upstream 429 throttled" {
 		t.Fatalf("close = %+v, want stream s1 with the error in the top-level error field", *recorder.close)
+	}
+}
+
+// The host's C callback reports a rejected emit with rc=0 and an ok:false body,
+// never as a Go error, so streamEmit must decode the envelope to see it.
+func TestStreamEmitReadsRejectionFromEnvelope(t *testing.T) {
+	recorder := &hostStreamRecorder{failEmits: true}
+	installStreamRecorder(t, recorder)
+
+	err := streamEmit("s0", []byte("data: one\n\n"))
+	if err == nil || err.Error() != "stream s0 is not open" {
+		t.Fatalf("streamEmit error = %v, want the host's envelope message", err)
+	}
+
+	recorder.failEmits = false
+	if err := streamEmit("s0", []byte("data: two\n\n")); err != nil {
+		t.Fatalf("streamEmit on an open stream = %v, want nil", err)
+	}
+	if len(recorder.emits) != 1 {
+		t.Fatalf("emits = %d, want the accepted payload only", len(recorder.emits))
 	}
 }
 

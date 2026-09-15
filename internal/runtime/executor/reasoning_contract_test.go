@@ -211,6 +211,57 @@ func TestStreamStopsReadingWhenTheContextIsCancelled(t *testing.T) {
 	}
 }
 
+// An error-typed frame whose payload carries no message must still end the
+// response as a failure. Letting it fall through reaches EOF and emits a
+// message_stop, which presents a truncated answer as a clean end_turn and
+// records a success against the credential.
+func TestErrorFrameWithoutMessageStillFailsTheStream(t *testing.T) {
+	t.Parallel()
+
+	for _, eventType := range []string{"error", "exception", "internalServerException"} {
+		body := kiroEventStream(
+			kiroEvent("assistantResponseEvent", `{"assistantResponseEvent":{"content":"partial"}}`),
+			kiroEvent(eventType, `{}`),
+			kiroEvent("assistantResponseEvent", `{"assistantResponseEvent":{"content":"never"}}`),
+		)
+
+		out := make(chan cliproxyexecutor.StreamChunk, 32)
+		if ok := (&KiroExecutor{}).streamToChannel(context.Background(), bytes.NewReader(body), out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil); ok {
+			t.Fatalf("%s: streamToChannel reported success after an error frame", eventType)
+		}
+		close(out)
+		var streamErr error
+		var visibleText strings.Builder
+		for chunk := range out {
+			if chunk.Err != nil {
+				streamErr = chunk.Err
+				continue
+			}
+			data := eventData(chunk.Payload)
+			if data.Get("type").String() == "message_stop" {
+				t.Fatalf("%s: stream emitted message_stop after an error frame", eventType)
+			}
+			if data.Get("delta.type").String() == "text_delta" {
+				visibleText.WriteString(data.Get("delta.text").String())
+			}
+		}
+		if streamErr == nil || !strings.Contains(streamErr.Error(), eventType) {
+			t.Fatalf("%s: stream error = %v, want the event type as the message", eventType, streamErr)
+		}
+		if visibleText.String() != "partial" {
+			t.Fatalf("%s: visible text = %q, want only the text before the error", eventType, visibleText.String())
+		}
+
+		content, _, _, _, _, err := (&KiroExecutor{}).parseEventStream(bytes.NewReader(body))
+		if err == nil || !strings.Contains(err.Error(), eventType) {
+			t.Fatalf("%s: parseEventStream error = %v, want the event type as the message", eventType, err)
+		}
+		if content != "" {
+			t.Fatalf("%s: parseEventStream content = %q, want none on failure", eventType, content)
+		}
+	}
+}
+
 func TestOversizedEventStreamFrameIsRejectedAsMalformed(t *testing.T) {
 	t.Parallel()
 

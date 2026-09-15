@@ -1977,10 +1977,24 @@ type hostStreamMessage struct {
 // streamHostCall is swapped by tests that drive pumpStream without a host.
 var streamHostCall = hostCall
 
+// streamEmit reports a rejected emit. The host's C callback returns rc=0 even
+// when the call fails and puts the failure in an ok:false envelope instead
+// (internal/pluginhost/host_callbacks_unix.go), so a closed bridge is only
+// visible by decoding the body.
 func streamEmit(streamID string, payload []byte) error {
 	body, _ := json.Marshal(hostStreamMessage{StreamID: streamID, Payload: payload})
-	_, err := streamHostCall(pluginabi.MethodHostStreamEmit, body)
-	return err
+	raw, err := streamHostCall(pluginabi.MethodHostStreamEmit, body)
+	if err != nil {
+		return err
+	}
+	var response hostCallEnvelope
+	if err := json.Unmarshal(raw, &response); err == nil && !response.OK {
+		if response.Error != nil && response.Error.Message != "" {
+			return errors.New(response.Error.Message)
+		}
+		return errors.New("host rejected stream emit")
+	}
+	return nil
 }
 
 // streamClose ends the host stream. A non-nil err is queued by the host as a

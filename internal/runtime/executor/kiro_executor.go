@@ -1888,10 +1888,12 @@ func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.Kir
 				continue
 			}
 
-			// For other errors, return the error
-			if errMsg != "" {
-				return "", nil, nil, usageInfo, stopReason, streamStatusError(errType, errMsg)
+			// An error frame ends the response even when it carries no message:
+			// continuing would return the partial content as a clean completion.
+			if errMsg == "" {
+				errMsg = errType
 			}
+			return "", nil, nil, usageInfo, stopReason, streamStatusError(errType, errMsg)
 
 		default:
 			// Check for contextUsagePercentage in any event
@@ -2393,13 +2395,13 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 
 			log.Errorf("kiro: streamToChannel received error event: type=%s, message=%s", errType, errMsg)
 
-			// Send error to the stream and exit
-			if errMsg != "" {
-				out <- cliproxyexecutor.StreamChunk{
-					Err: streamStatusError(errType, errMsg),
-				}
-				return false
+			// An error frame ends the stream even when it carries no message:
+			// falling through would close the response as a clean end_turn.
+			if errMsg == "" {
+				errMsg = errType
 			}
+			out <- cliproxyexecutor.StreamChunk{Err: streamStatusError(errType, errMsg)}
+			return false
 
 		case "invalidStateEvent":
 			// Invalid state means the upstream rejected this request. Do not emit a
