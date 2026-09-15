@@ -1999,7 +1999,10 @@ func streamEmit(streamID string, payload []byte) error {
 
 // streamClose ends the host stream. A non-nil err is queued by the host as a
 // terminal error chunk after every payload already emitted, so the client sees
-// the failure and the host records it against the credential.
+// the failure and the host records it against the credential. Unlike emit,
+// the reply carries nothing to act on: closing a stream the host already
+// dropped is a silent no-op on its side (stream_bridge.go close), and the
+// plugin has no further step to take for this stream either way.
 func streamClose(streamID string, err error) {
 	message := hostStreamMessage{StreamID: streamID}
 	if err != nil {
