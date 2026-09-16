@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
 // PKCECodes holds PKCE verification codes for OAuth2 PKCE flow
@@ -288,8 +290,11 @@ func LoadKiroIDEToken() (*KiroTokenData, error) {
 	// The device registration file is located at ~/.aws/sso/cache/{clientIdHash}.json
 	if token.ClientIDHash != "" && token.ClientID == "" {
 		if err := loadDeviceRegistration(homeDir, token.ClientIDHash, &token); err != nil {
-			// Log warning but don't fail - token might still work for some operations
-			fmt.Printf("warning: failed to load device registration for clientIdHash %s: %v\n", token.ClientIDHash, err)
+			// Warn but don't fail - the token might still work for some
+			// operations. This is a shared library loaded into CPA, so it goes
+			// through logrus: stdout bypasses the host's log level and size cap
+			// and corrupts the JSON output of `-p`.
+			log.Warnf("kiro: failed to load device registration for clientIdHash %s: %v", token.ClientIDHash, err)
 		}
 	}
 
@@ -370,8 +375,11 @@ func LoadKiroTokenFromPath(tokenPath string) (*KiroTokenData, error) {
 	// For Enterprise Kiro IDE (IDC auth), load clientId and clientSecret from device registration
 	if token.ClientIDHash != "" && token.ClientID == "" {
 		if err := loadDeviceRegistration(homeDir, token.ClientIDHash, &token); err != nil {
-			// Log warning but don't fail - token might still work for some operations
-			fmt.Printf("warning: failed to load device registration for clientIdHash %s: %v\n", token.ClientIDHash, err)
+			// Warn but don't fail - the token might still work for some
+			// operations. This is a shared library loaded into CPA, so it goes
+			// through logrus: stdout bypasses the host's log level and size cap
+			// and corrupts the JSON output of `-p`.
+			log.Warnf("kiro: failed to load device registration for clientIdHash %s: %v", token.ClientIDHash, err)
 		}
 	}
 
