@@ -51,6 +51,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -205,7 +206,7 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 	if request != nil && requestLen > 0 {
 		body = C.GoBytes(unsafe.Pointer(request), C.int(requestLen))
 	}
-	raw, err := handleMethod(C.GoString(method), body)
+	raw, err := callHandler(C.GoString(method), body)
 	if err != nil {
 		writeResponse(response, errorEnvelopeFromError(err))
 		return 1
@@ -213,6 +214,26 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 	writeResponse(response, raw)
 	return 0
 }
+
+// callHandler turns a panic into a failed call. This plugin is a shared
+// library loaded into the CPA process, and neither the export above nor the
+// host's C bridge recovers, so an unhandled panic on one malformed request
+// would take the whole proxy down with it. Recovering here keeps the blast
+// radius at the request that caused it; the panic is still logged so the
+// underlying defect stays visible.
+func callHandler(method string, body []byte) (raw []byte, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			log.Printf("kiro: panic handling %s: %v\n%s", method, recovered, debug.Stack())
+			raw, err = nil, pluginStatusError{status: http.StatusInternalServerError, message: fmt.Sprintf("kiro: internal error handling %s", method)}
+		}
+	}()
+	return handleMethodFunc(method, body)
+}
+
+// handleMethodFunc is the dispatch callHandler protects. Tests replace it to
+// drive a panic through the same seam a translator defect would take.
+var handleMethodFunc = handleMethod
 
 //export cliproxyPluginFree
 func cliproxyPluginFree(ptr unsafe.Pointer, length C.size_t) {

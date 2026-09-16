@@ -116,8 +116,9 @@ jobs:
           go build -trimpath -buildmode=c-shared `
             -ldflags "-X github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro.clientVersion=2.19.0 -X main.pluginVersion=$version" `
             -o package/kiro-ha.dll ./cmd/kiro-plugin
-          # The linker drops an -X that names a missing symbol without an error,
-          # so assert both stamped versions are really in the binary.
+          # The linker drops an -X that names a missing symbol without an error.
+          # Both defaults ("dev") differ from the stamped values, so a missing
+          # string means the stamp never applied.
           $stamped = [System.IO.File]::ReadAllText('package/kiro-ha.dll', [System.Text.Encoding]::ASCII)
           foreach ($needle in @($version, '2.19.0')) {
             if (-not $stamped.Contains($needle)) { throw "kiro-ha.dll is missing stamped version $needle" }
@@ -173,8 +174,9 @@ jobs:
             -ldflags "-X github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro.clientVersion=2.19.0 -X main.pluginVersion=$version" \
             -o package/kiro-ha.so ./cmd/kiro-plugin
           strings package/kiro-ha.so | grep -Fq "$version"
-          # The linker drops an -X that names a missing symbol without an error,
-          # so assert the stamped client version is really in the binary.
+          # The linker drops an -X that names a missing symbol without an error.
+          # This catches it because the source default is "dev", not 2.19.0, so
+          # the string is only present when the stamp actually applied.
           strings package/kiro-ha.so | grep -Fq '2.19.0'
           nm -D package/kiro-ha.so | grep -Fq 'cliproxy_plugin_init'
           sha256sum package/kiro-ha.so | sed 's#package/##' > package/kiro-ha.so.sha256

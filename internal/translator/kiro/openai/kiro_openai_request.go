@@ -518,6 +518,39 @@ func processOpenAIMessages(messages gjson.Result, modelID, origin string) ([]Kir
 	return history, currentUserMsg, currentToolResults
 }
 
+// openAIImageDataURL reads the data URL out of an image block. Both spellings
+// the validator accepts appear in the wild: image_url as an object with a url
+// field (OpenAI Chat) and as a bare string (the Responses input_image shape).
+func openAIImageDataURL(part gjson.Result) string {
+	if url := part.Get("image_url.url").String(); url != "" {
+		return url
+	}
+	return part.Get("image_url").String()
+}
+
+// kiroImageFromDataURL converts a data:image/<format>;base64,<data> URL into a
+// Kiro image. Anything else reports false: Kiro takes inline bytes only, and
+// the validator has already rejected remote URLs by this point.
+func kiroImageFromDataURL(imageURL string) (KiroImage, bool) {
+	if !strings.HasPrefix(imageURL, "data:") {
+		return KiroImage{}, false
+	}
+	idx := strings.Index(imageURL, ";base64,")
+	if idx == -1 {
+		return KiroImage{}, false
+	}
+	mediaType := imageURL[5:idx] // Skip "data:"
+	data := imageURL[idx+8:]     // Skip ";base64,"
+	format := ""
+	if lastSlash := strings.LastIndex(mediaType, "/"); lastSlash != -1 {
+		format = mediaType[lastSlash+1:]
+	}
+	if format == "" || data == "" {
+		return KiroImage{}, false
+	}
+	return KiroImage{Format: format, Source: KiroImageSource{Bytes: data}}, true
+}
+
 // buildUserMessageFromOpenAI builds a user message from OpenAI format and extracts tool results
 func buildUserMessageFromOpenAI(msg gjson.Result, modelID, origin string) (KiroUserInputMessage, []KiroToolResult) {
 	content := msg.Get("content")
@@ -529,7 +562,12 @@ func buildUserMessageFromOpenAI(msg gjson.Result, modelID, origin string) (KiroU
 		for _, part := range content.Array() {
 			partType := part.Get("type").String()
 			switch partType {
-			case "text":
+			// The block names accepted here must stay in step with
+			// validateKiroContentBlocks and hasOpenAIUserContent
+			// (internal/runtime/executor/request_contract.go). A name the
+			// validator admits but this switch drops is content the caller sent,
+			// the model never saw, and nobody was told about.
+			case "text", "input_text":
 				contentBuilder.WriteString(part.Get("text").String())
 			case "tool_result":
 				toolCallID := firstOpenAIValue(part.Get("tool_use_id").String(), part.Get("tool_call_id").String())
@@ -537,29 +575,12 @@ func buildUserMessageFromOpenAI(msg gjson.Result, modelID, origin string) (KiroU
 					isError := part.Get("is_error").Bool() || strings.EqualFold(part.Get("status").String(), "error")
 					toolResults = append(toolResults, buildOpenAIToolResult(toolCallID, part.Get("content"), isError))
 				}
-			case "image_url":
-				imageURL := part.Get("image_url.url").String()
-				if strings.HasPrefix(imageURL, "data:") {
-					// Parse data URL: data:image/png;base64,xxxxx
-					if idx := strings.Index(imageURL, ";base64,"); idx != -1 {
-						mediaType := imageURL[5:idx] // Skip "data:"
-						data := imageURL[idx+8:]     // Skip ";base64,"
-
-						format := ""
-						if lastSlash := strings.LastIndex(mediaType, "/"); lastSlash != -1 {
-							format = mediaType[lastSlash+1:]
-						}
-
-						if format != "" && data != "" {
-							images = append(images, KiroImage{
-								Format: format,
-								Source: KiroImageSource{
-									Bytes: data,
-								},
-							})
-						}
-					}
+			case "image_url", "input_image":
+				if image, ok := kiroImageFromDataURL(openAIImageDataURL(part)); ok {
+					images = append(images, image)
 				}
+			default:
+				log.Debugf("kiro-openai: dropping unsupported content block type %q", partType)
 			}
 		}
 	} else if content.Type == gjson.String {

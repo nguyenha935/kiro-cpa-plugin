@@ -6,9 +6,12 @@ import (
 	"strings"
 )
 
-// clientVersion is set to the Kiro CLI release used for compatibility tests.
-// Release builds may replace it with -ldflags -X.
-var clientVersion = "2.19.0"
+// clientVersion is the Kiro CLI release this plugin reports. Release builds
+// replace it with -ldflags -X. The default is deliberately not a real version:
+// the linker drops an -X that names a missing symbol without reporting it, and
+// a default equal to the stamped value would let that failure pass a build
+// check that greps the binary for it.
+var clientVersion = "dev"
 
 func ClientVersion() string {
 	version := strings.TrimSpace(clientVersion)
