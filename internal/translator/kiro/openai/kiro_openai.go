@@ -137,12 +137,13 @@ func ConvertKiroStreamToOpenAI(ctx context.Context, model string, originalReques
 		// Content block ended - nothing to emit for OpenAI
 
 	case "message_delta":
-		// Message delta with stop_reason
-		stopReason := eventJSON.Get("delta.stop_reason").String()
-		finishReason := mapKiroStopReasonToOpenAI(stopReason)
-		if finishReason != "" {
-			chunk := BuildOpenAISSEFinish(state, finishReason)
-			results = append(results, chunk)
+		// Message delta with stop_reason. A missing stop_reason emits no finish
+		// chunk, but a present one always does: the mapper keeps the value
+		// inside OpenAI's closed set, and ToolCallIndex says whether any tool
+		// block was opened on this stream, which is what picks the fallback.
+		if stopReason := eventJSON.Get("delta.stop_reason").String(); strings.TrimSpace(stopReason) != "" {
+			finishReason := openAIFinishReason(stopReason, state.ToolCallIndex > 0)
+			results = append(results, BuildOpenAISSEFinish(state, finishReason))
 		}
 
 		// Extract usage if present

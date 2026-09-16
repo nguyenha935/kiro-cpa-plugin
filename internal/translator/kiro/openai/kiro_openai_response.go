@@ -63,14 +63,10 @@ func BuildOpenAIResponseWithReasoning(content, reasoningContent string, toolUses
 		}
 	}
 
-	// Use upstream stopReason; apply fallback logic if not provided
-	finishReason := mapKiroStopReasonToOpenAI(stopReason)
-	if finishReason == "" {
-		finishReason = "stop"
-		if len(toolUses) > 0 {
-			finishReason = "tool_calls"
-		}
-		log.Debugf("kiro-openai: buildOpenAIResponse using fallback finish_reason: %s", finishReason)
+	// Use upstream stopReason; fall back when it is missing or unrecognised.
+	finishReason := openAIFinishReason(stopReason, len(toolUses) > 0)
+	if mapKiroStopReasonToOpenAI(stopReason) == "" {
+		log.Debugf("kiro-openai: buildOpenAIResponse using fallback finish_reason %q for stop_reason %q", finishReason, stopReason)
 	}
 
 	response := map[string]interface{}{
@@ -96,7 +92,12 @@ func BuildOpenAIResponseWithReasoning(content, reasoningContent string, toolUses
 	return result
 }
 
-// mapKiroStopReasonToOpenAI converts Kiro/Claude stop_reason to OpenAI finish_reason
+// mapKiroStopReasonToOpenAI converts Kiro/Claude stop_reason to OpenAI
+// finish_reason. OpenAI Chat Completions defines a closed set, and clients
+// branch on it to decide whether to run tools, so an unrecognised upstream
+// value must never reach the client verbatim: it returns "" and the caller
+// picks the fallback, because only the caller knows whether the response
+// carries tool calls. An empty stop_reason returns "" for the same reason.
 func mapKiroStopReasonToOpenAI(stopReason string) string {
 	normalized := strings.ToLower(strings.TrimSpace(stopReason))
 	switch normalized {
@@ -110,9 +111,29 @@ func mapKiroStopReasonToOpenAI(stopReason string) string {
 		return "length"
 	case "content_filtered":
 		return "content_filter"
+	case "pause_turn":
+		// Anthropic pauses a turn while a server-side tool runs. OpenAI has no
+		// equivalent and the client is not being asked to call anything, so
+		// this reports as an ordinary stop rather than tool_calls.
+		return "stop"
+	case "refusal":
+		return "content_filter"
 	default:
-		return normalized
+		return ""
 	}
+}
+
+// openAIFinishReason resolves the finish_reason reported to the client.
+// hasToolCalls decides the fallback: a response that carries tool calls must
+// say tool_calls, otherwise a client stops its tool loop on a complete answer.
+func openAIFinishReason(stopReason string, hasToolCalls bool) string {
+	if finishReason := mapKiroStopReasonToOpenAI(stopReason); finishReason != "" {
+		return finishReason
+	}
+	if hasToolCalls {
+		return "tool_calls"
+	}
+	return "stop"
 }
 
 // BuildOpenAIStreamChunk constructs an OpenAI Chat Completions streaming chunk.
