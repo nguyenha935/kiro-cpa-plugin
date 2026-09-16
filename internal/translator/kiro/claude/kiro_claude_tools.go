@@ -84,10 +84,14 @@ func ProcessToolUseEvent(event map[string]interface{}, current *ToolUseState, pr
 	return []KiroToolUse{toolUse}, nil, nil
 }
 
-// DeduplicateToolUses removes duplicate upstream events without changing their content.
+// DeduplicateToolUses drops an upstream event the stream already delivered.
+// The tool use id is the only key: two calls with different ids are two calls,
+// even when the model asked for the same tool with the same arguments, which is
+// ordinary for an idempotent probe. Keying on name+input as well collapsed them
+// into one, so the client returned one tool_result for a turn that had
+// requested two and the second id never reached it at all.
 func DeduplicateToolUses(toolUses []KiroToolUse) []KiroToolUse {
 	seenIDs := make(map[string]bool)
-	seenContent := make(map[string]bool)
 	unique := make([]KiroToolUse, 0, len(toolUses))
 
 	for _, toolUse := range toolUses {
@@ -95,14 +99,7 @@ func DeduplicateToolUses(toolUses []KiroToolUse) []KiroToolUse {
 			log.Debugf("kiro: removing ID-duplicate tool use: %s (name: %s)", toolUse.ToolUseID, toolUse.Name)
 			continue
 		}
-		inputJSON, _ := json.Marshal(toolUse.Input)
-		contentKey := toolUse.Name + ":" + string(inputJSON)
-		if seenContent[contentKey] {
-			log.Debugf("kiro: removing content-duplicate tool use: %s (id: %s)", toolUse.Name, toolUse.ToolUseID)
-			continue
-		}
 		seenIDs[toolUse.ToolUseID] = true
-		seenContent[contentKey] = true
 		unique = append(unique, toolUse)
 	}
 	return unique
