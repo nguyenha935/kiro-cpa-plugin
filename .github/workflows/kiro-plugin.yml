@@ -128,12 +128,26 @@ jobs:
           Compress-Archive -Path package/* -DestinationPath kiro-ha-windows-amd64.zip
           $archiveHash = (Get-FileHash -Algorithm SHA256 kiro-ha-windows-amd64.zip).Hash.ToLowerInvariant()
           "$archiveHash  kiro-ha-windows-amd64.zip" | Set-Content -NoNewline -Encoding ascii kiro-ha-windows-amd64.zip.sha256
+          # The plugin store looks for one exact asset name per platform and
+          # reads nothing but zip, so a release also carries that name. The
+          # archive above keeps its own name for manual installs.
+          if ($env:RELEASE_TAG) {
+            $storeZip = "kiro-ha_${version}_windows_amd64.zip"
+            Compress-Archive -Path package/* -DestinationPath $storeZip
+            $storeHash = (Get-FileHash -Algorithm SHA256 $storeZip).Hash.ToLowerInvariant()
+            "$storeHash  $storeZip" | Set-Content -Encoding ascii "$storeZip.sha256"
+          }
       - name: Upload release assets
         if: env.RELEASE_TAG != ''
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload $env:RELEASE_TAG kiro-ha-windows-amd64.zip kiro-ha-windows-amd64.zip.sha256 --repo $env:GITHUB_REPOSITORY --clobber
+        run: |
+          $version = $env:RELEASE_TAG.TrimStart('v')
+          gh release upload $env:RELEASE_TAG `
+            kiro-ha-windows-amd64.zip kiro-ha-windows-amd64.zip.sha256 `
+            "kiro-ha_${version}_windows_amd64.zip" "kiro-ha_${version}_windows_amd64.zip.sha256" `
+            --repo $env:GITHUB_REPOSITORY --clobber
 
   linux:
     needs: prepare-release
@@ -182,11 +196,27 @@ jobs:
           sha256sum package/kiro-ha.so | sed 's#package/##' > package/kiro-ha.so.sha256
           tar -C package -czf "kiro-ha-linux-${GOARCH}.tar.gz" kiro-ha.so kiro-ha.h kiro-ha.so.sha256
           sha256sum "kiro-ha-linux-${GOARCH}.tar.gz" > "kiro-ha-linux-${GOARCH}.tar.gz.sha256"
+          # The plugin store looks for one exact asset name per platform and
+          # reads nothing but zip, so a release also carries that name. The
+          # tarball keeps its own name for manual installs.
+          if [[ -n "$RELEASE_TAG" ]]; then
+            store_zip="kiro-ha_${version}_linux_${GOARCH}.zip"
+            zip -j -q "$store_zip" package/kiro-ha.so package/kiro-ha.h package/kiro-ha.so.sha256
+            sha256sum "$store_zip" > "$store_zip.sha256"
+          fi
       - name: Upload release assets
         if: env.RELEASE_TAG != ''
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$RELEASE_TAG" "kiro-ha-linux-${{ matrix.arch }}.tar.gz" "kiro-ha-linux-${{ matrix.arch }}.tar.gz.sha256" --repo "$GITHUB_REPOSITORY" --clobber
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          gh release upload "$RELEASE_TAG" \
+            "kiro-ha-linux-${GOARCH}.tar.gz" \
+            "kiro-ha-linux-${GOARCH}.tar.gz.sha256" \
+            "kiro-ha_${version}_linux_${GOARCH}.zip" \
+            "kiro-ha_${version}_linux_${GOARCH}.zip.sha256" \
+            --repo "$GITHUB_REPOSITORY" --clobber
 
   release:
     if: needs.prepare-release.outputs.tag != ''
@@ -195,6 +225,24 @@ jobs:
     permissions:
       contents: write
     steps:
+      # The store verifies an archive against a single checksums.txt covering
+      # every platform, so it can only be written once all targets uploaded.
+      - name: Publish checksums.txt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+        run: |
+          version="${TAG#v}"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir sums --pattern 'kiro-ha_*.zip.sha256'
+          # awk terminates every record it prints, so a file written without a
+          # trailing newline cannot merge two entries into one unreadable line,
+          # and a CRLF file cannot leave a stray return in the asset name.
+          awk '{ sub(/\r$/, ""); if (NF) print }' sums/*.sha256 > checksums.txt
+          for target in linux_amd64 linux_arm64 windows_amd64; do
+            archive="kiro-ha_${version}_${target}.zip"
+            grep -q " ${archive}\$" checksums.txt || { echo "checksums.txt is missing $archive" >&2; exit 1; }
+          done
+          gh release upload "$TAG" checksums.txt --repo "$GITHUB_REPOSITORY" --clobber
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
