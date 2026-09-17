@@ -1328,7 +1328,7 @@ func listAvailableModels(ctx context.Context, token *kiroauth.KiroTokenData) ([]
 		if err != nil {
 			return nil, pluginStatusError{status: http.StatusBadGateway, message: "list Kiro models: " + err.Error()}
 		}
-		body, readErr := io.ReadAll(resp.Body)
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 		if readErr != nil {
 			return nil, pluginStatusError{status: http.StatusBadGateway, message: "read Kiro models: " + readErr.Error()}
@@ -1620,7 +1620,7 @@ func listAvailableProfiles(ctx context.Context, client *http.Client, endpoint, a
 		if err != nil {
 			return nil, fmt.Errorf("list Kiro profiles: %w", err)
 		}
-		responseBody, readErr := io.ReadAll(resp.Body)
+		responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 		if readErr != nil {
 			return nil, readErr

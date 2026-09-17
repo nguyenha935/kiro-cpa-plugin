@@ -3,6 +3,7 @@ package claude
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -37,14 +38,17 @@ func ProcessToolUseEvent(event map[string]interface{}, current *ToolUseState, pr
 		if toolName == "" {
 			return nil, nil, fmt.Errorf("kiro: tool call %q has no name", toolUseID)
 		}
-		if processedIDs != nil && processedIDs[toolUseID] {
+		// A read, not a claim: recording the id here would make an incomplete
+		// call look delivered, so end of stream would stop reporting it as the
+		// malformed upstream response it is.
+		if processedIDs[toolUseID] {
 			return nil, nil, nil
 		}
 		current = &ToolUseState{ToolUseID: toolUseID, Name: toolName}
 	}
 
 	if current == nil {
-		return nil, nil, fmt.Errorf("kiro: tool event has no toolUseId")
+		return nil, nil, errToolUseHasNoID
 	}
 
 	if inputRaw, ok := tu["input"]; ok {
@@ -77,11 +81,38 @@ func ProcessToolUseEvent(event map[string]interface{}, current *ToolUseState, pr
 		}
 	}
 
-	toolUse := KiroToolUse{ToolUseID: current.ToolUseID, Name: current.Name, Input: input}
-	if processedIDs != nil {
-		processedIDs[current.ToolUseID] = true
+	if _, err := ClaimToolUseID(processedIDs, current.ToolUseID); err != nil {
+		return nil, nil, err
 	}
+	toolUse := KiroToolUse{ToolUseID: current.ToolUseID, Name: current.Name, Input: input}
 	return []KiroToolUse{toolUse}, nil, nil
+}
+
+// errToolUseHasNoID names the one thing every path must agree on.
+var errToolUseHasNoID = errors.New("kiro: tool use has no toolUseId")
+
+// ClaimToolUseID records a tool use as delivered and reports whether the caller
+// should emit it. It is the single decision shared by the dedicated toolUseEvent
+// path and the toolUses array embedded in an assistant response, so the two
+// cannot disagree about what a tool use must carry.
+//
+// A repeated id is not an error: upstream replays completed calls in later
+// events and the client must receive each one exactly once. An empty id is one,
+// because the client answers a tool call by echoing its id back in tool_result,
+// so an id-less call can never be answered — and keying dedup on it also blocks
+// every later call that has no id.
+func ClaimToolUseID(processedIDs map[string]bool, toolUseID string) (duplicate bool, err error) {
+	if toolUseID == "" {
+		return false, errToolUseHasNoID
+	}
+	if processedIDs == nil {
+		return false, nil
+	}
+	if processedIDs[toolUseID] {
+		return true, nil
+	}
+	processedIDs[toolUseID] = true
+	return false, nil
 }
 
 // DeduplicateToolUses drops an upstream event the stream already delivered.
@@ -95,6 +126,13 @@ func DeduplicateToolUses(toolUses []KiroToolUse) []KiroToolUse {
 	unique := make([]KiroToolUse, 0, len(toolUses))
 
 	for _, toolUse := range toolUses {
+		// An id-less call is dropped, not kept once: ClaimToolUseID refuses the
+		// same shape on the streaming paths, and the client could not answer it
+		// either way.
+		if toolUse.ToolUseID == "" {
+			log.Debugf("kiro: dropping tool use with no toolUseId (name: %s)", toolUse.Name)
+			continue
+		}
 		if seenIDs[toolUse.ToolUseID] {
 			log.Debugf("kiro: removing ID-duplicate tool use: %s (name: %s)", toolUse.ToolUseID, toolUse.Name)
 			continue

@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+	log "github.com/sirupsen/logrus"
 )
 
 // BuildClaudeResponse preserves text, signed or redacted reasoning, and tool
@@ -65,7 +66,40 @@ func BuildClaudeResponse(content string, reasoning *KiroReasoningContent, toolUs
 	return result
 }
 
-// NormalizeStopReason converts Kiro's enum spelling to Anthropic's wire values.
+// anthropicStopReasons is the closed set Anthropic's Messages API defines for
+// stop_reason. A client branches on this field to decide whether to run a tool
+// or to keep the turn open, so a value outside the set is either a parse error
+// or a silently wrong decision.
+var anthropicStopReasons = map[string]bool{
+	"end_turn":                      true,
+	"max_tokens":                    true,
+	"stop_sequence":                 true,
+	"tool_use":                      true,
+	"pause_turn":                    true,
+	"refusal":                       true,
+	"model_context_window_exceeded": true,
+}
+
+// NormalizeStopReason converts an upstream stop reason to Anthropic's wire
+// values, or to "" when the value has no Anthropic counterpart. Callers own the
+// "" case: both of them fall back to tool_use or end_turn, and collapsing an
+// unknown value to end_turn here would report a tool-calling turn as finished
+// and stop the client's tool loop.
+//
+// content_filtered is not Anthropic's spelling but is what an AWS-backed
+// upstream reports for blocked output; refusal is Anthropic's value for the same
+// outcome and is the mapping the host uses for its own content_filter
+// (internal/translator/codex/claude in CLIProxyAPI).
 func NormalizeStopReason(stopReason string) string {
-	return strings.ToLower(strings.TrimSpace(stopReason))
+	normalized := strings.ToLower(strings.TrimSpace(stopReason))
+	if normalized == "content_filtered" {
+		return "refusal"
+	}
+	if anthropicStopReasons[normalized] {
+		return normalized
+	}
+	if normalized != "" {
+		log.Debugf("kiro: upstream stop_reason %q is not an Anthropic value; falling back", stopReason)
+	}
+	return ""
 }
