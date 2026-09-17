@@ -24,6 +24,54 @@ var (
 	proxyTransportCacheMutex sync.RWMutex
 )
 
+// The connection-establishment timings of the proxied transport. They are the
+// same values getKiroPooledHTTPClient uses for the unproxied one, so that
+// routing through a proxy does not change how long a dead peer is tolerated: a
+// zero-value http.Transport dials and handshakes without any deadline at all,
+// and the streaming path runs with no client timeout by design (an established
+// upstream must not be cut off mid-answer), so an unreachable proxy used to hang
+// the request indefinitely.
+//
+// These bound the handshake and the wait for the upstream to accept the
+// request, never how long the answer may take: nothing here limits reading the
+// body, which is what the host's convention asks for once a connection is up.
+// ResponseHeaderTimeout is the one value that starts counting after the socket
+// exists. It is included because getKiroPooledHTTPClient already applies it to
+// every unproxied request, streaming included, and it covers the upstream's 200
+// plus headers rather than its output — dropping it here would make a proxied
+// credential the only one that can wait forever for an acknowledgement.
+const (
+	proxyDialTimeout         = 30 * time.Second
+	proxyDialKeepAlive       = 30 * time.Second
+	proxyTLSHandshakeTimeout = 10 * time.Second
+	proxyResponseHeaderWait  = 30 * time.Second
+	proxyExpectContinue      = 1 * time.Second
+	proxyMaxIdleConns        = 100
+	proxyMaxIdleConnsPerHost = 20
+	proxyMaxConnsPerHost     = 50
+	proxyIdleConnTimeout     = 90 * time.Second
+)
+
+// proxyTransportTimings returns the timings every proxy transport shares,
+// whatever its scheme.
+func proxyTransportTimings() *http.Transport {
+	return &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   proxyDialTimeout,
+			KeepAlive: proxyDialKeepAlive,
+		}).DialContext,
+		TLSHandshakeTimeout:   proxyTLSHandshakeTimeout,
+		ResponseHeaderTimeout: proxyResponseHeaderWait,
+		ExpectContinueTimeout: proxyExpectContinue,
+		// The unproxied client pools, so the proxied one pools the same way;
+		// otherwise a proxy turns connection reuse off for every credential.
+		MaxIdleConns:        proxyMaxIdleConns,
+		MaxIdleConnsPerHost: proxyMaxIdleConnsPerHost,
+		MaxConnsPerHost:     proxyMaxConnsPerHost,
+		IdleConnTimeout:     proxyIdleConnTimeout,
+	}
+}
+
 // newProxyAwareHTTPClient creates an HTTP client with proper proxy configuration priority:
 // 1. Use auth.ProxyURL if configured (highest priority)
 // 2. Use cfg.ProxyURL if auth proxy is not configured
@@ -115,15 +163,28 @@ func buildProxyTransport(proxyURL string) *http.Transport {
 			log.Errorf("create SOCKS5 dialer failed: %v", errSOCKS5)
 			return nil
 		}
-		// Set up a custom transport using the SOCKS5 dialer
-		transport = &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return dialer.Dial(network, addr)
-			},
+		// proxy.SOCKS5 returns a *socks.Dialer, which implements ContextDialer.
+		// Dialing through it is what carries the request's deadline and its
+		// cancellation: the deprecated Dial it replaced ran the whole handshake
+		// against context.Background(), so a client that had left and a dial
+		// timeout both went unnoticed.
+		contextDialer, ok := dialer.(proxy.ContextDialer)
+		if !ok {
+			// A dialer without context support would hang exactly as before, so
+			// refuse the proxy and let the caller fall back rather than build it.
+			log.Errorf("SOCKS5 dialer cannot dial with a context: %T", dialer)
+			return nil
 		}
+		transport = proxyTransportTimings()
+		transport.DialContext = contextDialer.DialContext
+		// A custom DialContext disables HTTP/2 conservatively; the unproxied
+		// transport asks for it, so ask here too.
+		transport.ForceAttemptHTTP2 = true
 	} else if parsedURL.Scheme == "http" || parsedURL.Scheme == "https" {
 		// Configure HTTP or HTTPS proxy
-		transport = &http.Transport{Proxy: http.ProxyURL(parsedURL)}
+		transport = proxyTransportTimings()
+		transport.Proxy = http.ProxyURL(parsedURL)
+		transport.ForceAttemptHTTP2 = true
 	} else {
 		log.Errorf("unsupported proxy scheme: %s", parsedURL.Scheme)
 		return nil

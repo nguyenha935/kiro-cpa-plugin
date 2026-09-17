@@ -860,7 +860,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 		// 429 goes straight back to CPA, which owns the per-credential backoff
 		// ladder and the failover to the next credential.
 		if httpResp.StatusCode == http.StatusTooManyRequests {
-			respBody, _ := io.ReadAll(httpResp.Body)
+			respBody := readUpstreamErrorBody(httpResp.Body)
 			_ = httpResp.Body.Close()
 			appendAPIResponseChunk(ctx, e.cfg, respBody)
 			summary := summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)
@@ -869,7 +869,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 		}
 
 		if httpResp.StatusCode >= 500 && httpResp.StatusCode < 600 {
-			respBody, _ := io.ReadAll(httpResp.Body)
+			respBody := readUpstreamErrorBody(httpResp.Body)
 			_ = httpResp.Body.Close()
 			appendAPIResponseChunk(ctx, e.cfg, respBody)
 
@@ -886,7 +886,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 		}
 
 		if httpResp.StatusCode == http.StatusBadRequest {
-			respBody, _ := io.ReadAll(httpResp.Body)
+			respBody := readUpstreamErrorBody(httpResp.Body)
 			_ = httpResp.Body.Close()
 			appendAPIResponseChunk(ctx, e.cfg, respBody)
 			if attempt == 0 && isThinkingSignatureInvalid(respBody) {
@@ -902,7 +902,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 		// Handle 401 errors with token refresh and retry
 		// 401 = Unauthorized (token expired/invalid) - refresh token
 		if httpResp.StatusCode == 401 {
-			respBody, _ := io.ReadAll(httpResp.Body)
+			respBody := readUpstreamErrorBody(httpResp.Body)
 			_ = httpResp.Body.Close()
 			appendAPIResponseChunk(ctx, e.cfg, respBody)
 			if isAPIKeyAuth(auth) {
@@ -941,7 +941,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 		// Handle 402 errors - Monthly Limit Reached. CPA needs a 429 to
 		// rotate away from this credential.
 		if httpResp.StatusCode == 402 {
-			respBody, _ := io.ReadAll(httpResp.Body)
+			respBody := readUpstreamErrorBody(httpResp.Body)
 			_ = httpResp.Body.Close()
 			appendAPIResponseChunk(ctx, e.cfg, respBody)
 
@@ -954,7 +954,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 
 		// Handle 403 errors - Access Denied / Token Expired
 		if httpResp.StatusCode == 403 {
-			respBody, _ := io.ReadAll(httpResp.Body)
+			respBody := readUpstreamErrorBody(httpResp.Body)
 			_ = httpResp.Body.Close()
 			appendAPIResponseChunk(ctx, e.cfg, respBody)
 
@@ -1010,7 +1010,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 		}
 
 		if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-			b, _ := io.ReadAll(httpResp.Body)
+			b := readUpstreamErrorBody(httpResp.Body)
 			appendAPIResponseChunk(ctx, e.cfg, b)
 			log.Debugf("kiro request error, status: %d, body: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 			err = statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), b)}
@@ -1195,7 +1195,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 		// 429 goes straight back to CPA, which owns the per-credential backoff
 		// ladder and the failover to the next credential.
 		if httpResp.StatusCode == http.StatusTooManyRequests {
-			respBody, _ := io.ReadAll(httpResp.Body)
+			respBody := readUpstreamErrorBody(httpResp.Body)
 			_ = httpResp.Body.Close()
 			appendAPIResponseChunk(ctx, e.cfg, respBody)
 			summary := summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)
@@ -1204,7 +1204,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 		}
 
 		if httpResp.StatusCode >= 500 && httpResp.StatusCode < 600 {
-			respBody, _ := io.ReadAll(httpResp.Body)
+			respBody := readUpstreamErrorBody(httpResp.Body)
 			_ = httpResp.Body.Close()
 			appendAPIResponseChunk(ctx, e.cfg, respBody)
 
@@ -1222,7 +1222,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 
 		// Handle 400 errors - Credential/Validation issues
 		if httpResp.StatusCode == 400 {
-			respBody, _ := io.ReadAll(httpResp.Body)
+			respBody := readUpstreamErrorBody(httpResp.Body)
 			_ = httpResp.Body.Close()
 			appendAPIResponseChunk(ctx, e.cfg, respBody)
 
@@ -1242,7 +1242,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 		// Handle 401 errors with token refresh and retry
 		// 401 = Unauthorized (token expired/invalid) - refresh token
 		if httpResp.StatusCode == 401 {
-			respBody, _ := io.ReadAll(httpResp.Body)
+			respBody := readUpstreamErrorBody(httpResp.Body)
 			_ = httpResp.Body.Close()
 			appendAPIResponseChunk(ctx, e.cfg, respBody)
 			if isAPIKeyAuth(auth) {
@@ -1280,7 +1280,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 
 		// Handle 402 errors - Monthly Limit Reached.
 		if httpResp.StatusCode == 402 {
-			respBody, _ := io.ReadAll(httpResp.Body)
+			respBody := readUpstreamErrorBody(httpResp.Body)
 			_ = httpResp.Body.Close()
 			appendAPIResponseChunk(ctx, e.cfg, respBody)
 
@@ -1293,7 +1293,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 
 		// Handle 403 errors - Access Denied / Token Expired
 		if httpResp.StatusCode == 403 {
-			respBody, _ := io.ReadAll(httpResp.Body)
+			respBody := readUpstreamErrorBody(httpResp.Body)
 			_ = httpResp.Body.Close()
 			appendAPIResponseChunk(ctx, e.cfg, respBody)
 
@@ -1348,7 +1348,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 		}
 
 		if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-			b, _ := io.ReadAll(httpResp.Body)
+			b := readUpstreamErrorBody(httpResp.Body)
 			appendAPIResponseChunk(ctx, e.cfg, b)
 			summary := summarizeErrorBody(httpResp.Header.Get("Content-Type"), b)
 			log.Debugf("kiro stream error, status: %d, body: %s", httpResp.StatusCode, summary)
@@ -1603,12 +1603,14 @@ func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.Kir
 					for _, tuRaw := range toolUsesRaw {
 						if tu, ok := tuRaw.(map[string]interface{}); ok {
 							toolUseID := kirocommon.GetStringValue(tu, "toolUseId")
-							// Check for duplicate
-							if processedIDs[toolUseID] {
+							duplicate, err := kiroclaude.ClaimToolUseID(processedIDs, toolUseID)
+							if err != nil {
+								return "", nil, nil, usageInfo, stopReason, err
+							}
+							if duplicate {
 								log.Debugf("kiro: skipping duplicate tool use from assistantResponse: %s", toolUseID)
 								continue
 							}
-							processedIDs[toolUseID] = true
 
 							toolUse := kiroclaude.KiroToolUse{
 								ToolUseID: toolUseID,
@@ -1631,12 +1633,14 @@ func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.Kir
 				for _, tuRaw := range toolUsesRaw {
 					if tu, ok := tuRaw.(map[string]interface{}); ok {
 						toolUseID := kirocommon.GetStringValue(tu, "toolUseId")
-						// Check for duplicate
-						if processedIDs[toolUseID] {
+						duplicate, err := kiroclaude.ClaimToolUseID(processedIDs, toolUseID)
+						if err != nil {
+							return "", nil, nil, usageInfo, stopReason, err
+						}
+						if duplicate {
 							log.Debugf("kiro: skipping duplicate direct tool use: %s", toolUseID)
 							continue
 						}
-						processedIDs[toolUseID] = true
 
 						toolUse := kiroclaude.KiroToolUse{
 							ToolUseID: toolUseID,
@@ -2221,6 +2225,27 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 	messageStartSent := false
 	isTextBlockOpen := false
 
+	// emitMessageStart opens the Anthropic message exactly once. message_delta
+	// and message_stop are meaningless before it: a client that receives a
+	// terminal event for a message it was never told about has no message id to
+	// attach the usage or the stop_reason to, and the SDKs reject the stream.
+	// A frame with no payload and one whose payload is not JSON are both skipped
+	// before reaching the switch, so a stream made only of those used to close
+	// without ever opening.
+	emitMessageStart := func() {
+		if messageStartSent {
+			return
+		}
+		msgStart := kiroclaude.BuildClaudeMessageStartEvent(model, totalUsage.InputTokens)
+		sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, msgStart, &translatorParam)
+		for _, chunk := range sseData {
+			if len(chunk) > 0 {
+				out <- cliproxyexecutor.StreamChunk{Payload: append(bytes.Clone(chunk), '\n', '\n')}
+			}
+		}
+		messageStartSent = true
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -2301,17 +2326,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 			log.Debugf("kiro: streamToChannel found stopReason (top-level): %s", upstreamStopReason)
 		}
 
-		// Send message_start on first event
-		if !messageStartSent {
-			msgStart := kiroclaude.BuildClaudeMessageStartEvent(model, totalUsage.InputTokens)
-			sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, msgStart, &translatorParam)
-			for _, chunk := range sseData {
-				if len(chunk) > 0 {
-					out <- cliproxyexecutor.StreamChunk{Payload: append(bytes.Clone(chunk), '\n', '\n')}
-				}
-			}
-			messageStartSent = true
-		}
+		emitMessageStart()
 
 		switch eventType {
 		case "followupPromptEvent":
@@ -2501,12 +2516,15 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 				toolUseID := kirocommon.GetString(tu, "toolUseId")
 				toolName := kirocommon.GetString(tu, "name")
 
-				// Check for duplicate
-				if processedIDs[toolUseID] {
+				duplicate, err := kiroclaude.ClaimToolUseID(processedIDs, toolUseID)
+				if err != nil {
+					out <- cliproxyexecutor.StreamChunk{Err: streamStatusError("invalid tool event", err.Error())}
+					return false
+				}
+				if duplicate {
 					log.Debugf("kiro: skipping duplicate tool use in stream: %s", toolUseID)
 					continue
 				}
-				processedIDs[toolUseID] = true
 
 				hasToolUses = true
 				outputForUsage.WriteString("\n")
@@ -3052,6 +3070,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 	}
 
 	// Send message_delta event
+	emitMessageStart()
 	msgDelta := kiroclaude.BuildClaudeMessageDeltaEvent(stopReason, totalUsage)
 	sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, msgDelta, &translatorParam)
 	for _, chunk := range sseData {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"html"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -187,6 +188,22 @@ func payloadRequestedModel(opts cliproxyexecutor.Options, fallback string) strin
 		return model
 	}
 	return fallback
+}
+
+// maxUpstreamErrorBodyBytes bounds the read of an upstream error body, matching
+// the 1 MiB cap the discovery and auth paths already use. Every consumer either
+// summarizes the body down to 512 bytes or searches it for a known marker, so
+// nothing is lost by not buffering an arbitrarily long one, while an unbounded
+// ReadAll turns a broken or hostile upstream into a memory spike inside the
+// shared CPA process.
+const maxUpstreamErrorBodyBytes = 1 << 20
+
+// readUpstreamErrorBody reads an upstream error body within that bound. The read
+// error is deliberately dropped: the caller already holds an HTTP status to
+// report, and a body that cannot be read only makes that message shorter.
+func readUpstreamErrorBody(body io.Reader) []byte {
+	read, _ := io.ReadAll(io.LimitReader(body, maxUpstreamErrorBodyBytes))
+	return read
 }
 
 func summarizeErrorBody(contentType string, body []byte) string {
