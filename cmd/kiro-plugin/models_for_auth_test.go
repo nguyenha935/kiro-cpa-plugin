@@ -23,7 +23,7 @@ func (fn catalogTransport) RoundTrip(request *http.Request) (*http.Response, err
 const builderIDCatalog = `{"models":[{"modelId":"claude-sonnet-4.5","modelName":"Claude Sonnet 4.5","tokenLimits":{"maxInputTokens":200000,"maxOutputTokens":64000}}]}`
 
 // stubCatalog answers every outbound request with handler, counts the calls and
-// fails the test if anything tries to renew the token.
+// fails the test if model.for_auth tries to renew the token.
 func stubCatalog(t *testing.T, handler func(*http.Request) (*http.Response, error)) *int {
 	t.Helper()
 	calls := 0
@@ -44,19 +44,16 @@ func catalogResponse(status int, body string) *http.Response {
 	return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}
 }
 
-// credential builds a stored Builder ID credential. catalogToken, when set,
-// stores a one-model catalogue listed with that access token.
-func credential(t *testing.T, accessToken string, expiresAt time.Time, catalogToken string) []byte {
+// credential builds a stored Builder ID credential, optionally carrying a
+// one-model catalogue (claude-haiku-4.5).
+func credential(t *testing.T, accessToken string, expiresAt time.Time, withCatalog bool) []byte {
 	t.Helper()
 	fields := map[string]any{
 		"accessToken": accessToken, "refreshToken": "refresh", "clientId": "client", "clientSecret": "secret",
 		"authMethod": "builder-id", "region": "us-east-1", "expiresAt": expiresAt.UTC().Format(time.RFC3339),
 	}
-	if catalogToken != "" {
-		fields["kiro_model_catalog"] = storedCatalog{
-			Token:  accessTokenFingerprint(&kiroauth.KiroTokenData{AccessToken: catalogToken}),
-			Models: []controlPlaneModel{{ModelID: "claude-haiku-4.5"}},
-		}
+	if withCatalog {
+		fields[modelCatalogKey] = storedCatalog{Models: []controlPlaneModel{{ModelID: "claude-haiku-4.5"}}}
 	}
 	raw, _ := json.Marshal(fields)
 	return raw
@@ -69,15 +66,20 @@ func modelsForAuth(t *testing.T, storage []byte) (pluginapi.ModelResponse, error
 	if err != nil {
 		return pluginapi.ModelResponse{}, err
 	}
-	var envelope envelope
 	var response pluginapi.ModelResponse
+	decodeEnvelope(t, raw, &response)
+	return response, nil
+}
+
+func decodeEnvelope(t *testing.T, raw []byte, result any) {
+	t.Helper()
+	var envelope envelope
 	if err := json.Unmarshal(raw, &envelope); err != nil {
 		t.Fatal(err)
 	}
-	if err := json.Unmarshal(envelope.Result, &response); err != nil {
+	if err := json.Unmarshal(envelope.Result, result); err != nil {
 		t.Fatal(err)
 	}
-	return response, nil
 }
 
 func modelIDs(response pluginapi.ModelResponse) string {
@@ -88,17 +90,31 @@ func modelIDs(response pluginapi.ModelResponse) string {
 	return strings.Join(ids, ",")
 }
 
-// A stored catalogue answers registration without touching the network, both
-// for the token it was listed with and for an expired token awaiting renewal.
+func catalogOf(t *testing.T, storage []byte) string {
+	t.Helper()
+	token, err := decodeKiroCredential(storage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, ok := storedModelCatalog(token)
+	if !ok {
+		return ""
+	}
+	ids := make([]string, 0, len(stored.Models))
+	for _, model := range stored.Models {
+		ids = append(ids, model.ModelID)
+	}
+	return strings.Join(ids, ",")
+}
+
+// A stored catalogue answers registration without touching the network,
+// whether the token is valid or has expired and awaits CPA's renewal.
 func TestModelsForAuthAnswersFromStoredCatalogWithoutNetwork(t *testing.T) {
 	calls := stubCatalog(t, func(*http.Request) (*http.Response, error) {
 		return catalogResponse(http.StatusOK, builderIDCatalog), nil
 	})
-	for name, storage := range map[string][]byte{
-		"same token":    credential(t, "access", time.Now().Add(30*time.Minute), "access"),
-		"expired token": credential(t, "renewed-elsewhere", time.Now().Add(-time.Minute), "access"),
-	} {
-		response, err := modelsForAuth(t, storage)
+	for name, expiresAt := range map[string]time.Time{"valid token": time.Now().Add(30 * time.Minute), "expired token": time.Now().Add(-time.Minute)} {
+		response, err := modelsForAuth(t, credential(t, "access", expiresAt, true))
 		if err != nil || modelIDs(response) != "claude-haiku-4.5" {
 			t.Fatalf("%s: models = %q, err = %v; want the stored catalogue", name, modelIDs(response), err)
 		}
@@ -111,92 +127,122 @@ func TestModelsForAuthAnswersFromStoredCatalogWithoutNetwork(t *testing.T) {
 	}
 }
 
-// Without a stored catalogue the credential is listed once and the listing is
-// persisted through AuthUpdate, keyed to the token it was made with.
+// A credential that was never listed is listed once, with the stored token,
+// and the listing is persisted through AuthUpdate.
 func TestModelsForAuthListsAndStoresCatalog(t *testing.T) {
-	for name, catalogToken := range map[string]string{"no catalogue": "", "token renewed since": "old-access"} {
-		calls := stubCatalog(t, func(request *http.Request) (*http.Response, error) {
-			if request.Header.Get("Authorization") != "Bearer access" {
-				t.Fatalf("catalogue was not requested with the stored token")
-			}
-			return catalogResponse(http.StatusOK, builderIDCatalog), nil
-		})
-		response, err := modelsForAuth(t, credential(t, "access", time.Now().Add(30*time.Minute), catalogToken))
-		if err != nil || modelIDs(response) != "claude-sonnet-4.5" || *calls != 1 {
-			t.Fatalf("%s: models = %q after %d calls, err = %v", name, modelIDs(response), *calls, err)
+	calls := stubCatalog(t, func(request *http.Request) (*http.Response, error) {
+		if request.Header.Get("Authorization") != "Bearer access" {
+			t.Fatalf("catalogue was not requested with the stored token")
 		}
-		saved, err := decodeKiroCredential(response.AuthUpdate.StorageJSON)
-		if err != nil {
-			t.Fatalf("%s: AuthUpdate carries no credential: %v", name, err)
-		}
-		stored, ok := storedModelCatalog(saved)
-		if !ok || stored.Token != accessTokenFingerprint(saved) || len(stored.Models) != 1 || stored.Models[0].ModelID != "claude-sonnet-4.5" {
-			t.Fatalf("%s: persisted catalogue = %+v", name, stored)
-		}
-		if strings.Contains(string(response.AuthUpdate.StorageJSON), `"token":"access"`) {
-			t.Fatalf("%s: the access token itself was stored as the fingerprint", name)
-		}
-	}
-}
-
-// An expired token with no catalogue is a credential error, with no network call.
-func TestModelsForAuthRejectsExpiredTokenWithoutCatalog(t *testing.T) {
-	calls := stubCatalog(t, func(*http.Request) (*http.Response, error) {
 		return catalogResponse(http.StatusOK, builderIDCatalog), nil
 	})
-	_, err := modelsForAuth(t, credential(t, "access", time.Now().Add(-time.Minute), ""))
-	var status interface{ StatusCode() int }
-	if !errors.As(err, &status) || status.StatusCode() != http.StatusUnauthorized {
-		t.Fatalf("error = %v, want 401", err)
+	response, err := modelsForAuth(t, credential(t, "access", time.Now().Add(30*time.Minute), false))
+	if err != nil || modelIDs(response) != "claude-sonnet-4.5" || *calls != 1 {
+		t.Fatalf("models = %q after %d calls, err = %v", modelIDs(response), *calls, err)
 	}
-	if *calls != 0 {
-		t.Fatalf("expired credential made %d network calls", *calls)
+	if got := catalogOf(t, response.AuthUpdate.StorageJSON); got != "claude-sonnet-4.5" {
+		t.Fatalf("persisted catalogue = %q", got)
 	}
 }
 
-// When a relisting fails transiently the stored catalogue still answers; a
-// rejection of the credential is never masked by it.
-func TestModelsForAuthFallsBackOnlyForTransientFailures(t *testing.T) {
-	status := 0
-	stubCatalog(t, func(*http.Request) (*http.Response, error) {
-		if status == 0 {
-			return nil, errors.New("dial tcp: lookup q.us-east-1.amazonaws.com: server misbehaving")
+// Without a catalogue an expired token is a credential error with no network
+// call, and a failed listing is an error rather than an empty model list.
+func TestModelsForAuthWithoutCatalogReportsFailures(t *testing.T) {
+	status := http.StatusOK
+	calls := stubCatalog(t, func(*http.Request) (*http.Response, error) {
+		return catalogResponse(status, builderIDCatalog), nil
+	})
+	_, err := modelsForAuth(t, credential(t, "access", time.Now().Add(-time.Minute), false))
+	var statusErr interface{ StatusCode() int }
+	if !errors.As(err, &statusErr) || statusErr.StatusCode() != http.StatusUnauthorized || *calls != 0 {
+		t.Fatalf("expired: error = %v after %d calls, want 401 and no call", err, *calls)
+	}
+	for _, failing := range []int{http.StatusServiceUnavailable, http.StatusForbidden} {
+		status = failing
+		if _, err := modelsForAuth(t, credential(t, "access", time.Now().Add(30*time.Minute), false)); err == nil {
+			t.Fatalf("status %d: a failed listing returned models", failing)
+		}
+	}
+}
+
+func refreshAuth(t *testing.T, storage []byte) pluginapi.AuthRefreshResponse {
+	t.Helper()
+	request, _ := json.Marshal(pluginapi.AuthRefreshRequest{AuthID: "kiro.json", StorageJSON: storage})
+	raw, err := handleRefreshAuth(request)
+	if err != nil {
+		t.Fatalf("auth.refresh: %v", err)
+	}
+	var response pluginapi.AuthRefreshResponse
+	decodeEnvelope(t, raw, &response)
+	return response
+}
+
+// auth.refresh, which CPA schedules off the startup path, is where the stored
+// catalogue is renewed. A failed relisting keeps the old catalogue and does not
+// fail the token refresh.
+func TestRefreshAuthRelistsCatalog(t *testing.T) {
+	original := authRefreshCredential
+	t.Cleanup(func() { authRefreshCredential = original })
+	authRefreshCredential = func(_ context.Context, token *kiroauth.KiroTokenData) (*kiroauth.KiroTokenData, error) {
+		refreshed := &kiroauth.KiroTokenData{AccessToken: "renewed", RefreshToken: "refresh", AuthMethod: "builder-id", Region: "us-east-1",
+			ExpiresAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339)}
+		carryHostOwnedFields(token, refreshed)
+		return refreshed, nil
+	}
+	status := http.StatusOK
+	stubCatalog(t, func(request *http.Request) (*http.Response, error) {
+		if request.Header.Get("Authorization") != "Bearer renewed" {
+			t.Fatalf("relisting did not use the renewed token")
 		}
 		return catalogResponse(status, builderIDCatalog), nil
 	})
-	renewed := credential(t, "access", time.Now().Add(30*time.Minute), "old-access")
-	for _, transient := range []int{0, http.StatusServiceUnavailable, http.StatusTooManyRequests} {
-		status = transient
-		response, err := modelsForAuth(t, renewed)
-		if err != nil || modelIDs(response) != "claude-haiku-4.5" {
-			t.Fatalf("status %d: models = %q, err = %v; want the stored catalogue", transient, modelIDs(response), err)
-		}
+	stored := credential(t, "access", time.Now().Add(5*time.Minute), true)
+
+	if got := catalogOf(t, refreshAuth(t, stored).Auth.StorageJSON); got != "claude-sonnet-4.5" {
+		t.Fatalf("catalogue after refresh = %q, want the relisted one", got)
 	}
-	status = http.StatusForbidden
-	if _, err := modelsForAuth(t, renewed); err == nil {
-		t.Fatal("a 403 was masked by the stored catalogue")
-	}
-	status = 0
-	if _, err := modelsForAuth(t, credential(t, "access", time.Now().Add(30*time.Minute), "")); err == nil {
-		t.Fatal("a failed listing without a catalogue returned models")
+	status = http.StatusServiceUnavailable
+	if got := catalogOf(t, refreshAuth(t, stored).Auth.StorageJSON); got != "claude-haiku-4.5" {
+		t.Fatalf("catalogue after a failed relisting = %q, want the previous one kept", got)
 	}
 }
 
-// auth.refresh builds a new credential from the provider's answer; it must
-// keep the stored catalogue, or every renewal would force a live listing at the
-// next start.
+// The token refresh transport builds a new credential from the provider's
+// answer; it must carry the stored catalogue over.
 func TestRefreshKeepsStoredCatalog(t *testing.T) {
-	from, err := decodeKiroCredential(credential(t, "access", time.Now(), "access"))
+	from, err := decodeKiroCredential(credential(t, "access", time.Now(), true))
 	if err != nil {
 		t.Fatal(err)
 	}
 	to := &kiroauth.KiroTokenData{AccessToken: "renewed"}
 	carryHostOwnedFields(from, to)
-	stored, ok := storedModelCatalog(to)
-	if !ok || stored.Models[0].ModelID != "claude-haiku-4.5" {
+	if stored, ok := storedModelCatalog(to); !ok || stored.Models[0].ModelID != "claude-haiku-4.5" {
 		t.Fatal("refresh dropped the stored catalogue")
 	}
-	if _, inMetadata := authMetadata(to)["kiro_model_catalog"]; inMetadata {
+	if _, inMetadata := authMetadata(to)[modelCatalogKey]; inMetadata {
+		t.Fatal("the catalogue leaked into auth metadata")
+	}
+}
+
+// Host metadata overrides stored fields on save. A stale catalogue held there
+// must not replace the listing being saved.
+func TestSavedCatalogIsNotOverriddenByHostMetadata(t *testing.T) {
+	token, err := decodeKiroCredential(credential(t, "access", time.Now().Add(30*time.Minute), true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	token.HostMetadata = map[string]any{
+		modelCatalogKey: map[string]any{"models": []any{map[string]any{"modelId": "stale-model"}}},
+		"priority":      3,
+	}
+	data := authData(token, "kiro.json")
+	if got := catalogOf(t, data.StorageJSON); got != "claude-haiku-4.5" {
+		t.Fatalf("host metadata replaced the saved catalogue: %q", got)
+	}
+	if saved, _ := decodeKiroCredential(data.StorageJSON); saved.Priority != 3 {
+		t.Fatal("other host-owned settings must still be persisted")
+	}
+	if _, ok := data.Metadata[modelCatalogKey]; ok {
 		t.Fatal("the catalogue leaked into auth metadata")
 	}
 }
@@ -213,30 +259,5 @@ func TestOAuthCredentialsEnterCPARefreshScheduler(t *testing.T) {
 	apiKey := &kiroauth.KiroTokenData{AccessToken: "a", AuthMethod: "api_key", Region: "us-east-1"}
 	if _, ok := authMetadata(apiKey)[refreshIntervalKey]; ok {
 		t.Fatal("API keys cannot be refreshed and must not be scheduled")
-	}
-}
-
-// Host metadata overrides stored fields on save. A stale catalogue held there
-// must not replace the listing being saved, or the fingerprint never matches
-// and every registration lists again.
-func TestSavedCatalogIsNotOverriddenByHostMetadata(t *testing.T) {
-	token, err := decodeKiroCredential(credential(t, "access", time.Now().Add(30*time.Minute), "access"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	token.HostMetadata = map[string]any{modelCatalogKey: map[string]any{"token": "stale"}, "priority": 3}
-	data := authData(token, "kiro.json")
-	saved, err := decodeKiroCredential(data.StorageJSON)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if stored, ok := storedModelCatalog(saved); !ok || stored.Token != accessTokenFingerprint(token) {
-		t.Fatalf("host metadata replaced the saved catalogue: %s", saved.ModelCatalog)
-	}
-	if saved.Priority != 3 {
-		t.Fatal("other host-owned settings must still be persisted")
-	}
-	if _, ok := data.Metadata[modelCatalogKey]; ok {
-		t.Fatal("the catalogue leaked into auth metadata")
 	}
 }

@@ -100,8 +100,8 @@ const (
 	// every token renewed well before it expires.
 	refreshIntervalKey     = "refresh_interval_seconds"
 	refreshIntervalSeconds = 1800
-	// modelListTimeout bounds a live model listing, which happens only when a
-	// credential has no stored catalogue for its current token.
+	// modelListTimeout bounds a live model listing: the first registration of a
+	// credential, and the relisting inside auth.refresh.
 	modelListTimeout = 15 * time.Second
 )
 
@@ -1159,10 +1159,11 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 	lock := credentialUsageLock(token, req.AuthID)
 	lock.Lock()
 	defer lock.Unlock()
-	refreshed, err := refreshKiroCredential(context.Background(), token)
+	refreshed, err := authRefreshCredential(context.Background(), token)
 	if err != nil {
 		return nil, err
 	}
+	relistModels(req.AuthID, refreshed)
 	clearUsageCache()
 	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: authDataForHostUpdate(refreshed, req.Attributes, req.AuthID), NextRefreshAfter: nextRefreshAfter(refreshed, parseTime(refreshed.ExpiresAt))})
 }
@@ -1190,17 +1191,14 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 	// provider answers at once; a live listing per credential made Kiro register
 	// 2-8 s after everything else (measured 2026-09-25, starts at 15:29 and
 	// 16:27), so anything reading the model list at startup saw no Kiro models.
-	// The stored listing answers until the token changes: a renewed token means
-	// CPA has just refreshed the credential, off the startup path, and that call
-	// lists again. An expired token keeps its listing too; renewing it is CPA's
-	// job and must not unregister the credential's models meanwhile.
-	stored, haveStored := storedModelCatalog(token)
-	now := time.Now()
-	if haveStored && (stored.Token == accessTokenFingerprint(token) || accessTokenExpired(token, now)) {
+	// The stored listing answers whatever the token's state: it is renewed by
+	// auth.refresh, which CPA schedules off the startup path.
+	if stored, ok := storedModelCatalog(token); ok {
 		return modelsResponse(req, token, stored.Models, authUpdated)
 	}
-	// Listing never renews the token. Renewal is auth.refresh, scheduled by CPA,
-	// which persists the result and registers the models again.
+	// Only a credential that has never been listed gets here. Listing never
+	// renews the token; renewal is auth.refresh, scheduled by CPA.
+	now := time.Now()
 	if accessTokenExpired(token, now) {
 		return nil, pluginStatusError{status: http.StatusUnauthorized, message: "Kiro access token expired; waiting for the host to refresh it"}
 	}
@@ -1220,15 +1218,7 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 
 	models, err := listAvailableModels(ctx, token)
 	if err != nil {
-		if !haveStored || !isTransientCatalogError(err) {
-			return nil, fmt.Errorf("list Kiro models: %w", err)
-		}
-		// A network blip must not unregister a working credential. The stored
-		// listing is this credential's own; a fixed list would be wrong, because
-		// catalogues differ per account (Builder ID lists 2 models, an IDC
-		// profile 19).
-		log.Printf("kiro: model list for %s failed (%v); serving its stored catalogue", req.AuthID, err)
-		return modelsResponse(req, token, stored.Models, authUpdated)
+		return nil, fmt.Errorf("list Kiro models: %w", err)
 	}
 	if storeModelCatalog(token, models, now) {
 		authUpdated = true
@@ -1239,12 +1229,30 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 // modelCatalogKey is the credential field holding the stored catalogue.
 const modelCatalogKey = "kiro_model_catalog"
 
-// storedCatalog is the kiro_model_catalog field of a credential. Token is the
-// fingerprint of the access token the listing was made with.
+// storedCatalog is the kiro_model_catalog field of a credential. Catalogues
+// differ per account (Builder ID lists 9 models, an IDC profile 19), so it is
+// the credential's own listing rather than a fixed list.
 type storedCatalog struct {
-	Token     string              `json:"token"`
 	FetchedAt string              `json:"fetched_at"`
 	Models    []controlPlaneModel `json:"models"`
+}
+
+// authRefreshCredential renews a credential in auth.refresh; tests replace it.
+var authRefreshCredential = refreshKiroCredential
+
+// relistModels renews the stored catalogue with a freshly refreshed token. It
+// runs inside auth.refresh, which CPA schedules every refreshIntervalSeconds
+// and persists, so the listing stays current without touching registration.
+// A failed listing keeps the previous catalogue and never fails the refresh.
+func relistModels(authID string, token *kiroauth.KiroTokenData) {
+	ctx, cancel := context.WithTimeout(context.Background(), modelListTimeout)
+	defer cancel()
+	models, err := listAvailableModels(ctx, token)
+	if err != nil {
+		log.Printf("kiro: relisting models for %s failed (%v); keeping the stored catalogue", authID, err)
+		return
+	}
+	storeModelCatalog(token, models, time.Now())
 }
 
 func storedModelCatalog(token *kiroauth.KiroTokenData) (storedCatalog, bool) {
@@ -1261,21 +1269,12 @@ func storeModelCatalog(token *kiroauth.KiroTokenData, models []controlPlaneModel
 	if len(models) == 0 {
 		return false
 	}
-	raw, err := json.Marshal(storedCatalog{Token: accessTokenFingerprint(token), FetchedAt: now.UTC().Format(time.RFC3339), Models: models})
+	raw, err := json.Marshal(storedCatalog{FetchedAt: now.UTC().Format(time.RFC3339), Models: models})
 	if err != nil {
 		return false
 	}
 	token.ModelCatalog = raw
 	return true
-}
-
-// accessTokenFingerprint names an access token without storing it again.
-func accessTokenFingerprint(token *kiroauth.KiroTokenData) string {
-	if token == nil || token.AccessToken == "" {
-		return ""
-	}
-	sum := sha256.Sum256([]byte(token.AccessToken))
-	return hex.EncodeToString(sum[:8])
 }
 
 func modelsResponse(req pluginapi.AuthModelRequest, token *kiroauth.KiroTokenData, models []controlPlaneModel, authUpdated bool) ([]byte, error) {
@@ -1304,18 +1303,6 @@ func modelsResponse(req pluginapi.AuthModelRequest, token *kiroauth.KiroTokenDat
 		response.AuthUpdate = authDataForHostUpdate(token, req.Attributes, req.AuthID)
 	}
 	return okEnvelope(response)
-}
-
-// isTransientCatalogError reports failures that say nothing about the
-// credential: transport errors, throttling and server errors. A 4xx answer is
-// the credential's own and is never masked by a cached catalogue.
-func isTransientCatalogError(err error) bool {
-	var status interface{ StatusCode() int }
-	if !errors.As(err, &status) {
-		return true
-	}
-	code := status.StatusCode()
-	return code == http.StatusTooManyRequests || code >= http.StatusInternalServerError
 }
 
 // accessTokenExpired is true only for a token whose recorded expiry has passed.
