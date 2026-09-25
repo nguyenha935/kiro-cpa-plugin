@@ -100,8 +100,8 @@ const (
 	// every token renewed well before it expires.
 	refreshIntervalKey     = "refresh_interval_seconds"
 	refreshIntervalSeconds = 1800
-	// modelListTimeout bounds model.for_auth, which CPA calls while it is
-	// registering credentials.
+	// modelListTimeout bounds a live model listing, which happens only when a
+	// credential has no stored catalogue for its current token.
 	modelListTimeout = 15 * time.Second
 )
 
@@ -760,7 +760,12 @@ func authData(token *kiroauth.KiroTokenData, fileName string) pluginapi.AuthData
 			// Host metadata is the authoritative source for CPA-managed fields
 			// changed from the UI (aliases, exclusions, priority, cooling, etc.).
 			// Persist it before rebuilding classification so a refresh cannot erase
-			// those settings.
+			// those settings. The model catalogue is the plugin's own record and
+			// is never taken from the host copy, which can be older than the
+			// listing being saved.
+			if key == modelCatalogKey {
+				continue
+			}
 			storageMap[key] = value
 		}
 		storageMap["type"] = providerName
@@ -921,6 +926,7 @@ func authMetadata(token *kiroauth.KiroTokenData) map[string]any {
 	if metadata == nil {
 		metadata = make(map[string]any)
 	}
+	delete(metadata, modelCatalogKey)
 	// Unknown fields in the credential document are host-owned CPA settings or
 	// forward-compatible metadata. Promote them back into AuthData so refresh
 	// cannot replace a rich host record with a reduced plugin-only record.
@@ -1171,15 +1177,6 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	applyHostOwnedSettings(token, req.Metadata, req.Attributes)
-	// Listing never renews the token. Renewal is auth.refresh, scheduled by CPA,
-	// which persists the result and registers the models again. Renewing here
-	// used to put an AWS round trip for every dead credential in front of model
-	// registration and wrote credential files behind the host's back.
-	if accessTokenExpired(token, time.Now()) {
-		return nil, pluginStatusError{status: http.StatusUnauthorized, message: "Kiro access token expired; waiting for the host to refresh it"}
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), modelListTimeout)
-	defer cancel()
 	// CPA's generic file synthesizer applies OAuth defaults after plugin parsing.
 	// Returning AuthUpdate during model discovery restores the API-key kind and
 	// api_key attribute in the live auth record without requiring a CPA patch.
@@ -1188,6 +1185,28 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 	lock.Lock()
 	defer lock.Unlock()
 
+	// Registration must not wait on the network. CPA asks every credential in
+	// turn while it starts, after its port is already open, and every other
+	// provider answers at once; a live listing per credential made Kiro register
+	// 2-8 s after everything else (measured 2026-09-25, starts at 15:29 and
+	// 16:27), so anything reading the model list at startup saw no Kiro models.
+	// The stored listing answers until the token changes: a renewed token means
+	// CPA has just refreshed the credential, off the startup path, and that call
+	// lists again. An expired token keeps its listing too; renewing it is CPA's
+	// job and must not unregister the credential's models meanwhile.
+	stored, haveStored := storedModelCatalog(token)
+	now := time.Now()
+	if haveStored && (stored.Token == accessTokenFingerprint(token) || accessTokenExpired(token, now)) {
+		return modelsResponse(req, token, stored.Models, authUpdated)
+	}
+	// Listing never renews the token. Renewal is auth.refresh, scheduled by CPA,
+	// which persists the result and registers the models again.
+	if accessTokenExpired(token, now) {
+		return nil, pluginStatusError{status: http.StatusUnauthorized, message: "Kiro access token expired; waiting for the host to refresh it"}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), modelListTimeout)
+	defer cancel()
+
 	if resolveAccount(token).ProfileDiscoverable() && strings.TrimSpace(token.ProfileArn) == "" {
 		// A social credential reached this branch under the previous
 		// "not an API key and not Builder ID" test, and discovery refuses social,
@@ -1195,52 +1214,73 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 		// and is served by the Amazon Q surface, exactly like Builder ID.
 		if err = reconcileProfile(ctx, token); err != nil {
 			return nil, fmt.Errorf("discover required Kiro profile: %w", err)
-		} else {
-			authUpdated = true
 		}
+		authUpdated = true
 	}
 
-	catalog, err := fetchModelCatalog(ctx, token)
-	if err != nil {
-		cached, ok := lastGoodCatalogs.Load(req.AuthID)
-		if !ok || !isTransientCatalogError(err) {
-			return nil, fmt.Errorf("list Kiro models: %w", err)
-		}
-		// A network blip must not unregister a working credential. The cached
-		// catalogue is this credential's own last answer; a fixed list would be
-		// wrong, because catalogues differ per account (Builder ID lists 2 models,
-		// an IDC profile 19).
-		log.Printf("kiro: model list for %s failed (%v); serving its last catalogue", req.AuthID, err)
-		catalog = cached.(modelCatalog)
-	} else {
-		lastGoodCatalogs.Store(req.AuthID, catalog)
-	}
-	modelcapabilities.ReplaceForAuth(req.AuthID, catalog.capabilities)
-	response := pluginapi.ModelResponse{Provider: providerName, Models: catalog.models}
-	if authUpdated {
-		response.AuthUpdate = authDataForHostUpdate(token, req.Attributes, req.AuthID)
-	}
-	return okEnvelope(response)
-}
-
-type modelCatalog struct {
-	models       []pluginapi.ModelInfo
-	capabilities []modelcapabilities.Capability
-}
-
-// lastGoodCatalogs holds each credential's last successful catalogue, keyed by
-// auth ID, for the lifetime of the host process.
-var lastGoodCatalogs sync.Map
-
-func fetchModelCatalog(ctx context.Context, token *kiroauth.KiroTokenData) (modelCatalog, error) {
 	models, err := listAvailableModels(ctx, token)
 	if err != nil {
-		return modelCatalog{}, err
+		if !haveStored || !isTransientCatalogError(err) {
+			return nil, fmt.Errorf("list Kiro models: %w", err)
+		}
+		// A network blip must not unregister a working credential. The stored
+		// listing is this credential's own; a fixed list would be wrong, because
+		// catalogues differ per account (Builder ID lists 2 models, an IDC
+		// profile 19).
+		log.Printf("kiro: model list for %s failed (%v); serving its stored catalogue", req.AuthID, err)
+		return modelsResponse(req, token, stored.Models, authUpdated)
 	}
-	catalog := modelCatalog{
-		models:       make([]pluginapi.ModelInfo, 0, len(models)),
-		capabilities: make([]modelcapabilities.Capability, 0, len(models)),
+	if storeModelCatalog(token, models, now) {
+		authUpdated = true
 	}
+	return modelsResponse(req, token, models, authUpdated)
+}
+
+// modelCatalogKey is the credential field holding the stored catalogue.
+const modelCatalogKey = "kiro_model_catalog"
+
+// storedCatalog is the kiro_model_catalog field of a credential. Token is the
+// fingerprint of the access token the listing was made with.
+type storedCatalog struct {
+	Token     string              `json:"token"`
+	FetchedAt string              `json:"fetched_at"`
+	Models    []controlPlaneModel `json:"models"`
+}
+
+func storedModelCatalog(token *kiroauth.KiroTokenData) (storedCatalog, bool) {
+	var stored storedCatalog
+	if len(token.ModelCatalog) == 0 || json.Unmarshal(token.ModelCatalog, &stored) != nil {
+		return storedCatalog{}, false
+	}
+	return stored, len(stored.Models) > 0
+}
+
+// storeModelCatalog records a listing on the credential and reports whether
+// it has to be persisted. An empty listing is never stored.
+func storeModelCatalog(token *kiroauth.KiroTokenData, models []controlPlaneModel, now time.Time) bool {
+	if len(models) == 0 {
+		return false
+	}
+	raw, err := json.Marshal(storedCatalog{Token: accessTokenFingerprint(token), FetchedAt: now.UTC().Format(time.RFC3339), Models: models})
+	if err != nil {
+		return false
+	}
+	token.ModelCatalog = raw
+	return true
+}
+
+// accessTokenFingerprint names an access token without storing it again.
+func accessTokenFingerprint(token *kiroauth.KiroTokenData) string {
+	if token == nil || token.AccessToken == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(token.AccessToken))
+	return hex.EncodeToString(sum[:8])
+}
+
+func modelsResponse(req pluginapi.AuthModelRequest, token *kiroauth.KiroTokenData, models []controlPlaneModel, authUpdated bool) ([]byte, error) {
+	out := make([]pluginapi.ModelInfo, 0, len(models))
+	capabilities := make([]modelcapabilities.Capability, 0, len(models))
 	for _, model := range models {
 		if strings.TrimSpace(model.ModelID) == "" {
 			continue
@@ -1248,8 +1288,8 @@ func fetchModelCatalog(ctx context.Context, token *kiroauth.KiroTokenData) (mode
 		id := normalizeModelID(model.ModelID)
 		capability := modelcapabilities.Parse(id, model.AdditionalModelRequestFieldsSchema)
 		capability.InputTokenLimit = int64(model.TokenLimits.MaxInputTokens)
-		catalog.capabilities = append(catalog.capabilities, capability)
-		catalog.models = append(catalog.models, pluginapi.ModelInfo{
+		capabilities = append(capabilities, capability)
+		out = append(out, pluginapi.ModelInfo{
 			ID: id, Object: "model", OwnedBy: providerName, Type: providerName,
 			Name: model.ModelID, DisplayName: defaultString(model.ModelName, id), Description: model.Description,
 			InputTokenLimit: int64(model.TokenLimits.MaxInputTokens), OutputTokenLimit: int64(model.TokenLimits.MaxOutputTokens),
@@ -1258,7 +1298,12 @@ func fetchModelCatalog(ctx context.Context, token *kiroauth.KiroTokenData) (mode
 			UserDefined: true,
 		})
 	}
-	return catalog, nil
+	modelcapabilities.ReplaceForAuth(req.AuthID, capabilities)
+	response := pluginapi.ModelResponse{Provider: providerName, Models: out}
+	if authUpdated {
+		response.AuthUpdate = authDataForHostUpdate(token, req.Attributes, req.AuthID)
+	}
+	return okEnvelope(response)
 }
 
 // isTransientCatalogError reports failures that say nothing about the
