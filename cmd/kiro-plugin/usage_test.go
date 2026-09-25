@@ -253,28 +253,6 @@ func TestRefreshImportedDesktopCredentialUsesKiroAuthService(t *testing.T) {
 	}
 }
 
-func TestMergeRefreshedTokenPreservesHostMetadata(t *testing.T) {
-	original := []byte(`{"type":"kiro","priority":4,"disabled":true,"note":"keep","accessToken":"old","custom":{"value":1}}`)
-	refreshed := &kiroauth.KiroTokenData{
-		AccessToken: "new", RefreshToken: "refresh", ProfileArn: "profile", ExpiresAt: "2026-08-20T13:00:00Z",
-		AuthMethod: "idc", ClientID: "client", ClientSecret: "secret", ClientIDHash: "hash", StartURL: "https://tenant.awsapps.com/start", Region: "us-east-1",
-	}
-	merged, err := mergeRefreshedToken(original, refreshed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var value map[string]any
-	if err := json.Unmarshal(merged, &value); err != nil {
-		t.Fatal(err)
-	}
-	if value["priority"] != float64(4) || value["disabled"] != true || value["note"] != "keep" || value["accessToken"] != "new" || value["access_token"] != "new" || value["profileArn"] != "profile" || value["profile_arn"] != "profile" {
-		t.Fatalf("unexpected merged credential fields: %#v", value)
-	}
-	if _, ok := value["custom"]; !ok {
-		t.Fatal("custom host metadata was discarded")
-	}
-}
-
 func TestUsagePageEscapesContentAndSetsSecurityHeaders(t *testing.T) {
 	view := newUsagePageView([]usageAccountView{{
 		Label: `<script>alert("account")</script>`, State: "Active", StateKey: usageStateActive, StateClass: "active",
@@ -466,69 +444,70 @@ func TestCredentialUsageLocksShareCredentialIdentity(t *testing.T) {
 	}
 }
 
-func TestConcurrentUsageRefreshesAndPersistsOnce(t *testing.T) {
-	originalHostCall := usageHostCall
-	originalHTTPClient := usageHTTPClient
-	originalRefresh := usageRefreshCredential
-	originalNow := usageNow
+// Reading usage never renews a token: an expired one is reported and left for
+// CPA's scheduled auth.refresh, with no AWS call and no write.
+func TestUsageLeavesAnExpiredTokenToCPA(t *testing.T) {
+	originalHostCall, originalHTTPClient, originalNow := usageHostCall, usageHTTPClient, usageNow
 	t.Cleanup(func() {
-		usageHostCall = originalHostCall
-		usageHTTPClient = originalHTTPClient
-		usageRefreshCredential = originalRefresh
-		usageNow = originalNow
+		usageHostCall, usageHTTPClient, usageNow = originalHostCall, originalHTTPClient, originalNow
+		resetUsageState()
+	})
+	resetUsageState()
+	forbidRenewal(t, "the usage reader")
+	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	usageNow = func() time.Time { return now }
+	stored, _ := json.Marshal(&kiroauth.KiroTokenData{
+		AccessToken: "expired", RefreshToken: "refresh", ExpiresAt: now.Add(-time.Minute).Format(time.RFC3339),
+		ClientIDHash: "hash", Region: "us-east-1", AuthMethod: "builder-id",
+	})
+	usageHostCall = func(method string, _ []byte) ([]byte, error) {
+		if method != pluginabi.MethodHostAuthGet {
+			t.Fatalf("usage reader called %s", method)
+		}
+		return okEnvelope(pluginapi.HostAuthGetResponse{AuthIndex: "a", Name: "a.json", JSON: stored})
+	}
+	usageHTTPClient = func() httpDoer {
+		return httpDoerFunc(func(*http.Request) (*http.Response, error) {
+			t.Fatal("usage was requested with an expired token")
+			return nil, nil
+		})
+	}
+	entry := pluginapi.HostAuthFileEntry{AuthIndex: "a", Name: "a.json", Provider: "kiro"}
+	account := loadUsageCredential(context.Background(), resolveUsageCredentials([]pluginapi.HostAuthFileEntry{entry})[0], true)
+	if account.ErrorKey != "err_expired" || !usageNeedsAttention(account) {
+		t.Fatalf("expired token view = %+v, want err_expired needing attention", account)
+	}
+}
+
+// Two readers of one credential share a single AWS request.
+func TestConcurrentUsageReadsShareOneRequest(t *testing.T) {
+	originalHostCall, originalHTTPClient, originalNow := usageHostCall, usageHTTPClient, usageNow
+	t.Cleanup(func() {
+		usageHostCall, usageHTTPClient, usageNow = originalHostCall, originalHTTPClient, originalNow
 		resetUsageState()
 	})
 	resetUsageState()
 	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
 	usageNow = func() time.Time { return now }
-	expired := &kiroauth.KiroTokenData{
-		AccessToken: "expired", RefreshToken: "refresh", ProfileArn: "old-profile", ExpiresAt: now.Add(-time.Minute).Format(time.RFC3339),
-		ClientID: "client", ClientSecret: "secret", ClientIDHash: "shared-hash", StartURL: "https://shared.awsapps.com/start", Region: "us-east-1", AuthMethod: "idc",
-		// The plan is already known so identity self-healing has nothing to write:
-		// this test measures the refresh save, not the identity save.
+	stored, _ := json.Marshal(&kiroauth.KiroTokenData{
+		AccessToken: "valid", RefreshToken: "refresh", ProfileArn: "profile", ExpiresAt: now.Add(time.Hour).Format(time.RFC3339),
+		ClientIDHash: "shared-hash", StartURL: "https://shared.awsapps.com/start", Region: "us-east-1", AuthMethod: "idc",
+		// The plan is already known so identity self-healing has nothing to write.
 		SubscriptionTitle: "Kiro Pro",
-	}
-	stored, _ := json.Marshal(expired)
-	var stateMu sync.Mutex
-	refreshCalls := 0
-	saveCalls := 0
-	requestCalls := 0
-	usageRefreshCredential = func(_ context.Context, token *kiroauth.KiroTokenData) (*kiroauth.KiroTokenData, error) {
-		stateMu.Lock()
-		refreshCalls++
-		stateMu.Unlock()
-		copy := *token
-		copy.AccessToken = "fresh"
-		copy.ProfileArn = "fresh-profile"
-		copy.ExpiresAt = now.Add(time.Hour).Format(time.RFC3339)
-		return &copy, nil
-	}
-	usageHostCall = func(method string, request []byte) ([]byte, error) {
-		stateMu.Lock()
-		defer stateMu.Unlock()
-		switch method {
-		case pluginabi.MethodHostAuthGet:
-			return okEnvelope(pluginapi.HostAuthGetResponse{AuthIndex: "shared", Name: "shared.json", JSON: append([]byte(nil), stored...)})
-		case pluginabi.MethodHostAuthSave:
-			var save pluginapi.HostAuthSaveRequest
-			if err := json.Unmarshal(request, &save); err != nil {
-				return nil, err
-			}
-			stored = append([]byte(nil), save.JSON...)
-			saveCalls++
-			return okEnvelope(pluginapi.HostAuthSaveResponse{Name: save.Name, Path: "shared.json"})
-		default:
+	})
+	var mu sync.Mutex
+	requests := 0
+	usageHostCall = func(method string, _ []byte) ([]byte, error) {
+		if method != pluginabi.MethodHostAuthGet {
 			return errorEnvelope("unexpected", method), nil
 		}
+		return okEnvelope(pluginapi.HostAuthGetResponse{AuthIndex: "shared", Name: "shared.json", JSON: stored})
 	}
 	usageHTTPClient = func() httpDoer {
 		return httpDoerFunc(func(request *http.Request) (*http.Response, error) {
-			stateMu.Lock()
-			requestCalls++
-			stateMu.Unlock()
-			if request.Header.Get("Authorization") != "Bearer fresh" || request.URL.Query().Get("profileArn") != "fresh-profile" {
-				t.Fatalf("usage request did not use refreshed credential")
-			}
+			mu.Lock()
+			requests++
+			mu.Unlock()
 			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"subscriptionInfo":{"subscriptionTitle":"Kiro Pro"},"usageBreakdownList":[{"displayNamePlural":"Credits","currentUsage":1,"usageLimit":50}]}`)), Header: make(http.Header)}, nil
 		})
 	}
@@ -543,13 +522,8 @@ func TestConcurrentUsageRefreshesAndPersistsOnce(t *testing.T) {
 		}(index)
 	}
 	group.Wait()
-	stateMu.Lock()
-	defer stateMu.Unlock()
-	if refreshCalls != 1 || saveCalls != 1 || requestCalls != 1 {
-		t.Fatalf("expected one refresh, save, and upstream request; got refresh=%d save=%d request=%d", refreshCalls, saveCalls, requestCalls)
-	}
-	if results[0].Plan != "Kiro Pro" || results[1].Plan != "Kiro Pro" {
-		t.Fatalf("concurrent callers did not share refreshed usage: %+v", results)
+	if requests != 1 || results[0].Plan != "Kiro Pro" || results[1].Plan != "Kiro Pro" {
+		t.Fatalf("requests = %d, results = %+v; want one shared read", requests, results)
 	}
 }
 
@@ -871,6 +845,9 @@ func TestPublicUsageErrorKeyMirrorsPublicUsageError(t *testing.T) {
 	}
 	if got := publicUsageErrorKey(errors.New("boom")); got != "err_generic" {
 		t.Fatalf("plain error mapped to %q", got)
+	}
+	if publicUsageErrorKey(errUsageTokenExpired) != "err_expired" || usagePageTextPacks[usageLangEN]["err_expired"] != publicUsageError(errUsageTokenExpired) {
+		t.Fatal("the expired-token key or its english text disagrees with publicUsageError")
 	}
 }
 

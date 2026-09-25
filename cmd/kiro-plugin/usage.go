@@ -43,8 +43,7 @@ var (
 	usageHTTPClient = func() httpDoer {
 		return &http.Client{Timeout: usageRequestTimeout}
 	}
-	usageHostCall          = hostCall
-	usageRefreshCredential = refreshKiroCredential
+	usageHostCall = hostCall
 )
 
 // Credential presentation states. The key drives both the CSS class and the
@@ -783,27 +782,18 @@ func loadUsageCredentialView(ctx context.Context, credential usageCredential, fo
 	return account
 }
 
+// errUsageTokenExpired reports a stored access token past its expiry. Renewal
+// belongs to auth.refresh, which CPA schedules; reading usage never renews a
+// token, so a second writer cannot race CPA's refresh and save.
+var errUsageTokenExpired = errors.New("kiro access token expired; waiting for CLIProxyAPI to refresh it")
+
 func fetchUsageForCredential(ctx context.Context, credential usageCredential) (usageAccountView, error) {
 	authRecord, raw, token := credential.authRecord, credential.raw, credential.token
-	var err error
 	label := kiroUsageLabel(token)
-	if credentialNeedsRefresh(token, usageNow()) {
-		token, raw, err = refreshAndSaveUsageCredential(ctx, authRecord.Name, raw, token)
-		if err != nil {
-			return usageAccountView{Label: label}, err
-		}
-		label = kiroUsageLabel(token)
+	if accessTokenExpired(token, usageNow()) {
+		return usageAccountView{Label: label}, errUsageTokenExpired
 	}
-
 	usage, err := requestUsageLimits(ctx, usageHTTPClient(), token)
-	var responseError *usageHTTPError
-	if errors.As(err, &responseError) && (responseError.StatusCode == http.StatusUnauthorized || responseError.StatusCode == http.StatusForbidden) {
-		token, _, err = refreshAndSaveUsageCredential(ctx, authRecord.Name, raw, token)
-		if err != nil {
-			return usageAccountView{Label: label}, err
-		}
-		usage, err = requestUsageLimits(ctx, usageHTTPClient(), token)
-	}
 	if err != nil {
 		return usageAccountView{Label: label}, err
 	}
@@ -813,7 +803,6 @@ func fetchUsageForCredential(ctx context.Context, credential usageCredential) (u
 		label = kiroUsageLabel(token)
 	}
 	account := usageView(label, usage, usageNow())
-	// The refreshed token is the freshest source for session expiry.
 	decorateUsageAccount(&account, credential, token)
 	return account, nil
 }
@@ -974,51 +963,6 @@ func getHostKiroAuth(authIndex string) (pluginapi.HostAuthGetResponse, []byte, *
 		return response, response.JSON, nil, err
 	}
 	return response, response.JSON, token, nil
-}
-
-func refreshAndSaveUsageCredential(ctx context.Context, name string, original []byte, token *kiroauth.KiroTokenData) (*kiroauth.KiroTokenData, []byte, error) {
-	refreshed, err := usageRefreshCredential(ctx, token)
-	if err != nil {
-		return nil, nil, err
-	}
-	merged, err := mergeRefreshedToken(original, refreshed)
-	if err != nil {
-		return nil, nil, err
-	}
-	request, _ := json.Marshal(pluginapi.HostAuthSaveRequest{Name: filepath.Base(name), JSON: merged})
-	var saved pluginapi.HostAuthSaveResponse
-	if err := callHostResult(pluginabi.MethodHostAuthSave, request, &saved); err != nil {
-		return nil, nil, fmt.Errorf("persist refreshed Kiro credential: %w", err)
-	}
-	clearUsageCache()
-	return refreshed, merged, nil
-}
-
-func mergeRefreshedToken(original []byte, refreshed *kiroauth.KiroTokenData) ([]byte, error) {
-	var destination map[string]any
-	if err := json.Unmarshal(original, &destination); err != nil {
-		return nil, fmt.Errorf("decode persisted Kiro credential: %w", err)
-	}
-	encoded, err := json.Marshal(refreshed)
-	if err != nil {
-		return nil, err
-	}
-	var source map[string]any
-	if err := json.Unmarshal(encoded, &source); err != nil {
-		return nil, err
-	}
-	for key, value := range source {
-		destination[key] = value
-	}
-	destination["access_token"] = refreshed.AccessToken
-	destination["refresh_token"] = refreshed.RefreshToken
-	destination["profile_arn"] = refreshed.ProfileArn
-	destination["expires_at"] = refreshed.ExpiresAt
-	destination["auth_method"] = refreshed.AuthMethod
-	destination["client_id"] = refreshed.ClientID
-	destination["client_secret"] = refreshed.ClientSecret
-	destination["type"] = providerName
-	return json.Marshal(destination)
 }
 
 func credentialNeedsRefresh(token *kiroauth.KiroTokenData, now time.Time) bool {
@@ -1356,6 +1300,9 @@ func kiroUsageLabel(token *kiroauth.KiroTokenData) string {
 // localize the same condition. Both are kept: Error remains the machine-facing
 // English string used by host diagnostics.
 func publicUsageErrorKey(err error) string {
+	if errors.Is(err, errUsageTokenExpired) {
+		return "err_expired"
+	}
 	var httpError *usageHTTPError
 	if errors.As(err, &httpError) {
 		switch httpError.StatusCode {
@@ -1373,6 +1320,9 @@ func publicUsageErrorKey(err error) string {
 }
 
 func publicUsageError(err error) string {
+	if errors.Is(err, errUsageTokenExpired) {
+		return "The access token has expired and CLIProxyAPI has not renewed it yet. Sign in again if this persists."
+	}
 	var httpError *usageHTTPError
 	if errors.As(err, &httpError) {
 		switch httpError.StatusCode {

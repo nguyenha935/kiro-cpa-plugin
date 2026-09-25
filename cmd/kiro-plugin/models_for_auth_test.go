@@ -24,22 +24,29 @@ func (fn catalogTransport) RoundTrip(request *http.Request) (*http.Response, err
 
 const builderIDCatalog = `{"models":[{"modelId":"claude-sonnet-4.5","modelName":"Claude Sonnet 4.5","tokenLimits":{"maxInputTokens":200000,"maxOutputTokens":64000}}]}`
 
-// stubCatalog answers every outbound request with handler, counts the calls and
-// fails the test if model.for_auth tries to renew the token.
+// stubCatalog answers every outbound request with handler and counts the calls.
 func stubCatalog(t *testing.T, handler func(*http.Request) (*http.Response, error)) *int {
 	t.Helper()
 	calls := 0
-	originalTransport, originalRefresh := http.DefaultTransport, usageRefreshCredential
+	originalTransport := http.DefaultTransport
 	http.DefaultTransport = catalogTransport(func(request *http.Request) (*http.Response, error) {
 		calls++
 		return handler(request)
 	})
-	usageRefreshCredential = func(context.Context, *kiroauth.KiroTokenData) (*kiroauth.KiroTokenData, error) {
-		t.Fatal("model.for_auth renewed the token; renewal belongs to auth.refresh")
+	t.Cleanup(func() { http.DefaultTransport = originalTransport })
+	return &calls
+}
+
+// forbidRenewal fails the test if anything renews the token; renewal belongs to
+// auth.refresh, which CPA schedules.
+func forbidRenewal(t *testing.T, caller string) {
+	t.Helper()
+	original := authRefreshCredential
+	authRefreshCredential = func(context.Context, *kiroauth.KiroTokenData) (*kiroauth.KiroTokenData, error) {
+		t.Fatalf("%s renewed the token; renewal belongs to auth.refresh", caller)
 		return nil, nil
 	}
-	t.Cleanup(func() { http.DefaultTransport, usageRefreshCredential = originalTransport, originalRefresh })
-	return &calls
+	t.Cleanup(func() { authRefreshCredential = original })
 }
 
 func catalogResponse(status int, body string) *http.Response {
@@ -112,6 +119,7 @@ func catalogOf(t *testing.T, storage []byte) string {
 // A stored catalogue answers registration without touching the network,
 // whether the token is valid or has expired and awaits CPA's renewal.
 func TestModelsForAuthAnswersFromStoredCatalogWithoutNetwork(t *testing.T) {
+	forbidRenewal(t, "model.for_auth")
 	calls := stubCatalog(t, func(*http.Request) (*http.Response, error) {
 		return catalogResponse(http.StatusOK, builderIDCatalog), nil
 	})
@@ -132,6 +140,7 @@ func TestModelsForAuthAnswersFromStoredCatalogWithoutNetwork(t *testing.T) {
 // A credential that was never listed is listed once, with the stored token,
 // and the listing is persisted through AuthUpdate.
 func TestModelsForAuthListsAndStoresCatalog(t *testing.T) {
+	forbidRenewal(t, "model.for_auth")
 	calls := stubCatalog(t, func(request *http.Request) (*http.Response, error) {
 		if request.Header.Get("Authorization") != "Bearer access" {
 			t.Fatalf("catalogue was not requested with the stored token")
@@ -150,6 +159,7 @@ func TestModelsForAuthListsAndStoresCatalog(t *testing.T) {
 // Without a catalogue an expired token is a credential error with no network
 // call, and a failed listing is an error rather than an empty model list.
 func TestModelsForAuthWithoutCatalogReportsFailures(t *testing.T) {
+	forbidRenewal(t, "model.for_auth")
 	status := http.StatusOK
 	calls := stubCatalog(t, func(*http.Request) (*http.Response, error) {
 		return catalogResponse(status, builderIDCatalog), nil
