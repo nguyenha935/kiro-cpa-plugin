@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	kiroauth "github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
@@ -259,5 +261,53 @@ func TestOAuthCredentialsEnterCPARefreshScheduler(t *testing.T) {
 	apiKey := &kiroauth.KiroTokenData{AccessToken: "a", AuthMethod: "api_key", Region: "us-east-1"}
 	if _, ok := authMetadata(apiKey)[refreshIntervalKey]; ok {
 		t.Fatal("API keys cannot be refreshed and must not be scheduled")
+	}
+}
+
+// Re-logging an account whose file already exists goes through CPA's merge of
+// the old file into the new record. The new credential must come out whole:
+// no dead token, client or expiry may survive, and host settings such as the
+// operator's note must.
+func TestReloginReplacesEveryCredentialFieldOfTheOldFile(t *testing.T) {
+	oldFile := map[string]any{
+		"accessToken": "dead-access", "access_token": "dead-access",
+		"refreshToken": "dead-refresh", "refresh_token": "dead-refresh",
+		"clientId": "dead-client", "client_id": "dead-client", "clientSecret": "dead-secret", "client_secret": "dead-secret",
+		"expiresAt": "2026-09-24T16:38:08+07:00", "expires_at": "2026-09-24T16:38:08+07:00",
+		"profileArn": "arn:aws:codewhisperer:us-east-1:1:profile/dead", "profile_arn": "arn:aws:codewhisperer:us-east-1:1:profile/dead",
+		"authMethod": "builder-id", "region": "us-east-1", "note": "operator@example.com",
+	}
+	fresh := &kiroauth.KiroTokenData{
+		AccessToken: "new-access", RefreshToken: "new-refresh", ClientID: "new-client", ClientSecret: "new-secret",
+		ExpiresAt: "2026-09-25T20:16:35+07:00", AuthMethod: "builder-id", Region: "us-east-1",
+	}
+	data := authData(fresh, "kiro.json")
+	record := &coreauth.Auth{Provider: providerName, Metadata: data.Metadata}
+	coreauth.MergeExistingAuthMetadata(record, oldFile)
+
+	// CPA writes the stored document overlaid with the merged metadata.
+	var saved map[string]any
+	if err := json.Unmarshal(data.StorageJSON, &saved); err != nil {
+		t.Fatal(err)
+	}
+	for key, value := range record.Metadata {
+		saved[key] = value
+	}
+	raw, _ := json.Marshal(saved)
+	got, err := decodeKiroCredential(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AccessToken != "new-access" || got.RefreshToken != "new-refresh" || got.ClientID != "new-client" ||
+		got.ClientSecret != "new-secret" || got.ExpiresAt != fresh.ExpiresAt || got.ProfileArn != "" {
+		t.Fatalf("old credential fields survived the re-login: %+v", got)
+	}
+	for _, key := range []string{"accessToken", "access_token", "refreshToken", "refresh_token", "clientId", "client_id", "profileArn", "profile_arn"} {
+		if strings.Contains(fmt.Sprint(saved[key]), "dead") {
+			t.Fatalf("%s kept the old value %v", key, saved[key])
+		}
+	}
+	if saved["note"] != "operator@example.com" {
+		t.Fatalf("the operator's note was lost: %v", saved["note"])
 	}
 }

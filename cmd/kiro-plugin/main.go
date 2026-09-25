@@ -940,9 +940,7 @@ func authMetadata(token *kiroauth.KiroTokenData) map[string]any {
 		}
 	}
 	metadata["type"] = providerName
-	metadata["auth_method"] = token.AuthMethod
-	metadata["expires_at"] = token.ExpiresAt
-	metadata["region"] = token.Region
+	setCredentialKeys(metadata, token)
 	if isAPIKeyCredential(token) {
 		metadata["auth_kind"] = coreauth.AuthKindAPIKey
 	} else {
@@ -973,27 +971,6 @@ func authMetadata(token *kiroauth.KiroTokenData) map[string]any {
 	if value := strings.TrimSpace(token.ProfileName); value != "" {
 		metadata["profile_name"] = value
 	}
-	if token.AccessToken != "" {
-		metadata["access_token"] = token.AccessToken
-	}
-	if token.RefreshToken != "" {
-		metadata["refresh_token"] = token.RefreshToken
-	}
-	if token.ClientID != "" {
-		metadata["client_id"] = token.ClientID
-	}
-	if token.ClientSecret != "" {
-		metadata["client_secret"] = token.ClientSecret
-	}
-	if token.ProfileArn != "" {
-		metadata["profile_arn"] = token.ProfileArn
-	}
-	if token.TokenEndpoint != "" {
-		metadata["token_endpoint"] = token.TokenEndpoint
-	}
-	if token.Scopes != "" {
-		metadata["scopes"] = token.Scopes
-	}
 	if token.PreferredEndpoint != "" {
 		metadata["preferred_endpoint"] = token.PreferredEndpoint
 	}
@@ -1010,6 +987,39 @@ func authMetadata(token *kiroauth.KiroTokenData) map[string]any {
 		metadata["disable_cooling"] = true
 	}
 	return metadata
+}
+
+// setCredentialKeys writes every field that identifies the credential under
+// both spellings the credential document carries, even when empty.
+//
+// On login CPA merges the existing file into the new record, copying every key
+// the new metadata does not define and skipping only a few snake_case token
+// keys (sdk/cliproxy/auth MergeExistingAuthMetadata), then overlays metadata
+// on the stored document. A key missing here therefore comes back from the old
+// file: re-logging a Builder ID account on 2026-09-25 kept the dead
+// accessToken/refreshToken/clientId next to the new snake_case ones, and the
+// camelCase fields, which are read first, made the fresh login unusable.
+func setCredentialKeys(metadata map[string]any, token *kiroauth.KiroTokenData) {
+	for _, field := range []struct {
+		value        string
+		camel, snake string
+	}{
+		{token.AccessToken, "accessToken", "access_token"},
+		{token.RefreshToken, "refreshToken", "refresh_token"},
+		{token.ClientID, "clientId", "client_id"},
+		{token.ClientSecret, "clientSecret", "client_secret"},
+		{token.ClientIDHash, "clientIdHash", "client_id_hash"},
+		{token.ExpiresAt, "expiresAt", "expires_at"},
+		{token.ProfileArn, "profileArn", "profile_arn"},
+		{token.AuthMethod, "authMethod", "auth_method"},
+		{token.StartURL, "startUrl", "start_url"},
+		{token.Region, "region", "region"},
+		{token.TokenEndpoint, "token_endpoint", "token_endpoint"},
+		{token.Scopes, "scopes", "scopes"},
+	} {
+		metadata[field.camel] = field.value
+		metadata[field.snake] = field.value
+	}
 }
 
 func authAttributes(token *kiroauth.KiroTokenData) map[string]string {
