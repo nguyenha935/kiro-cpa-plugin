@@ -549,6 +549,15 @@ func usagePageFuncs(text usagePageText) template.FuncMap {
 		// isAddress keeps the account fact to a real address AWS reported; a bare
 		// user key says nothing a reader can recognise.
 		"isAddress": looksLikeEmail,
+		// The panel is reached through Cloudflare, whose Email Address
+		// Obfuscation rewrites every address in an HTML page to "[email protected]"
+		// and injects a decoder script. This page's CSP runs only its own
+		// nonce script, so the decoder never ran and every note read
+		// "[email protected]" (reported 2026-09-25). The email_off markers are
+		// Cloudflare's per-page opt-out. They are returned as template.HTML
+		// because html/template drops comments written in the template.
+		"emailOff": func() template.HTML { return "<!--email_off-->" },
+		"emailOn":  func() template.HTML { return "<!--/email_off-->" },
 		"cell": func(account usageAccountView, view usagePageView) usageAccountCell {
 			return usageAccountCell{Account: account, View: view}
 		},

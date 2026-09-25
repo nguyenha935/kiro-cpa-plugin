@@ -184,3 +184,18 @@ func TestUsageCellShowsFileNameThenNote(t *testing.T) {
 		t.Fatal("the synthetic label is still the account title")
 	}
 }
+
+// Cloudflare replaces addresses in HTML with "[email protected]" unless they sit
+// between its email_off markers; the page's CSP blocks the decoder it injects.
+func TestUsagePageOptsOutOfCloudflareEmailObfuscation(t *testing.T) {
+	accounts := []usageAccountView{{FileName: "kiro-a.json", Note: "a@example.com", StateKey: usageStateActive}}
+	page, err := renderUsagePage(newUsagePageView(accounts, usagePageOptions{Nonce: "n"}, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(page)
+	start, note, end := strings.Index(html, "<!--email_off-->"), strings.Index(html, "a@example.com"), strings.Index(html, "<!--/email_off-->")
+	if start < 0 || end < 0 || !(start < note && note < end) {
+		t.Fatalf("the note is not inside Cloudflare's email_off markers (start %d, note %d, end %d)", start, note, end)
+	}
+}
