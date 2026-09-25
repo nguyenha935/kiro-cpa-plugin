@@ -307,6 +307,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			Resources: []pluginapi.ResourceRoute{
 				{Path: "/capabilities"},
 				{Path: usageResourcePath, Menu: "Kiro Usage", Description: "Shows Kiro subscription usage for connected accounts."},
+				{Path: usageActionPath()},
 			},
 		})
 	case pluginabi.MethodManagementHandle:
@@ -2044,8 +2045,11 @@ func handleManagement(raw []byte) ([]byte, error) {
 			Body: body,
 		})
 	}
-	if req.Path == resourceBasePath+usageResourcePath {
+	switch req.Path {
+	case resourceBasePath + usageResourcePath:
 		return handleUsagePage(req)
+	case resourceBasePath + usageActionPath():
+		return handleUsageAction(req)
 	}
 	return okEnvelope(pluginapi.ManagementResponse{StatusCode: http.StatusNotFound, Headers: http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}}, Body: []byte("Not found")})
 }

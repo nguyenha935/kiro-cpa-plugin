@@ -379,7 +379,7 @@ func TestCollectUsageAccountsIsolatesAccountsAndFailures(t *testing.T) {
 		})
 	}
 
-	accounts := collectUsageAccounts(context.Background(), false)
+	accounts := collectUsageAccounts(context.Background(), "")
 	if len(accounts) != 3 {
 		t.Fatalf("expected three Kiro accounts, got %+v", accounts)
 	}
@@ -446,7 +446,7 @@ func TestCollectUsageAccountsDeduplicatesCredentialIdentity(t *testing.T) {
 		})
 	}
 
-	accounts := collectUsageAccounts(context.Background(), false)
+	accounts := collectUsageAccounts(context.Background(), "")
 	if len(accounts) != 2 {
 		t.Fatalf("expected two distinct OIDC credentials, got %+v", accounts)
 	}
@@ -828,16 +828,10 @@ func TestUsagePageShowsPlanTypeCurrencyAndCredentialFacts(t *testing.T) {
 	if strings.Contains(html, "super-secret-access-token") {
 		t.Fatal("rendered page leaked the access token")
 	}
-	// The duplicate identity row is gone, so a real address has to reach the page
-	// as the card title. It must never stop being visible.
-	titled := account
-	titled.Label = kiroUsageLabel(credential.token)
-	titledPage, err := renderUsagePage(newUsagePageView([]usageAccountView{titled}, usagePageOptions{Nonce: "n"}, ""))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(titledPage), "user@example.com") {
-		t.Fatalf("a real address is no longer shown anywhere: %s", titledPage)
+	// The row is titled by the credential file, but a real address AWS reported
+	// must never stop being visible: it is the account fact in the detail.
+	if !strings.Contains(html, "user@example.com") {
+		t.Fatalf("a real address is no longer shown anywhere: %s", html)
 	}
 }
 
