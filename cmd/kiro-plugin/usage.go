@@ -401,6 +401,9 @@ func carryHostOwnedFields(from *kiroauth.KiroTokenData, to *kiroauth.KiroTokenDa
 	if to.PreferredEndpoint == "" {
 		to.PreferredEndpoint = from.PreferredEndpoint
 	}
+	if len(to.ModelCatalog) == 0 {
+		to.ModelCatalog = from.ModelCatalog
+	}
 	if to.Extra == nil {
 		to.Extra = from.Extra
 	}

@@ -78,13 +78,16 @@ type KiroTokenData struct {
 	Scopes string `json:"scopes,omitempty"`
 	// Host-owned routing/settings fields are kept in the credential document so
 	// plugin refresh/model-discovery updates cannot silently erase CPA UI state.
-	Priority          int                        `json:"priority,omitempty"`
-	Weight            int                        `json:"weight,omitempty"`
-	Disabled          bool                       `json:"disabled,omitempty"`
-	DisableCooling    bool                       `json:"disable_cooling,omitempty"`
-	RequestRetry      int                        `json:"request_retry,omitempty"`
-	PreferredEndpoint string                     `json:"preferred_endpoint,omitempty"`
-	Extra             map[string]json.RawMessage `json:"-"`
+	Priority          int    `json:"priority,omitempty"`
+	Weight            int    `json:"weight,omitempty"`
+	Disabled          bool   `json:"disabled,omitempty"`
+	DisableCooling    bool   `json:"disable_cooling,omitempty"`
+	RequestRetry      int    `json:"request_retry,omitempty"`
+	PreferredEndpoint string `json:"preferred_endpoint,omitempty"`
+	// ModelCatalog is the credential's last model listing, persisted so model
+	// registration is answered without a network call.
+	ModelCatalog json.RawMessage            `json:"kiro_model_catalog,omitempty"`
+	Extra        map[string]json.RawMessage `json:"-"`
 	// HostMetadata and HostAttributes are runtime-only CPA state supplied to
 	// refresh/model-discovery calls. They must survive AuthData replacement but
 	// must never be written as nested provider credential fields.
