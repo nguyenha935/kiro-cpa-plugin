@@ -172,6 +172,7 @@ type registrationCapabilities struct {
 	ExecutorInputFormats  []string                     `json:"executor_input_formats,omitempty"`
 	ExecutorOutputFormats []string                     `json:"executor_output_formats,omitempty"`
 	ManagementAPI         bool                         `json:"management_api"`
+	QuotaProvider         bool                         `json:"quota_provider"`
 }
 
 type identifierResponse struct {
@@ -312,6 +313,14 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		})
 	case pluginabi.MethodManagementHandle:
 		return handleManagement(request)
+	case methodQuotaIdentifier:
+		return okEnvelope(identifierResponse{Identifier: providerName})
+	case methodQuotaDescribe:
+		return handleQuotaDescribe()
+	case methodQuotaFetch:
+		return handleQuotaFetch(request)
+	case methodQuotaReset:
+		return handleQuotaReset()
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
@@ -548,6 +557,7 @@ func pluginRegistration() registration {
 			ExecutorInputFormats:  []string{"openai-response", "claude", "openai"},
 			ExecutorOutputFormats: []string{"openai-response", "claude", "openai"},
 			ManagementAPI:         true,
+			QuotaProvider:         true,
 		},
 	}
 }
