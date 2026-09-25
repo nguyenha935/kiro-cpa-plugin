@@ -292,6 +292,9 @@ type usageAccountView struct {
 	TokenExpiresAt string
 	LastRefresh    string
 	StatusMessage  string
+	// Note is the operator's own note on the credential file, the name they
+	// actually know the account by. It is shown under the file name.
+	Note string
 	// Structured AWS identity. Each field is a separate parameter AWS actually
 	// reports, so the page can name an account instead of printing one opaque
 	// string: Account is the address or short user key, Directory the identity
@@ -564,12 +567,17 @@ func refreshExternalIDP(ctx context.Context, token *kiroauth.KiroTokenData) (*ki
 // handleUsagePage answers both the legacy resource route and the authenticated
 // management route. Theme and language come from the embedding panel; both are
 // validated against a closed set before reaching the document.
+//
+// Opening the page reads the per-credential cache; only ?refresh=<file> or
+// ?refresh=all asks AWS again, so viewing the page no longer costs one usage
+// call per connected account.
 func handleUsagePage(req pluginapi.ManagementRequest) ([]byte, error) {
-	accounts := collectUsageAccounts(context.Background(), true)
+	accounts := collectUsageAccounts(context.Background(), strings.TrimSpace(req.Query.Get("refresh")))
 	view := newUsagePageView(accounts, usagePageOptions{
 		Theme: req.Query.Get("theme"),
 		Lang:  req.Query.Get("lang"),
 	}, usageNow().Format(time.RFC3339))
+	view.ActionPath = resourceBasePath + usageActionPath()
 	page, err := renderUsagePage(view)
 	if err != nil {
 		return nil, err
@@ -591,7 +599,13 @@ func usagePageHeaders(nonce string) http.Header {
 	}
 }
 
-func collectUsageAccounts(ctx context.Context, force bool) []usageAccountView {
+// usageRefreshAll is the ?refresh value that re-reads every account.
+const usageRefreshAll = "all"
+
+// collectUsageAccounts builds one view per Kiro credential. refresh names the
+// credential file to read from AWS again, usageRefreshAll for every one, or is
+// empty to serve cached views.
+func collectUsageAccounts(ctx context.Context, refresh string) []usageAccountView {
 	var listed hostAuthListResponse
 	if err := callHostResult(pluginabi.MethodHostAuthList, nil, &listed); err != nil {
 		return []usageAccountView{{
@@ -616,12 +630,36 @@ func collectUsageAccounts(ctx context.Context, force bool) []usageAccountView {
 			defer group.Done()
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
+			force := refresh == usageRefreshAll || (refresh != "" && refresh == filepath.Base(credentials[index].entry.Name))
 			results[index] = loadUsageCredential(ctx, credentials[index], force)
 		}()
 	}
 	group.Wait()
-	sort.SliceStable(results, func(i, j int) bool { return strings.ToLower(results[i].Label) < strings.ToLower(results[j].Label) })
+	// Accounts that need attention come first, then the rest by the name the
+	// page shows, so a broken credential is never buried among working ones.
+	sort.SliceStable(results, func(i, j int) bool {
+		if first, second := usageNeedsAttention(results[i]), usageNeedsAttention(results[j]); first != second {
+			return first
+		}
+		return strings.ToLower(usageDisplayName(results[i])) < strings.ToLower(usageDisplayName(results[j]))
+	})
 	return results
+}
+
+// usageNeedsAttention is the page's single test for a credential that is not
+// working, shared by the ordering and the summary strip.
+func usageNeedsAttention(account usageAccountView) bool {
+	return account.ErrorKey != "" || account.Error != "" || account.StateKey == usageStateUnavailable
+}
+
+// usageDisplayName is the credential file name, the identity shared with the
+// panel's auth file list. A view without one (a host that sent no name) falls
+// back to its label.
+func usageDisplayName(account usageAccountView) string {
+	if name := strings.TrimSpace(account.FileName); name != "" {
+		return name
+	}
+	return account.Label
 }
 
 func resolveUsageCredentials(entries []pluginapi.HostAuthFileEntry) []usageCredential {
@@ -798,6 +836,9 @@ func decorateUsageAccount(account *usageAccountView, credential usageCredential,
 	if account.StatusMessage == "" {
 		account.StatusMessage = strings.TrimSpace(entry.StatusMessage)
 	}
+	if account.Note == "" {
+		account.Note = credentialNote(credential.raw)
+	}
 	if account.LastRefresh == "" && !entry.LastRefresh.IsZero() {
 		account.LastRefresh = entry.LastRefresh.UTC().Format(time.RFC3339)
 	}
@@ -840,6 +881,86 @@ func decorateUsageAccount(account *usageAccountView, credential usageCredential,
 	if account.TokenExpiresAt == "" && !isAPIKeyCredential(token) {
 		account.TokenExpiresAt = strings.TrimSpace(token.ExpiresAt)
 	}
+}
+
+// credentialNote reads the note CPA stores on the credential document. It is
+// read from the raw document so an account whose token cannot be decoded still
+// shows the name its operator gave it.
+func credentialNote(raw []byte) string {
+	var document struct {
+		Note string `json:"note"`
+	}
+	if len(raw) == 0 || json.Unmarshal(raw, &document) != nil {
+		return ""
+	}
+	return strings.TrimSpace(document.Note)
+}
+
+// usageActionPath is the resource route that toggles a credential, under the
+// same unguessable prefix as the page itself.
+func usageActionPath() string {
+	return usageResourcePath + "/action"
+}
+
+// handleUsageAction enables or disables one Kiro credential and returns to the
+// page. Resource routes are GET only and carry no management key, so the
+// action lives under the page's own random path, like the page; it only sets
+// the credential's disabled flag through the host, which CPA then applies.
+func handleUsageAction(req pluginapi.ManagementRequest) ([]byte, error) {
+	back := resourceBasePath + usageResourcePath + "?" + url.Values{
+		"theme": {resolveUsageTheme(req.Query.Get("theme"))},
+		"lang":  {resolveUsageLang(req.Query.Get("lang"))},
+	}.Encode()
+	op := strings.TrimSpace(req.Query.Get("op"))
+	name := filepath.Base(strings.TrimSpace(req.Query.Get("file")))
+	if (op != "disable" && op != "enable") || name == "." || name == "" {
+		return usageActionResponse(http.StatusBadRequest, "", "unknown Kiro usage action")
+	}
+	if err := setCredentialDisabled(name, op == "disable"); err != nil {
+		return usageActionResponse(http.StatusBadGateway, "", err.Error())
+	}
+	clearUsageCache()
+	return usageActionResponse(http.StatusSeeOther, back, "")
+}
+
+func usageActionResponse(status int, location, message string) ([]byte, error) {
+	headers := http.Header{"Cache-Control": []string{"no-store"}, "Content-Type": []string{"text/plain; charset=utf-8"}}
+	if location != "" {
+		headers.Set("Location", location)
+	}
+	return okEnvelope(pluginapi.ManagementResponse{StatusCode: status, Headers: headers, Body: []byte(message)})
+}
+
+// setCredentialDisabled flips the disabled flag of the Kiro credential stored
+// under name and saves the document back through the host, leaving every other
+// field as it was.
+func setCredentialDisabled(name string, disabled bool) error {
+	var listed hostAuthListResponse
+	if err := callHostResult(pluginabi.MethodHostAuthList, nil, &listed); err != nil {
+		return fmt.Errorf("list Kiro credentials: %w", err)
+	}
+	for _, entry := range listed.Files {
+		if filepath.Base(entry.Name) != name || !(strings.EqualFold(entry.Provider, providerName) || strings.EqualFold(entry.Type, providerName)) {
+			continue
+		}
+		record, _, _, err := getHostKiroAuth(entry.AuthIndex)
+		if err != nil && len(record.JSON) == 0 {
+			return fmt.Errorf("read Kiro credential %s: %w", name, err)
+		}
+		var document map[string]any
+		if err := json.Unmarshal(record.JSON, &document); err != nil {
+			return fmt.Errorf("decode Kiro credential %s: %w", name, err)
+		}
+		document["disabled"] = disabled
+		saved, _ := json.Marshal(document)
+		request, _ := json.Marshal(pluginapi.HostAuthSaveRequest{Name: name, JSON: saved})
+		var response pluginapi.HostAuthSaveResponse
+		if err := callHostResult(pluginabi.MethodHostAuthSave, request, &response); err != nil {
+			return fmt.Errorf("save Kiro credential %s: %w", name, err)
+		}
+		return nil
+	}
+	return fmt.Errorf("credential %s not found", name)
 }
 
 func getHostKiroAuth(authIndex string) (pluginapi.HostAuthGetResponse, []byte, *kiroauth.KiroTokenData, error) {

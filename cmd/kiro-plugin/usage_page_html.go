@@ -71,20 +71,24 @@ h1{margin:0;font-size:17px;line-height:1.3;font-weight:600;letter-spacing:-.01em
 .intro{margin:2px 0 0;color:var(--muted);font-size:12px}
 
 /* Fleet totals: the same figures as the last table row, read before the detail. */
+/* Wrapping flex rather than a grid: a grid left the unfilled end of its last
+   row showing the border colour as a dark block. Here the last row's items
+   grow to fill it. */
 .totals{
-  display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,168px),1fr));
-  gap:1px;margin:14px 0 0;overflow:hidden;
+  display:flex;flex-wrap:wrap;gap:1px;margin:14px 0 0;overflow:hidden;
   border:1px solid var(--border);border-radius:10px;background:var(--border);
 }
-.total{padding:9px 13px 10px;background:var(--surface)}
+.total{flex:1 1 168px;padding:9px 13px 10px;background:var(--surface)}
 .total dt{margin:0;color:var(--muted);font-size:12px;font-weight:400}
 .total dd{margin:1px 0 0;font-size:15px;font-weight:600;letter-spacing:-.01em;font-variant-numeric:tabular-nums}
 .total dd small{color:var(--muted);font-size:12px;font-weight:400;letter-spacing:0}
-.total.wide{grid-column:span 2}
+.total.wide{flex-basis:337px}
 
+/* A table narrower than its columns scrolls sideways instead of squeezing the
+   text columns; the squeeze is what broke "Kiro Free" into one letter a line. */
 .table-wrap{
   margin:12px 0 0;border:1px solid var(--border);border-radius:10px;
-  background:var(--surface);box-shadow:var(--shadow);overflow:hidden;
+  background:var(--surface);box-shadow:var(--shadow);overflow-x:auto;
 }
 table{width:100%;border-collapse:separate;border-spacing:0;font-variant-numeric:tabular-nums}
 /* Vertical centring is the fix for the misaligned rows: figures of different
@@ -118,14 +122,33 @@ tr.row:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
    spanning cells simply keep the row colour they had. */
 tr.row[aria-expanded="true"]>td{background:var(--surface-2)}
 
-.name{display:flex;align-items:center;gap:8px;min-width:0}
+.name{display:flex;align-items:flex-start;gap:8px;min-width:0}
+.name .chev,.name .dot{margin-top:5px}
+/* The file name is the identity shared with the panel's auth file list; the
+   operator's note sits under it, smaller, and only when there is one. */
+.who{display:flex;flex-direction:column;min-width:0}
+.note{color:var(--muted);font-size:12px;overflow-wrap:break-word}
+.status-line{color:var(--bad);font-size:12px;overflow-wrap:break-word}
+.actions{display:flex;flex-wrap:wrap;gap:6px;margin:7px 0 0 27px}
+.page-actions{margin:8px 0 0}
+.act{
+  display:inline-flex;align-items:center;min-height:26px;padding:0 10px;
+  border:1px solid var(--border-2);border-radius:999px;background:var(--surface);
+  color:var(--text-2);font-size:12px;font-weight:500;text-decoration:none;white-space:nowrap;
+}
+.act:hover{border-color:var(--accent);color:var(--text)}
+.act:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.act.primary{border-color:var(--bad-line);background:var(--bad-bg);color:var(--bad)}
 .chev{flex:none;width:12px;color:var(--muted);font-size:12px;line-height:1;transition:transform .12s ease-out}
 tr.row[aria-expanded="true"] .chev{transform:rotate(90deg);color:var(--accent)}
-.label{font-weight:500;overflow-wrap:anywhere}
+/* break-word, not anywhere: a name wraps only when it cannot fit, and never
+   mid-word when a line is merely tight. */
+.label{font-weight:500;overflow-wrap:break-word}
+td.account{min-width:250px}
 .dot{flex:none;width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3px var(--ok-bg)}
 .dot.error{background:var(--bad);box-shadow:0 0 0 3px var(--bad-bg)}
 .dot.disabled{background:var(--muted);box-shadow:none}
-.plan{font-weight:500;overflow-wrap:anywhere}
+.plan{font-weight:500;white-space:nowrap}
 .pair{white-space:nowrap}
 .sep,.cap{color:var(--muted);font-weight:400}
 .strong{font-weight:600}
@@ -183,16 +206,16 @@ tr.meta[hidden]{display:none}
 }
 .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 
-/* Under this width a seven-column table either scrolls sideways or shrinks past
-   reading size, so each row becomes its own block and every value keeps the
-   column head as its label. */
-@media(max-width:900px){
+/* The eight-column table needs a 1240px viewport (measured 2026-09-25: at
+   1180px it overflowed by 60px), and the panel frames this page narrower than
+   that on a laptop, where it broke. Under this width each account becomes its
+   own block and every value keeps the column head as its label. */
+@media(max-width:1240px){
   main{padding:14px 12px 22px}
   /* The panel keeps its cluster at a 12px gutter on a narrow viewport, so the
      reserved corner grows as a share of the width rather than shrinking. */
   .page-head{padding-right:clamp(150px,44vw,196px)}
-  .totals{grid-template-columns:repeat(auto-fit,minmax(min(100%,150px),1fr))}
-  .total.wide{grid-column:span 1}
+  .total,.total.wide{flex-basis:150px}
   thead{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
   table,tbody,tfoot,tr,td{display:block;width:auto}
   tbody.account,tfoot tr{padding:6px 14px 10px}
@@ -204,6 +227,10 @@ tr.meta[hidden]{display:none}
   td[data-label]{display:flex;align-items:baseline;justify-content:space-between;gap:14px}
   td[data-label]::before{content:attr(data-label);flex:none;color:var(--muted);font-weight:400}
   td.account[data-label]::before{content:none}
+  /* The account cell stacks: name, note, then its actions on their own line,
+     so the name keeps the full card width. */
+  td.account[data-label]{display:block;min-width:0}
+  .actions{margin:8px 0 2px 27px}
   .gauge{min-width:120px}
   tr.meta>td{padding:0}
   .fact dt{width:10.5em}
@@ -216,6 +243,7 @@ tr.meta[hidden]{display:none}
   <header class="page-head">
     <h1>{{text "title"}}</h1>
     <p class="intro">{{text "intro"}}</p>
+    {{if not .Empty}}<p class="page-actions"><a class="act" href="?refresh=all&amp;theme={{.Options.Theme}}&amp;lang={{.Options.Lang}}">{{text "action_refresh_all"}}</a></p>{{end}}
   </header>
   {{if .Empty}}<div class="empty" role="status">{{text "empty"}}</div>{{else}}
   {{$totals := .Totals}}
@@ -281,12 +309,7 @@ tr.meta[hidden]{display:none}
         <tr class="row" tabindex="0" role="button" aria-expanded="false" aria-controls="{{$metaID}}" data-target="{{$metaID}}">
           {{if eq $row 0}}
           <td class="account" rowspan="{{$rows}}" data-label="{{text "col_account"}}">
-            <span class="name">
-              <span class="chev" aria-hidden="true">&#9656;</span>
-              <span class="dot {{$account.StateClass}}" aria-hidden="true"></span>
-              <span class="label">{{$account.Label}}</span>
-              <span class="sr">{{text "label_state"}}: {{stateLabel $account.StateKey}}. {{text "row_hint"}}</span>
-            </span>
+            {{template "account-cell" (cell $account $)}}
           </td>
           <td rowspan="{{$rows}}" data-label="{{text "col_plan"}}"><span class="plan">{{if $account.Plan}}{{$account.Plan}}{{else}}{{text "plan_unknown"}}{{end}}</span></td>
           {{end}}
@@ -319,12 +342,7 @@ tr.meta[hidden]{display:none}
         {{if eq (len $account.Buckets) 0}}
         <tr class="row" tabindex="0" role="button" aria-expanded="false" aria-controls="{{$metaID}}" data-target="{{$metaID}}">
           <td class="account" data-label="{{text "col_account"}}">
-            <span class="name">
-              <span class="chev" aria-hidden="true">&#9656;</span>
-              <span class="dot {{$account.StateClass}}" aria-hidden="true"></span>
-              <span class="label">{{$account.Label}}</span>
-              <span class="sr">{{text "label_state"}}: {{stateLabel $account.StateKey}}. {{text "row_hint"}}</span>
-            </span>
+            {{template "account-cell" (cell $account $)}}
           </td>
           <td data-label="{{text "col_plan"}}"><span class="plan">{{if $account.Plan}}{{$account.Plan}}{{else}}{{text "plan_unknown"}}{{end}}</span></td>
           <td data-label="{{text "col_quota"}}"><span class="none">&mdash;</span></td>
@@ -342,6 +360,7 @@ tr.meta[hidden]{display:none}
               {{if $message}}<p class="notice" role="status">{{$message}}</p>{{end}}
               <dl class="facts">
                 <div class="fact"><dt>{{text "label_state"}}</dt><dd>{{stateLabel $account.StateKey}}</dd></div>
+                {{if isAddress $account.Account}}<div class="fact"><dt>{{text "label_account"}}</dt><dd>{{$account.Account}}</dd></div>{{end}}
                 {{if $account.PlanType}}<div class="fact"><dt>{{text "col_plan"}}</dt><dd>{{$account.PlanType}}</dd></div>{{end}}
                 {{if $account.AuthMethod}}<div class="fact"><dt>{{text "label_auth_method"}}</dt><dd>{{authMethodLabel $account.AuthMethod}}</dd></div>{{end}}
                 {{if $account.Region}}<div class="fact"><dt>{{text "label_region"}}</dt><dd>{{$account.Region}}</dd></div>{{end}}
@@ -506,9 +525,34 @@ tr.meta[hidden]{display:none}
       badge.className = left < 3600000 ? 'countdown soon' : 'countdown';
     }
   }
+  var confirmLinks = document.querySelectorAll('a[data-confirm]');
+  for (var c = 0; c < confirmLinks.length; c += 1) {
+    confirmLinks[c].addEventListener('click', function (event) {
+      if (!window.confirm(this.getAttribute('data-confirm'))) {
+        event.preventDefault();
+      }
+    });
+  }
   tick();
   setInterval(tick, 30000);
 })();
 </script>
 </body>
-</html>`
+</html>
+{{define "account-cell"}}{{$account := .Account}}{{$view := .View}}
+<span class="name">
+  <span class="chev" aria-hidden="true">&#9656;</span>
+  <span class="dot {{$account.StateClass}}" aria-hidden="true"></span>
+  <span class="who">
+    <span class="label">{{displayName $account}}</span>
+    {{if $account.Note}}<span class="note">{{$account.Note}}</span>{{end}}
+    {{if and (needsAttention $account) $account.StatusMessage}}<span class="status-line">{{$account.StatusMessage}}</span>{{end}}
+  </span>
+  <span class="sr">{{text "label_state"}}: {{stateLabel $account.StateKey}}. {{text "row_hint"}}</span>
+</span>
+{{if $account.FileName}}<span class="actions">
+  {{if needsAttention $account}}<a class="act primary" href="/management.html#/oauth" target="_top">{{text "action_relogin"}}</a>{{end}}
+  {{if ne $account.StateKey "disabled"}}<a class="act" href="?refresh={{$account.FileName}}&amp;theme={{$view.Options.Theme}}&amp;lang={{$view.Options.Lang}}">{{text "action_refresh"}}</a>{{end}}
+  {{if $view.ActionPath}}{{if eq $account.StateKey "disabled"}}<a class="act" href="{{$view.ActionPath}}?op=enable&amp;file={{$account.FileName}}&amp;theme={{$view.Options.Theme}}&amp;lang={{$view.Options.Lang}}">{{text "action_enable"}}</a>{{else}}<a class="act" data-confirm="{{text "confirm_disable"}}" href="{{$view.ActionPath}}?op=disable&amp;file={{$account.FileName}}&amp;theme={{$view.Options.Theme}}&amp;lang={{$view.Options.Lang}}">{{text "action_disable"}}</a>{{end}}{{end}}
+</span>{{end}}
+{{end}}`
