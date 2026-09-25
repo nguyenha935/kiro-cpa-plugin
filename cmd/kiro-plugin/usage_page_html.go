@@ -239,6 +239,7 @@ tr.meta[hidden]{display:none}
 </head>
 <body data-text-in="{{text "countdown_in"}}" data-text-due="{{text "countdown_due"}}">
 <noscript><style>tr.meta[hidden]{display:table-row}.chev{display:none}tr.row{cursor:default}</style></noscript>
+{{emailOff}}
 <main>
   <header class="page-head">
     <h1>{{text "title"}}</h1>
@@ -422,6 +423,7 @@ tr.meta[hidden]{display:none}
     </table>
   </div>{{end}}
 </main>
+{{emailOn}}
 <script nonce="{{.Options.Nonce}}">
 (function () {
   var root = document.documentElement;
