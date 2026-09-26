@@ -25,7 +25,7 @@ func TestParseEventStreamAccumulatesFragmentedSignedReasoning(t *testing.T) {
 		kiroEvent("assistantResponseEvent", `{"assistantResponseEvent":{"content":"Resposta."}}`),
 	)
 
-	content, reasoning, toolUses, _, _, err := (&KiroExecutor{}).parseEventStream(bytes.NewReader(body))
+	content, reasoning, toolUses, _, _, _, err := (&KiroExecutor{}).parseEventStream(bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestStreamBuffersReasoningUntilSignatureAndKeepsItOutOfVisibleText(t *testi
 	)
 
 	out := make(chan cliproxyexecutor.StreamChunk, 32)
-	(&KiroExecutor{}).streamToChannel(context.Background(), bytes.NewReader(body), out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil)
+	(&KiroExecutor{}).streamToChannel(context.Background(), bytes.NewReader(body), out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil, 0)
 	close(out)
 
 	var eventTypes []string
@@ -101,7 +101,7 @@ func TestStreamDoesNotExposeUnsignedReasoning(t *testing.T) {
 		kiroEvent("assistantResponseEvent", `{"assistantResponseEvent":{"content":"visible"}}`),
 	)
 	out := make(chan cliproxyexecutor.StreamChunk, 32)
-	(&KiroExecutor{}).streamToChannel(context.Background(), bytes.NewReader(body), out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil)
+	(&KiroExecutor{}).streamToChannel(context.Background(), bytes.NewReader(body), out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil, 0)
 	close(out)
 
 	var visibleText strings.Builder
@@ -128,7 +128,7 @@ func TestStreamClosesSignedReasoningBeforeDedicatedToolUse(t *testing.T) {
 		kiroEvent("toolUseEvent", `{"toolUseEvent":{"toolUseId":"call_1","name":"read_file","input":{"path":"README.md"},"stop":true}}`),
 	)
 	out := make(chan cliproxyexecutor.StreamChunk, 32)
-	(&KiroExecutor{}).streamToChannel(context.Background(), bytes.NewReader(body), out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil)
+	(&KiroExecutor{}).streamToChannel(context.Background(), bytes.NewReader(body), out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil, 0)
 	close(out)
 
 	thinkingStopPosition := -1
@@ -179,7 +179,7 @@ func TestStreamStopsReadingWhenTheContextIsCancelled(t *testing.T) {
 	out := make(chan cliproxyexecutor.StreamChunk)
 	finished := make(chan bool, 1)
 	go func() {
-		finished <- (&KiroExecutor{}).streamToChannel(ctx, reader, out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil)
+		finished <- (&KiroExecutor{}).streamToChannel(ctx, reader, out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil, 0)
 	}()
 
 	var streamErr error
@@ -226,7 +226,7 @@ func TestErrorFrameWithoutMessageStillFailsTheStream(t *testing.T) {
 		)
 
 		out := make(chan cliproxyexecutor.StreamChunk, 32)
-		if ok := (&KiroExecutor{}).streamToChannel(context.Background(), bytes.NewReader(body), out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil); ok {
+		if ok := (&KiroExecutor{}).streamToChannel(context.Background(), bytes.NewReader(body), out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil, 0); ok {
 			t.Fatalf("%s: streamToChannel reported success after an error frame", eventType)
 		}
 		close(out)
@@ -252,7 +252,7 @@ func TestErrorFrameWithoutMessageStillFailsTheStream(t *testing.T) {
 			t.Fatalf("%s: visible text = %q, want only the text before the error", eventType, visibleText.String())
 		}
 
-		content, _, _, _, _, err := (&KiroExecutor{}).parseEventStream(bytes.NewReader(body))
+		content, _, _, _, _, _, err := (&KiroExecutor{}).parseEventStream(bytes.NewReader(body))
 		if err == nil || !strings.Contains(err.Error(), eventType) {
 			t.Fatalf("%s: parseEventStream error = %v, want the event type as the message", eventType, err)
 		}
@@ -271,7 +271,7 @@ func TestOversizedEventStreamFrameIsRejectedAsMalformed(t *testing.T) {
 	frame = append(frame, make([]byte, 64)...)
 
 	out := make(chan cliproxyexecutor.StreamChunk, 4)
-	if ok := (&KiroExecutor{}).streamToChannel(context.Background(), bytes.NewReader(frame), out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil); ok {
+	if ok := (&KiroExecutor{}).streamToChannel(context.Background(), bytes.NewReader(frame), out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil, 0); ok {
 		t.Fatal("streamToChannel reported success for an oversized frame")
 	}
 	close(out)
@@ -285,7 +285,7 @@ func TestOversizedEventStreamFrameIsRejectedAsMalformed(t *testing.T) {
 		t.Fatalf("stream error = %v, want a malformed 'message too large' rejection", streamErr)
 	}
 
-	_, _, _, _, _, err := (&KiroExecutor{}).parseEventStream(bytes.NewReader(frame))
+	_, _, _, _, _, _, err := (&KiroExecutor{}).parseEventStream(bytes.NewReader(frame))
 	var eventErr *EventStreamError
 	if !errors.As(err, &eventErr) || eventErr.Type != ErrStreamMalformed || !strings.Contains(eventErr.Message, "message too large") {
 		t.Fatalf("parseEventStream error = %v, want %s 'message too large'", err, ErrStreamMalformed)

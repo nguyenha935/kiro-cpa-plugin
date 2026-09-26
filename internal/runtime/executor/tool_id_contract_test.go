@@ -25,7 +25,7 @@ func TestStreamRefusesToolUseWithoutID(t *testing.T) {
 	)
 
 	out := make(chan cliproxyexecutor.StreamChunk, 32)
-	if ok := (&KiroExecutor{}).streamToChannel(context.Background(), bytes.NewReader(body), out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil); ok {
+	if ok := (&KiroExecutor{}).streamToChannel(context.Background(), bytes.NewReader(body), out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil, 0); ok {
 		t.Fatal("streamToChannel reported success for an id-less tool use")
 	}
 	close(out)
@@ -58,7 +58,7 @@ func TestBufferedResponseRefusesToolUseWithoutID(t *testing.T) {
 		kiroEvent("assistantResponseEvent", `{"assistantResponseEvent":{"toolUses":[{"name":"read_file","input":{"path":"a"}}]}}`),
 	)
 
-	_, _, toolUses, _, _, err := (&KiroExecutor{}).parseEventStream(bytes.NewReader(body))
+	_, _, toolUses, _, _, _, err := (&KiroExecutor{}).parseEventStream(bytes.NewReader(body))
 	if err == nil || !strings.Contains(err.Error(), "toolUseId") {
 		t.Fatalf("parseEventStream error = %v, want the missing toolUseId named", err)
 	}
@@ -80,7 +80,7 @@ func TestStreamDeliversToolUsesThatCarryAnID(t *testing.T) {
 	)
 
 	out := make(chan cliproxyexecutor.StreamChunk, 64)
-	if ok := (&KiroExecutor{}).streamToChannel(context.Background(), bytes.NewReader(body), out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil); !ok {
+	if ok := (&KiroExecutor{}).streamToChannel(context.Background(), bytes.NewReader(body), out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil, 0); !ok {
 		close(out)
 		t.Fatal("streamToChannel failed a stream of well-formed tool uses")
 	}

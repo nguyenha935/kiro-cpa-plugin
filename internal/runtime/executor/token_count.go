@@ -5,13 +5,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 
+	"github.com/nguyenha935/kiro-cpa-plugin/internal/modelcapabilities"
 	kiroclaude "github.com/nguyenha935/kiro-cpa-plugin/internal/translator/kiro/claude"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tiktoken-go/tokenizer"
 )
@@ -140,11 +143,16 @@ func appendCountJSON(segments *[]string, value gjson.Result) {
 	appendCountString(segments, raw)
 }
 
-// completeKiroUsage preserves authoritative upstream counters and fills only
-// missing dimensions. Kiro commonly emits credit metering without token totals;
-// plugin executors must still expose token usage in their wire response so CPA
-// can publish the canonical host usage record.
-func completeKiroUsage(detail usage.Detail, requestPayload []byte, content string, reasoning *kiroclaude.KiroReasoningContent, toolUses []kiroclaude.KiroToolUse) usage.Detail {
+// completeKiroUsage fills the token usage of one response from what Kiro
+// reported. Kiro sends no token counters: measured on 2026-09-26 on every
+// catalogue model, and the official kiro-cli records zero tokens for every
+// turn. It sends contextUsagePercentage, the share of the model's input window
+// the conversation fills once the reply is added; times the window from Kiro's
+// own catalogue it is an exact token count (2.0300002% of 200000 is 4060.0).
+// So the total is Kiro's, the output is counted locally and the input is the
+// total minus the output. The request is never counted to make up an input.
+// Counters Kiro does send take precedence over all of this.
+func completeKiroUsage(detail usage.Detail, contextPercentage float64, contextWindow int64, content string, reasoning *kiroclaude.KiroReasoningContent, toolUses []kiroclaude.KiroToolUse) usage.Detail {
 	output := make([]string, 0, len(toolUses)*2+2)
 	appendCountString(&output, content)
 	if reasoning != nil && reasoning.ReasoningText != nil {
@@ -156,10 +164,10 @@ func completeKiroUsage(detail usage.Detail, requestPayload []byte, content strin
 			appendCountString(&output, string(raw))
 		}
 	}
-	return completeKiroUsageFromText(detail, requestPayload, strings.Join(output, "\n"))
+	return completeKiroUsageFromText(detail, contextPercentage, contextWindow, strings.Join(output, "\n"))
 }
 
-func completeKiroUsageFromText(detail usage.Detail, requestPayload []byte, output string) usage.Detail {
+func completeKiroUsageFromText(detail usage.Detail, contextPercentage float64, contextWindow int64, output string) usage.Detail {
 	if detail.InputTokens < 0 {
 		detail.InputTokens = 0
 	}
@@ -170,25 +178,54 @@ func completeKiroUsageFromText(detail usage.Detail, requestPayload []byte, outpu
 		detail.TotalTokens = 0
 	}
 
-	if detail.TotalTokens > 0 {
-		switch {
-		case detail.InputTokens == 0 && detail.OutputTokens > 0 && detail.TotalTokens > detail.OutputTokens:
-			detail.InputTokens = detail.TotalTokens - detail.OutputTokens
-		case detail.OutputTokens == 0 && detail.InputTokens > 0 && detail.TotalTokens > detail.InputTokens:
-			detail.OutputTokens = detail.TotalTokens - detail.InputTokens
-		}
-	}
-	if detail.InputTokens == 0 {
-		detail.InputTokens = estimateKiroTokens(string(bytes.TrimSpace(requestPayload)))
+	if detail.OutputTokens == 0 && detail.InputTokens > 0 && detail.TotalTokens > detail.InputTokens {
+		detail.OutputTokens = detail.TotalTokens - detail.InputTokens
 	}
 	if detail.OutputTokens == 0 {
 		detail.OutputTokens = estimateKiroTokens(output)
+	}
+	if detail.InputTokens == 0 {
+		total := detail.TotalTokens
+		if total == 0 {
+			total = kiroContextTokens(contextPercentage, contextWindow)
+		}
+		if total > 0 {
+			// The local output count uses another tokenizer, so on a short turn
+			// it can exceed Kiro's own total.
+			detail.InputTokens = max(total-detail.OutputTokens, 0)
+		} else {
+			log.Warnf("kiro: no token total from Kiro (context usage %v%% of a %d-token window); input tokens left at zero", contextPercentage, contextWindow)
+		}
 	}
 	minimumTotal := detail.InputTokens + detail.OutputTokens
 	if detail.TotalTokens < minimumTotal {
 		detail.TotalTokens = minimumTotal
 	}
 	return detail
+}
+
+// kiroContextTokens converts contextUsagePercentage back into the token count
+// Kiro derived it from, or 0 when either number is missing.
+func kiroContextTokens(percentage float64, window int64) int64 {
+	if percentage <= 0 || window <= 0 || math.IsNaN(percentage) || math.IsInf(percentage, 0) {
+		return 0
+	}
+	return int64(math.Round(percentage * float64(window) / 100))
+}
+
+// kiroContextWindow is the input window Kiro's catalogue gives this
+// credential's model: the denominator of contextUsagePercentage. The catalogue
+// registers Kiro's "auto" as "kiro/auto" while requests carry "auto".
+func kiroContextWindow(auth *cliproxyauth.Auth, modelID string) int64 {
+	authID := ""
+	if auth != nil {
+		authID = auth.ID
+	}
+	capability, ok := modelcapabilities.ForAuth(authID, modelID)
+	if !ok {
+		capability, _ = modelcapabilities.ForAuth(authID, "kiro/"+modelID)
+	}
+	return capability.InputTokenLimit
 }
 
 func estimateKiroTokens(value string) int64 {
