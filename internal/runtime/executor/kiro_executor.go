@@ -1219,7 +1219,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 			if len(bytes.TrimSpace(requestPayload)) == 0 {
 				requestPayload = req.Payload
 			}
-			if e.streamToChannel(ctx, resp.Body, out, from, payloadRequestedModel(opts, req.Model), requestPayload, body) {
+			if e.streamToChannel(withStreamTraceLabel(ctx, authID), resp.Body, out, from, payloadRequestedModel(opts, req.Model), requestPayload, body) {
 				log.Debugf("kiro: stream completed successfully for token %s", tokenKey)
 			}
 		}(httpResp)
@@ -1330,8 +1330,9 @@ func (e *EventStreamError) Error() string {
 
 // eventStreamMessage represents a parsed AWS Event Stream message
 type eventStreamMessage struct {
-	EventType string // Event type from headers (e.g., "assistantResponseEvent")
-	Payload   []byte // JSON payload of the message
+	EventType string            // Event type from headers (e.g., "assistantResponseEvent")
+	Headers   map[string]string // Every string-valued header, e.g. :message-type, :exception-type
+	Payload   []byte            // JSON payload of the message
 }
 
 // NOTE: Request building functions moved to internal/translator/kiro/claude/kiro_claude_request.go
@@ -1906,12 +1907,12 @@ func (e *KiroExecutor) readEventStreamMessage(reader *bufio.Reader) (*eventStrea
 		}
 	}
 
-	// Extract event type from headers
 	// Headers start at beginning of 'remaining', length is headersLength
-	var eventType string
+	var headers map[string]string
 	if headersLength > 0 && headersLength <= uint32(len(remaining)) {
-		eventType = e.extractEventTypeFromBytes(remaining[:headersLength])
+		headers = e.eventStreamStringHeaders(remaining[:headersLength])
 	}
+	eventType := headers[":event-type"]
 
 	// Calculate payload boundaries
 	// Payload starts after headers, ends before message_crc (last 4 bytes)
@@ -1923,6 +1924,7 @@ func (e *KiroExecutor) readEventStreamMessage(reader *bufio.Reader) (*eventStrea
 		// No payload, return empty message
 		return &eventStreamMessage{
 			EventType: eventType,
+			Headers:   headers,
 			Payload:   nil,
 		}, nil
 	}
@@ -1931,6 +1933,7 @@ func (e *KiroExecutor) readEventStreamMessage(reader *bufio.Reader) (*eventStrea
 
 	return &eventStreamMessage{
 		EventType: eventType,
+		Headers:   headers,
 		Payload:   payload,
 	}, nil
 }
@@ -1984,8 +1987,13 @@ func skipEventStreamHeaderValue(headers []byte, offset int, valueType byte) (int
 	}
 }
 
-// extractEventTypeFromBytes extracts the event type from raw header bytes (without prelude CRC prefix)
-func (e *KiroExecutor) extractEventTypeFromBytes(headers []byte) string {
+// eventStreamStringHeaders returns the string-valued headers of one frame (raw
+// header bytes, without the prelude). Besides :event-type, an AWS exception
+// frame names its type and message here (:message-type "exception",
+// :exception-type, :error-code, :error-message), possibly with no payload.
+// A repeated name keeps its first value.
+func (e *KiroExecutor) eventStreamStringHeaders(headers []byte) map[string]string {
+	values := make(map[string]string)
 	offset := 0
 	for offset < len(headers) {
 		nameLen := int(headers[offset])
@@ -2011,12 +2019,10 @@ func (e *KiroExecutor) extractEventTypeFromBytes(headers []byte) string {
 			if offset+valueLen > len(headers) {
 				break
 			}
-			value := string(headers[offset : offset+valueLen])
-			offset += valueLen
-
-			if name == ":event-type" {
-				return value
+			if _, seen := values[name]; !seen {
+				values[name] = string(headers[offset : offset+valueLen])
 			}
+			offset += valueLen
 			continue
 		}
 
@@ -2026,7 +2032,7 @@ func (e *KiroExecutor) extractEventTypeFromBytes(headers []byte) string {
 		}
 		offset = nextOffset
 	}
-	return ""
+	return values
 }
 
 // streamToChannel converts AWS Event Stream to channel-based streaming.
@@ -2065,6 +2071,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 	contentBlockIndex := -1
 	messageStartSent := false
 	isTextBlockOpen := false
+	var trace streamFrameTrace
 
 	// emitMessageStart opens the Anthropic message exactly once. message_delta
 	// and message_stop are meaningless before it: a client that receives a
@@ -2115,6 +2122,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 
 			break
 		}
+		trace.record(msg)
 
 		eventType := msg.EventType
 		payload := msg.Payload
@@ -2860,6 +2868,10 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 					totalUsage.InputTokens, totalUsage.OutputTokens, totalUsage.TotalTokens)
 			}
 		}
+	}
+
+	if contentBlockIndex < 0 {
+		log.Warnf("kiro: stream ended without a content block (credential=%s model=%s): %s", streamTraceLabel(ctx), model, &trace)
 	}
 
 	// Close content block if open
