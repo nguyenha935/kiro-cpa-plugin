@@ -60,7 +60,7 @@ func captureLog(t *testing.T) *bytes.Buffer {
 func runStream(t *testing.T, ctx context.Context, body []byte) bool {
 	t.Helper()
 	out := make(chan cliproxyexecutor.StreamChunk, 64)
-	ok := (&KiroExecutor{}).streamToChannel(ctx, bytes.NewReader(body), out, sdktranslator.FormatClaude, "claude-sonnet-4.5", nil, nil)
+	ok := (&KiroExecutor{}).streamToChannel(ctx, bytes.NewReader(body), out, sdktranslator.FormatClaude, "claude-sonnet-4.5", nil, nil, 0)
 	close(out)
 	return ok
 }

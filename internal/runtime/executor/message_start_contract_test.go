@@ -47,7 +47,7 @@ func TestStreamOpensTheMessageBeforeClosingIt(t *testing.T) {
 			t.Parallel()
 
 			out := make(chan cliproxyexecutor.StreamChunk, 32)
-			if ok := (&KiroExecutor{}).streamToChannel(context.Background(), bytes.NewReader(tc.body), out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil); !ok {
+			if ok := (&KiroExecutor{}).streamToChannel(context.Background(), bytes.NewReader(tc.body), out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil, 0); !ok {
 				t.Fatal("streamToChannel failed a stream that carried no error")
 			}
 			close(out)
@@ -82,7 +82,7 @@ func TestStreamOpensTheMessageExactlyOnce(t *testing.T) {
 		kiroEvent("assistantResponseEvent", `{"assistantResponseEvent":{"content":" second"}}`),
 	)
 	out := make(chan cliproxyexecutor.StreamChunk, 32)
-	if ok := (&KiroExecutor{}).streamToChannel(context.Background(), bytes.NewReader(body), out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil); !ok {
+	if ok := (&KiroExecutor{}).streamToChannel(context.Background(), bytes.NewReader(body), out, sdktranslator.FormatClaude, "claude-opus-5", nil, nil, 0); !ok {
 		t.Fatal("streamToChannel failed a well-formed stream")
 	}
 	close(out)

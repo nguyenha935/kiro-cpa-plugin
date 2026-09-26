@@ -952,18 +952,14 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 			}
 		}()
 
-		content, reasoning, toolUses, usageInfo, stopReason, err := e.parseEventStream(httpResp.Body)
+		content, reasoning, toolUses, usageInfo, contextPercentage, stopReason, err := e.parseEventStream(httpResp.Body)
 		if err != nil {
 			recordAPIResponseError(ctx, e.cfg, err)
 			return resp, normalizeTransportError(err)
 		}
 
 		appendAPIResponseChunk(ctx, e.cfg, []byte(content))
-		requestPayload := opts.OriginalRequest
-		if len(bytes.TrimSpace(requestPayload)) == 0 {
-			requestPayload = req.Payload
-		}
-		usageInfo = completeKiroUsage(usageInfo, requestPayload, content, reasoning, toolUses)
+		usageInfo = completeKiroUsage(usageInfo, contextPercentage, kiroContextWindow(auth, kiroModelID), content, reasoning, toolUses)
 
 		// Build response in Claude format for Kiro translator
 		// stopReason is extracted from upstream response by parseEventStream
@@ -1219,7 +1215,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 			if len(bytes.TrimSpace(requestPayload)) == 0 {
 				requestPayload = req.Payload
 			}
-			if e.streamToChannel(withStreamTraceLabel(ctx, authID), resp.Body, out, from, payloadRequestedModel(opts, req.Model), requestPayload, body) {
+			if e.streamToChannel(withStreamTraceLabel(ctx, authID), resp.Body, out, from, payloadRequestedModel(opts, req.Model), requestPayload, body, kiroContextWindow(auth, kiroModelID)) {
 				log.Debugf("kiro: stream completed successfully for token %s", tokenKey)
 			}
 		}(httpResp)
@@ -1342,8 +1338,8 @@ type eventStreamMessage struct {
 // Extracts text content, signed or redacted reasoning, tool uses, and
 // stop_reason from the response.
 // Buffers official toolUseEvent fragments without altering their input.
-// Returns: content, reasoning, toolUses, usageInfo, stopReason, error
-func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.KiroReasoningContent, []kiroclaude.KiroToolUse, usage.Detail, string, error) {
+// Returns: content, reasoning, toolUses, usageInfo, contextUsagePercentage, stopReason, error
+func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.KiroReasoningContent, []kiroclaude.KiroToolUse, usage.Detail, float64, string, error) {
 	var content strings.Builder
 	var reasoningText strings.Builder
 	var reasoningSignature string
@@ -1364,7 +1360,7 @@ func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.Kir
 		msg, eventErr := e.readEventStreamMessage(reader)
 		if eventErr != nil {
 			log.Errorf("kiro: parseEventStream error: %v", eventErr)
-			return content.String(), nil, toolUses, usageInfo, stopReason, eventErr
+			return content.String(), nil, toolUses, usageInfo, 0, stopReason, eventErr
 		}
 		if msg == nil {
 			// Normal end of stream (EOF)
@@ -1392,7 +1388,7 @@ func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.Kir
 				errMsg = msg
 			}
 			log.Errorf("kiro: received AWS error in event stream: type=%s, message=%s", errType, errMsg)
-			return "", nil, nil, usageInfo, stopReason, streamStatusError(errType, errMsg)
+			return "", nil, nil, usageInfo, 0, stopReason, streamStatusError(errType, errMsg)
 		}
 		if errType, hasErrType := event["type"].(string); hasErrType && (errType == "error" || errType == "exception") {
 			// Generic error event
@@ -1405,7 +1401,7 @@ func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.Kir
 				}
 			}
 			log.Errorf("kiro: received error event in stream: type=%s, message=%s", errType, errMsg)
-			return "", nil, nil, usageInfo, stopReason, streamStatusError(errType, errMsg)
+			return "", nil, nil, usageInfo, 0, stopReason, streamStatusError(errType, errMsg)
 		}
 
 		// Extract stop_reason from various event formats
@@ -1447,7 +1443,7 @@ func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.Kir
 							toolUseID := kirocommon.GetStringValue(tu, "toolUseId")
 							duplicate, err := kiroclaude.ClaimToolUseID(processedIDs, toolUseID)
 							if err != nil {
-								return "", nil, nil, usageInfo, stopReason, err
+								return "", nil, nil, usageInfo, 0, stopReason, err
 							}
 							if duplicate {
 								log.Debugf("kiro: skipping duplicate tool use from assistantResponse: %s", toolUseID)
@@ -1477,7 +1473,7 @@ func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.Kir
 						toolUseID := kirocommon.GetStringValue(tu, "toolUseId")
 						duplicate, err := kiroclaude.ClaimToolUseID(processedIDs, toolUseID)
 						if err != nil {
-							return "", nil, nil, usageInfo, stopReason, err
+							return "", nil, nil, usageInfo, 0, stopReason, err
 						}
 						if duplicate {
 							log.Debugf("kiro: skipping duplicate direct tool use: %s", toolUseID)
@@ -1500,7 +1496,7 @@ func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.Kir
 			// Handle dedicated tool use events with input buffering
 			completedToolUses, newState, toolErr := kiroclaude.ProcessToolUseEvent(event, currentToolUse, processedIDs)
 			if toolErr != nil {
-				return "", nil, nil, usageInfo, stopReason, toolErr
+				return "", nil, nil, usageInfo, 0, stopReason, toolErr
 			}
 			currentToolUse = newState
 			toolUses = append(toolUses, completedToolUses...)
@@ -1739,7 +1735,7 @@ func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.Kir
 			if errMsg == "" {
 				errMsg = errType
 			}
-			return "", nil, nil, usageInfo, stopReason, streamStatusError(errType, errMsg)
+			return "", nil, nil, usageInfo, 0, stopReason, streamStatusError(errType, errMsg)
 
 		default:
 			// Check for contextUsagePercentage in any event
@@ -1839,7 +1835,7 @@ func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.Kir
 		log.Warn("kiro: dropping unsigned reasoning from buffered response")
 	}
 
-	return cleanedContent, reasoning, toolUses, usageInfo, stopReason, nil
+	return cleanedContent, reasoning, toolUses, usageInfo, upstreamContextPercentage, stopReason, nil
 }
 
 // readEventStreamMessage reads and validates a single AWS Event Stream message.
@@ -2039,7 +2035,7 @@ func (e *KiroExecutor) eventStreamStringHeaders(headers []byte) map[string]strin
 // Supports tool calling - emits tool_use content blocks when tools are used.
 // Buffers official toolUseEvent input fragments without repairing malformed JSON.
 // Extracts stop_reason from upstream events when available.
-func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out chan<- cliproxyexecutor.StreamChunk, targetFormat sdktranslator.Format, model string, originalReq, claudeBody []byte) bool {
+func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out chan<- cliproxyexecutor.StreamChunk, targetFormat sdktranslator.Format, model string, originalReq, claudeBody []byte, contextWindow int64) bool {
 	reader := bufio.NewReader(body)
 	var totalUsage usage.Detail
 	var outputForUsage strings.Builder
@@ -2896,7 +2892,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 		}
 	}
 
-	totalUsage = completeKiroUsageFromText(totalUsage, originalReq, outputForUsage.String())
+	totalUsage = completeKiroUsageFromText(totalUsage, upstreamContextPercentage, contextWindow, outputForUsage.String())
 
 	// Log upstream usage information if received
 	if hasUpstreamUsage {
