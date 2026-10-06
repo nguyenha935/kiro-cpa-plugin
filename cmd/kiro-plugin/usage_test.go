@@ -59,8 +59,8 @@ func TestManagementRegistrationAndIncorrectResourcePath(t *testing.T) {
 			found = resource.Path == usageResourcePath
 		}
 	}
-	if !found || len(registration.Resources) != 1 {
-		t.Fatalf("the static Kiro Usage shell must be the only resource: %+v", registration.Resources)
+	if !found {
+		t.Fatalf("the static Kiro Usage shell is not registered: %+v", registration.Resources)
 	}
 	// The host prefixes resource routes with its own id for the plugin, which is
 	// the shared-library name, not the provider name.
@@ -646,21 +646,25 @@ func TestRefreshKeepsHostRuntimeStateForAuthData(t *testing.T) {
 
 func TestUsagePageTextPacksAgreeOnKeys(t *testing.T) {
 	english := usagePageTextPacks[usageLangEN]
-	vietnamese := usagePageTextPacks[usageLangVI]
-	if len(english) == 0 || len(vietnamese) == 0 {
-		t.Fatal("both text packs must be populated")
+	if len(english) == 0 || len(usagePageTextPacks) != 3 {
+		t.Fatalf("expected the en, vi and zh-CN packs, got %d", len(usagePageTextPacks))
 	}
 	for key, value := range english {
 		if strings.TrimSpace(value) == "" {
 			t.Fatalf("english text %q is empty", key)
 		}
-		if translated, ok := vietnamese[key]; !ok || strings.TrimSpace(translated) == "" {
-			t.Fatalf("vietnamese pack is missing %q", key)
-		}
 	}
-	for key := range vietnamese {
-		if _, ok := english[key]; !ok {
-			t.Fatalf("vietnamese pack has an unknown key %q", key)
+	for _, lang := range []string{usageLangVI, usageLangZH} {
+		pack := usagePageTextPacks[lang]
+		for key := range english {
+			if translated, ok := pack[key]; !ok || strings.TrimSpace(translated) == "" {
+				t.Fatalf("%s pack is missing %q", lang, key)
+			}
+		}
+		for key := range pack {
+			if _, ok := english[key]; !ok {
+				t.Fatalf("%s pack has an unknown key %q", lang, key)
+			}
 		}
 	}
 }
@@ -699,7 +703,8 @@ func TestRenderUsagePageLocalizesTheSameCachedView(t *testing.T) {
 }
 
 func TestUsagePageOptionsRejectUnknownLanguage(t *testing.T) {
-	if resolveUsageLang("de") != usageLangEN || resolveUsageLang("VI-vn") != usageLangVI {
+	if resolveUsageLang("de") != usageLangEN || resolveUsageLang("VI-vn") != usageLangVI ||
+		resolveUsageLang("zh-TW") != usageLangZH || resolveUsageLang("zh") != usageLangZH || resolveUsageLang("zhx") != usageLangEN {
 		t.Fatal("language must resolve to a closed set")
 	}
 	page, err := renderUsagePage(newUsagePageView(nil, usagePageOptions{Lang: `ru" onload="alert(1)`}, ""))

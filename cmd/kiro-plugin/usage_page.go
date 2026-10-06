@@ -17,6 +17,9 @@ import (
 const (
 	usageLangEN = "en"
 	usageLangVI = "vi"
+	// usageLangZH covers every Chinese request: the page has one Chinese pack,
+	// in Simplified characters.
+	usageLangZH = "zh-CN"
 )
 
 // usagePageText maps a text key to its localized string.
@@ -244,6 +247,112 @@ var usagePageTextPacks = map[string]usagePageText{
 		"action_enable":         "Bật",
 		"confirm_disable":       "Tắt credential Kiro này? CLIProxyAPI sẽ ngừng chuyển request tới nó cho tới khi bật lại.",
 	},
+	usageLangZH: {
+		"title":                 "Kiro 用量",
+		"intro":                 "Kiro 为每个已连接账户报告的订阅用量。",
+		"empty":                 "尚未连接 Kiro 账户。请在 OAuth 登录页添加。",
+		"col_overage":           "超额",
+		"col_overage_sub":       "上限 · 单价 · 已计费",
+		"total_row":             "合计",
+		"total_accounts":        "{n} 个账户",
+		"total_used":            "已用 / 上限",
+		"total_remaining":       "剩余",
+		"total_share":           "已用比例",
+		"total_charged":         "超额费用",
+		"total_mixed_units":     "单位不一致",
+		"row_hint":              "展开账户详情",
+		"label_overage_cap":     "超额上限",
+		"label_overage_rate":    "超额单价",
+		"label_overage_charges": "已计超额费用",
+		"label_overage_limit":   "已设超额限制",
+		"label_free_trial":      "免费试用",
+		"label_trial_expiry":    "试用结束",
+		"label_bonus":           "赠送额度",
+		"label_overage_credit":  "超额额度",
+		"label_days_reset":      "距重置天数",
+		"label_overage_allowed": "允许超额",
+		"label_upgrade":         "可升级",
+		"label_manage":          "套餐管理方",
+		"label_state":           "状态",
+		"value_yes":             "是",
+		"value_no":              "否",
+		"value_purchase":        "自行购买",
+		"value_manage":          "组织管理",
+		"trial_expired":         "已过期",
+		"trial_active":          "进行中",
+		"per_unit":              "每 {unit}",
+		"col_quota":             "额度池",
+		"quota_plan":            "套餐额度",
+		"quota_trial":           "免费试用",
+		"quota_bonus":           "赠送额度",
+		"quota_overage_credit":  "超额额度",
+		"total_trial":           "免费试用",
+		"total_bonus":           "赠送额度",
+		"total_overage_credit":  "超额额度",
+		"grants_count":          "{n} 次发放",
+		"amount_unknown":        "未报告数量",
+		"label_expiry":          "到期",
+		"col_account":           "账户",
+		"col_plan":              "套餐",
+		"col_state":             "状态",
+		"col_bucket":            "额度",
+		"col_used":              "已用 / 上限",
+		"col_percent":           "比例",
+		"col_remaining":         "剩余",
+		"col_reset":             "重置",
+		"table_caption":         "各账户的 Kiro 额度池",
+		"toggle_details":        "显示凭证详情",
+		"stat_accounts":         "账户",
+		"stat_active":           "正常报告",
+		"stat_attention":        "需要处理",
+		"stat_generated":        "生成于",
+		"state_active":          "正常",
+		"state_disabled":        "已停用",
+		"state_unavailable":     "不可用",
+		"plan_unknown":          "未知套餐",
+		"bucket_of":             "/",
+		"label_remaining":       "剩余",
+		"label_overage":         "超额",
+		"label_renews":          "重置",
+		"label_unit":            "单位",
+		"label_currency":        "币种",
+		"label_auth_method":     "登录方式",
+		"label_region":          "区域",
+		"label_identity":        "身份",
+		"label_account":         "账户",
+		"label_directory":       "身份存储",
+		"label_aws_account":     "AWS 账户",
+		"label_profile":         "配置文件",
+		"directory_builder_id":  "AWS Builder ID",
+		"label_file":            "凭证文件",
+		"label_token_expires":   "会话到期",
+		"label_last_refresh":    "上次刷新",
+		"label_overage_status":  "超额计费",
+		"label_status":          "状态详情",
+		"credential_heading":    "凭证",
+		"updated_prefix":        "用量读取于",
+		"countdown_in":          "{duration}后",
+		"countdown_due":         "已到期",
+		"auth_idc":              "IAM Identity Center",
+		"auth_builder_id":       "AWS Builder ID",
+		"auth_api_key":          "API key",
+		"auth_external_idp":     "外部身份提供商",
+		"auth_imported":         "导入的凭证",
+		"err_no_buckets":        "Kiro 未返回该账户的用量数据。",
+		"err_list_failed":       "CLIProxyAPI 无法列出已连接的账户。",
+		"err_unavailable":       "该凭证当前不可用。",
+		"err_rejected":          "Kiro 拒绝了此会话。请在 OAuth 登录页重新登录。",
+		"err_expired":           "访问令牌已过期，CLIProxyAPI 尚未续期。如持续出现，请重新登录。",
+		"err_rate_limited":      "Kiro 限制了用量请求的频率。请稍后再试。",
+		"err_upstream":          "Kiro 用量暂时无法读取。",
+		"err_generic":           "无法加载该账户的用量。",
+		"action_refresh":        "刷新额度",
+		"action_refresh_all":    "全部刷新",
+		"action_relogin":        "重新登录",
+		"action_disable":        "停用",
+		"action_enable":         "启用",
+		"confirm_disable":       "停用此 Kiro 凭证？在重新启用之前，CLIProxyAPI 不会再向它转发请求。",
+	},
 }
 
 var usageAuthMethodTextKeys = map[string]string{
@@ -259,8 +368,11 @@ var usageAuthMethodTextKeys = map[string]string{
 // attribute.
 func resolveUsageLang(value string) string {
 	normalized := strings.ToLower(strings.TrimSpace(value))
-	if normalized == usageLangVI || strings.HasPrefix(normalized, usageLangVI+"-") {
+	switch {
+	case normalized == usageLangVI || strings.HasPrefix(normalized, usageLangVI+"-"):
 		return usageLangVI
+	case normalized == "zh" || strings.HasPrefix(normalized, "zh-"):
+		return usageLangZH
 	}
 	return usageLangEN
 }

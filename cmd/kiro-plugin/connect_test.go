@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,7 +14,10 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
-func TestLoginStartCreatesPanelManagedSessionWithoutRedirectURL(t *testing.T) {
+// The stock Management Center has no Kiro form, so StartLogin hands its OAuth
+// card the sign-in page. The state rides in the fragment, which a browser never
+// sends, so it reaches CPA only in the authenticated /connect body.
+func TestLoginStartReturnsTheSignInPage(t *testing.T) {
 	loginFlowsMu.Lock()
 	loginFlows = map[string]loginFlow{}
 	loginFlowsMu.Unlock()
@@ -34,8 +38,8 @@ func TestLoginStartCreatesPanelManagedSessionWithoutRedirectURL(t *testing.T) {
 	if login.State == "" || !login.ExpiresAt.After(time.Now().UTC()) {
 		t.Fatalf("invalid panel-managed login session: %+v", login)
 	}
-	if login.URL != "" {
-		t.Fatalf("Kiro login must stay inside the CPA panel, got redirect URL %q", login.URL)
+	if login.URL != resourceBasePath+loginResourcePath+"#state="+login.State || strings.Contains(login.URL, "?") {
+		t.Fatalf("sign-in URL = %q for state %q", login.URL, login.State)
 	}
 }
 
