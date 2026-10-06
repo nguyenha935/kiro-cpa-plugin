@@ -591,17 +591,7 @@ func handleUsageView(req pluginapi.ManagementRequest) ([]byte, error) {
 // resource route may serve: the shell fetches the table from handleUsageView
 // with the panel's management key.
 func handleUsageShell() ([]byte, error) {
-	return okEnvelope(pluginapi.ManagementResponse{
-		StatusCode: http.StatusOK,
-		Headers: http.Header{
-			"Content-Type":            []string{"text/html; charset=utf-8"},
-			"Cache-Control":           []string{"no-cache"},
-			"Content-Security-Policy": []string{usageShellCSP},
-			"Referrer-Policy":         []string{"no-referrer"},
-			"X-Content-Type-Options":  []string{"nosniff"},
-		},
-		Body: usageShellPage,
-	})
+	return shellResponse(usageShell)
 }
 
 // usageRefreshAll is the ?refresh value that re-reads every account.
