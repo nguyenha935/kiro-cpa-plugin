@@ -89,6 +89,20 @@ const (
 	pluginDisplayName = "Kiro"
 	resourceBasePath  = "/v0/resource/plugins/" + pluginID
 	maxPages          = 10
+
+	// refreshIntervalKey is the only channel through which a plugin credential
+	// enters CPA's refresh scheduler. Without it the scheduler drops the auth:
+	// "kiro" has no built-in refresh lead (sdk/auth/refresh_registry.go), and a
+	// successful refresh clears NextRefreshAfter
+	// (sdk/cliproxy/auth/conductor_refresh.go), so auth.refresh was never called
+	// on a timer. CPA refreshes when expiry is within the interval or the last
+	// refresh is older than it; half of Kiro's one-hour token lifetime keeps
+	// every token renewed well before it expires.
+	refreshIntervalKey     = "refresh_interval_seconds"
+	refreshIntervalSeconds = 1800
+	// modelListTimeout bounds a live model listing: the first registration of a
+	// credential, and the relisting inside auth.refresh.
+	modelListTimeout = 15 * time.Second
 )
 
 var pluginVersion = "dev"
@@ -158,6 +172,7 @@ type registrationCapabilities struct {
 	ExecutorInputFormats  []string                     `json:"executor_input_formats,omitempty"`
 	ExecutorOutputFormats []string                     `json:"executor_output_formats,omitempty"`
 	ManagementAPI         bool                         `json:"management_api"`
+	QuotaProvider         bool                         `json:"quota_provider"`
 }
 
 type identifierResponse struct {
@@ -293,10 +308,19 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			Resources: []pluginapi.ResourceRoute{
 				{Path: "/capabilities"},
 				{Path: usageResourcePath, Menu: "Kiro Usage", Description: "Shows Kiro subscription usage for connected accounts."},
+				{Path: usageActionPath()},
 			},
 		})
 	case pluginabi.MethodManagementHandle:
 		return handleManagement(request)
+	case methodQuotaIdentifier:
+		return okEnvelope(identifierResponse{Identifier: providerName})
+	case methodQuotaDescribe:
+		return handleQuotaDescribe()
+	case methodQuotaFetch:
+		return handleQuotaFetch(request)
+	case methodQuotaReset:
+		return handleQuotaReset()
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
@@ -533,6 +557,7 @@ func pluginRegistration() registration {
 			ExecutorInputFormats:  []string{"openai-response", "claude", "openai"},
 			ExecutorOutputFormats: []string{"openai-response", "claude", "openai"},
 			ManagementAPI:         true,
+			QuotaProvider:         true,
 		},
 	}
 }
@@ -746,7 +771,12 @@ func authData(token *kiroauth.KiroTokenData, fileName string) pluginapi.AuthData
 			// Host metadata is the authoritative source for CPA-managed fields
 			// changed from the UI (aliases, exclusions, priority, cooling, etc.).
 			// Persist it before rebuilding classification so a refresh cannot erase
-			// those settings.
+			// those settings. The model catalogue is the plugin's own record and
+			// is never taken from the host copy, which can be older than the
+			// listing being saved.
+			if key == modelCatalogKey {
+				continue
+			}
 			storageMap[key] = value
 		}
 		storageMap["type"] = providerName
@@ -907,6 +937,7 @@ func authMetadata(token *kiroauth.KiroTokenData) map[string]any {
 	if metadata == nil {
 		metadata = make(map[string]any)
 	}
+	delete(metadata, modelCatalogKey)
 	// Unknown fields in the credential document are host-owned CPA settings or
 	// forward-compatible metadata. Promote them back into AuthData so refresh
 	// cannot replace a rich host record with a reduced plugin-only record.
@@ -920,13 +951,15 @@ func authMetadata(token *kiroauth.KiroTokenData) map[string]any {
 		}
 	}
 	metadata["type"] = providerName
-	metadata["auth_method"] = token.AuthMethod
-	metadata["expires_at"] = token.ExpiresAt
-	metadata["region"] = token.Region
+	setCredentialKeys(metadata, token)
 	if isAPIKeyCredential(token) {
 		metadata["auth_kind"] = coreauth.AuthKindAPIKey
 	} else {
 		metadata["auth_kind"] = coreauth.AuthKindOAuth
+		// An interval set on the host record wins, like every host-owned field.
+		if _, set := metadata[refreshIntervalKey]; !set {
+			metadata[refreshIntervalKey] = refreshIntervalSeconds
+		}
 	}
 	// CPA resolves the panel account column from metadata["email"], then
 	// attributes["email"], then the credential document's own email field
@@ -949,27 +982,6 @@ func authMetadata(token *kiroauth.KiroTokenData) map[string]any {
 	if value := strings.TrimSpace(token.ProfileName); value != "" {
 		metadata["profile_name"] = value
 	}
-	if token.AccessToken != "" {
-		metadata["access_token"] = token.AccessToken
-	}
-	if token.RefreshToken != "" {
-		metadata["refresh_token"] = token.RefreshToken
-	}
-	if token.ClientID != "" {
-		metadata["client_id"] = token.ClientID
-	}
-	if token.ClientSecret != "" {
-		metadata["client_secret"] = token.ClientSecret
-	}
-	if token.ProfileArn != "" {
-		metadata["profile_arn"] = token.ProfileArn
-	}
-	if token.TokenEndpoint != "" {
-		metadata["token_endpoint"] = token.TokenEndpoint
-	}
-	if token.Scopes != "" {
-		metadata["scopes"] = token.Scopes
-	}
 	if token.PreferredEndpoint != "" {
 		metadata["preferred_endpoint"] = token.PreferredEndpoint
 	}
@@ -986,6 +998,39 @@ func authMetadata(token *kiroauth.KiroTokenData) map[string]any {
 		metadata["disable_cooling"] = true
 	}
 	return metadata
+}
+
+// setCredentialKeys writes every field that identifies the credential under
+// both spellings the credential document carries, even when empty.
+//
+// On login CPA merges the existing file into the new record, copying every key
+// the new metadata does not define and skipping only a few snake_case token
+// keys (sdk/cliproxy/auth MergeExistingAuthMetadata), then overlays metadata
+// on the stored document. A key missing here therefore comes back from the old
+// file: re-logging a Builder ID account on 2026-09-25 kept the dead
+// accessToken/refreshToken/clientId next to the new snake_case ones, and the
+// camelCase fields, which are read first, made the fresh login unusable.
+func setCredentialKeys(metadata map[string]any, token *kiroauth.KiroTokenData) {
+	for _, field := range []struct {
+		value        string
+		camel, snake string
+	}{
+		{token.AccessToken, "accessToken", "access_token"},
+		{token.RefreshToken, "refreshToken", "refresh_token"},
+		{token.ClientID, "clientId", "client_id"},
+		{token.ClientSecret, "clientSecret", "client_secret"},
+		{token.ClientIDHash, "clientIdHash", "client_id_hash"},
+		{token.ExpiresAt, "expiresAt", "expires_at"},
+		{token.ProfileArn, "profileArn", "profile_arn"},
+		{token.AuthMethod, "authMethod", "auth_method"},
+		{token.StartURL, "startUrl", "start_url"},
+		{token.Region, "region", "region"},
+		{token.TokenEndpoint, "token_endpoint", "token_endpoint"},
+		{token.Scopes, "scopes", "scopes"},
+	} {
+		metadata[field.camel] = field.value
+		metadata[field.snake] = field.value
+	}
 }
 
 func authAttributes(token *kiroauth.KiroTokenData) map[string]string {
@@ -1135,10 +1180,11 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 	lock := credentialUsageLock(token, req.AuthID)
 	lock.Lock()
 	defer lock.Unlock()
-	refreshed, err := refreshKiroCredential(context.Background(), token)
+	refreshed, err := authRefreshCredential(context.Background(), token)
 	if err != nil {
 		return nil, err
 	}
+	relistModels(req.AuthID, refreshed)
 	clearUsageCache()
 	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: authDataForHostUpdate(refreshed, req.Attributes, req.AuthID), NextRefreshAfter: nextRefreshAfter(refreshed, parseTime(refreshed.ExpiresAt))})
 }
@@ -1153,7 +1199,6 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	applyHostOwnedSettings(token, req.Metadata, req.Attributes)
-	ctx := context.Background()
 	// CPA's generic file synthesizer applies OAuth defaults after plugin parsing.
 	// Returning AuthUpdate during model discovery restores the API-key kind and
 	// api_key attribute in the live auth record without requiring a CPA patch.
@@ -1162,29 +1207,98 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 	lock.Lock()
 	defer lock.Unlock()
 
-	if credentialNeedsRefresh(token, usageNow()) {
-		token, _, err = refreshAndSaveUsageCredential(ctx, kiroFileName(token), req.StorageJSON, token)
-		if err != nil {
-			return nil, err
-		}
-		authUpdated = true
-		clearUsageCache()
-	} else if resolveAccount(token).ProfileDiscoverable() && strings.TrimSpace(token.ProfileArn) == "" {
+	// Registration must not wait on the network. CPA asks every credential in
+	// turn while it starts, after its port is already open, and every other
+	// provider answers at once; a live listing per credential made Kiro register
+	// 2-8 s after everything else (measured 2026-09-25, starts at 15:29 and
+	// 16:27), so anything reading the model list at startup saw no Kiro models.
+	// The stored listing answers whatever the token's state: it is renewed by
+	// auth.refresh, which CPA schedules off the startup path.
+	if stored, ok := storedModelCatalog(token); ok {
+		return modelsResponse(req, token, stored.Models, authUpdated)
+	}
+	// Only a credential that has never been listed gets here. Listing never
+	// renews the token; renewal is auth.refresh, scheduled by CPA.
+	now := time.Now()
+	if accessTokenExpired(token, now) {
+		return nil, pluginStatusError{status: http.StatusUnauthorized, message: "Kiro access token expired; waiting for the host to refresh it"}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), modelListTimeout)
+	defer cancel()
+
+	if resolveAccount(token).ProfileDiscoverable() && strings.TrimSpace(token.ProfileArn) == "" {
 		// A social credential reached this branch under the previous
 		// "not an API key and not Builder ID" test, and discovery refuses social,
 		// so listing models failed outright for it. Social has no profile to find
 		// and is served by the Amazon Q surface, exactly like Builder ID.
 		if err = reconcileProfile(ctx, token); err != nil {
 			return nil, fmt.Errorf("discover required Kiro profile: %w", err)
-		} else {
-			authUpdated = true
 		}
+		authUpdated = true
 	}
 
 	models, err := listAvailableModels(ctx, token)
 	if err != nil {
 		return nil, fmt.Errorf("list Kiro models: %w", err)
 	}
+	if storeModelCatalog(token, models, now) {
+		authUpdated = true
+	}
+	return modelsResponse(req, token, models, authUpdated)
+}
+
+// modelCatalogKey is the credential field holding the stored catalogue.
+const modelCatalogKey = "kiro_model_catalog"
+
+// storedCatalog is the kiro_model_catalog field of a credential. Catalogues
+// differ per account (Builder ID lists 9 models, an IDC profile 19), so it is
+// the credential's own listing rather than a fixed list.
+type storedCatalog struct {
+	FetchedAt string              `json:"fetched_at"`
+	Models    []controlPlaneModel `json:"models"`
+}
+
+// authRefreshCredential renews a credential in auth.refresh; tests replace it.
+var authRefreshCredential = refreshKiroCredential
+
+// relistModels renews the stored catalogue with a freshly refreshed token. It
+// runs inside auth.refresh, which CPA schedules every refreshIntervalSeconds
+// and persists, so the listing stays current without touching registration.
+// A failed listing keeps the previous catalogue and never fails the refresh.
+func relistModels(authID string, token *kiroauth.KiroTokenData) {
+	ctx, cancel := context.WithTimeout(context.Background(), modelListTimeout)
+	defer cancel()
+	models, err := listAvailableModels(ctx, token)
+	if err != nil {
+		log.Printf("kiro: relisting models for %s failed (%v); keeping the stored catalogue", authID, err)
+		return
+	}
+	storeModelCatalog(token, models, time.Now())
+}
+
+func storedModelCatalog(token *kiroauth.KiroTokenData) (storedCatalog, bool) {
+	var stored storedCatalog
+	if len(token.ModelCatalog) == 0 || json.Unmarshal(token.ModelCatalog, &stored) != nil {
+		return storedCatalog{}, false
+	}
+	return stored, len(stored.Models) > 0
+}
+
+// storeModelCatalog records a listing on the credential and reports whether
+// it has to be persisted. An empty listing is never stored.
+func storeModelCatalog(token *kiroauth.KiroTokenData, models []controlPlaneModel, now time.Time) bool {
+	if len(models) == 0 {
+		return false
+	}
+	raw, err := json.Marshal(storedCatalog{FetchedAt: now.UTC().Format(time.RFC3339), Models: models})
+	if err != nil {
+		return false
+	}
+	token.ModelCatalog = raw
+	return true
+}
+
+func modelsResponse(req pluginapi.AuthModelRequest, token *kiroauth.KiroTokenData, models []controlPlaneModel, authUpdated bool) ([]byte, error) {
 	out := make([]pluginapi.ModelInfo, 0, len(models))
 	capabilities := make([]modelcapabilities.Capability, 0, len(models))
 	for _, model := range models {
@@ -1210,6 +1324,17 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 		response.AuthUpdate = authDataForHostUpdate(token, req.Attributes, req.AuthID)
 	}
 	return okEnvelope(response)
+}
+
+// accessTokenExpired is true only for a token whose recorded expiry has passed.
+// API keys do not expire, and an unreadable expiry is left for the upstream to
+// judge rather than rejected here.
+func accessTokenExpired(token *kiroauth.KiroTokenData, now time.Time) bool {
+	if token == nil || isAPIKeyCredential(token) {
+		return false
+	}
+	expiresAt, err := time.Parse(time.RFC3339, strings.TrimSpace(token.ExpiresAt))
+	return err == nil && !expiresAt.After(now)
 }
 
 func applyHostOwnedSettings(token *kiroauth.KiroTokenData, metadata map[string]any, attrs map[string]string) {
@@ -1930,8 +2055,11 @@ func handleManagement(raw []byte) ([]byte, error) {
 			Body: body,
 		})
 	}
-	if req.Path == resourceBasePath+usageResourcePath {
+	switch req.Path {
+	case resourceBasePath + usageResourcePath:
 		return handleUsagePage(req)
+	case resourceBasePath + usageActionPath():
+		return handleUsageAction(req)
 	}
 	return okEnvelope(pluginapi.ManagementResponse{StatusCode: http.StatusNotFound, Headers: http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}}, Body: []byte("Not found")})
 }

@@ -132,9 +132,16 @@ var usagePageTextPacks = map[string]usagePageText{
 		"err_list_failed":       "CLIProxyAPI could not list connected accounts.",
 		"err_unavailable":       "This credential is currently unavailable.",
 		"err_rejected":          "Kiro rejected this session. Sign in again from OAuth Login.",
+		"err_expired":           "The access token has expired and CLIProxyAPI has not renewed it yet. Sign in again if this persists.",
 		"err_rate_limited":      "Kiro rate-limited the usage request. Try again later.",
 		"err_upstream":          "Kiro usage is temporarily unavailable.",
 		"err_generic":           "Usage could not be loaded for this account.",
+		"action_refresh":        "Reload quota",
+		"action_refresh_all":    "Reload all quotas",
+		"action_relogin":        "Sign in again",
+		"action_disable":        "Disable",
+		"action_enable":         "Enable",
+		"confirm_disable":       "Disable this Kiro credential? CLIProxyAPI stops routing requests to it until it is enabled again.",
 	},
 	usageLangVI: {
 		"title":                 "Hạn mức Kiro",
@@ -231,9 +238,16 @@ var usagePageTextPacks = map[string]usagePageText{
 		"err_list_failed":       "CLIProxyAPI không liệt kê được các tài khoản đã kết nối.",
 		"err_unavailable":       "Credential này hiện không khả dụng.",
 		"err_rejected":          "Kiro từ chối phiên này. Đăng nhập lại ở trang OAuth Login.",
+		"err_expired":           "Access token đã hết hạn và CLIProxyAPI chưa làm mới. Nếu lỗi còn lặp lại, hãy đăng nhập lại.",
 		"err_rate_limited":      "Kiro đã chặn vì gọi quá nhiều. Thử lại sau.",
 		"err_upstream":          "Hạn mức Kiro tạm thời không đọc được.",
 		"err_generic":           "Không tải được hạn mức cho tài khoản này.",
+		"action_refresh":        "Tải lại quota",
+		"action_refresh_all":    "Tải lại tất cả",
+		"action_relogin":        "Đăng nhập lại",
+		"action_disable":        "Tắt",
+		"action_enable":         "Bật",
+		"confirm_disable":       "Tắt credential Kiro này? CLIProxyAPI sẽ ngừng chuyển request tới nó cho tới khi bật lại.",
 	},
 }
 
@@ -322,6 +336,16 @@ type usagePageView struct {
 	Totals      usagePageTotals
 	Options     usagePageOptions
 	GeneratedAt string
+	// ActionPath is the absolute resource path of the enable/disable action.
+	// Empty hides the toggle, as on a page rendered outside the host.
+	ActionPath string
+}
+
+// usageAccountCell carries one account together with the page it renders on,
+// because the account cell needs the page's options to build its links.
+type usageAccountCell struct {
+	Account usageAccountView
+	View    usagePageView
 }
 
 // newUsageTotals folds every bucket of every account into one row.
@@ -416,7 +440,7 @@ func newUsagePageView(accounts []usageAccountView, options usagePageOptions, gen
 	summary := usagePageSummary{Accounts: len(accounts)}
 	for _, account := range accounts {
 		switch {
-		case account.ErrorKey != "" || account.Error != "" || account.StateKey == usageStateUnavailable:
+		case usageNeedsAttention(account):
 			summary.Attention++
 		case len(account.Buckets) > 0:
 			summary.Reporting++
@@ -521,7 +545,24 @@ func usagePageFuncs(text usagePageText) template.FuncMap {
 			}
 			return &account.Buckets[0]
 		},
-		"lower": strings.ToLower,
+		"lower":          strings.ToLower,
+		"displayName":    usageDisplayName,
+		"needsAttention": usageNeedsAttention,
+		// isAddress keeps the account fact to a real address AWS reported; a bare
+		// user key says nothing a reader can recognise.
+		"isAddress": looksLikeEmail,
+		// The panel is reached through Cloudflare, whose Email Address
+		// Obfuscation rewrites every address in an HTML page to "[email protected]"
+		// and injects a decoder script. This page's CSP runs only its own
+		// nonce script, so the decoder never ran and every note read
+		// "[email protected]" (reported 2026-09-25). The email_off markers are
+		// Cloudflare's per-page opt-out. They are returned as template.HTML
+		// because html/template drops comments written in the template.
+		"emailOff": func() template.HTML { return "<!--email_off-->" },
+		"emailOn":  func() template.HTML { return "<!--/email_off-->" },
+		"cell": func(account usageAccountView, view usagePageView) usageAccountCell {
+			return usageAccountCell{Account: account, View: view}
+		},
 		// bucketName localises the pool rows this code creates and leaves the plan
 		// row named the way AWS named it.
 		"bucketName": func(bucket usageBucketView) string {
