@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -121,43 +120,42 @@ func TestUsageRefreshSelectorForcesOnlyTheNamedCredential(t *testing.T) {
 	}
 }
 
-func usageAction(t *testing.T, query url.Values) pluginapi.ManagementResponse {
+func postUsageCredential(t *testing.T, method, body string) pluginapi.ManagementResponse {
 	t.Helper()
-	raw, err := handleUsageAction(pluginapi.ManagementRequest{Method: http.MethodGet, Path: resourceBasePath + usageActionPath(), Query: query})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var response pluginapi.ManagementResponse
-	decodeEnvelope(t, raw, &response)
-	return response
+	return serveManagement(t, pluginapi.ManagementRequest{Method: method, Path: managementBasePath + usageCredentialRoute, Body: []byte(body)})
 }
 
-// The toggle flips only the disabled flag of the named credential and returns
-// to the page in the caller's language and theme.
-func TestUsageActionTogglesOnlyTheDisabledFlag(t *testing.T) {
+// The toggle flips only the disabled flag of the named credential.
+func TestUsageCredentialTogglesOnlyTheDisabledFlag(t *testing.T) {
 	_, saved := usageFixture(t)
-	response := usageAction(t, url.Values{"op": {"disable"}, "file": {"kiro-a.json"}, "lang": {"vi"}, "theme": {"light"}})
-	if response.StatusCode != http.StatusSeeOther {
+	response := postUsageCredential(t, http.MethodPost, `{"file":"kiro-a.json","disabled":true}`)
+	if response.StatusCode != http.StatusOK || response.Headers.Get("Content-Type") != "application/json" {
 		t.Fatalf("status = %d, body %s", response.StatusCode, response.Body)
 	}
-	location := response.Headers.Get("Location")
-	if !strings.HasPrefix(location, resourceBasePath+usageResourcePath+"?") || !strings.Contains(location, "lang=vi") || !strings.Contains(location, "theme=light") {
-		t.Fatalf("Location = %q", location)
+	var echoed struct {
+		File     string `json:"file"`
+		Disabled bool   `json:"disabled"`
+	}
+	if err := json.Unmarshal(response.Body, &echoed); err != nil || echoed.File != "kiro-a.json" || !echoed.Disabled {
+		t.Fatalf("response body = %s (%v)", response.Body, err)
 	}
 	document := saved["kiro-a.json"]
 	if document["disabled"] != true || document["note"] != "a@example.com" || document["accessToken"] != "a-token" || len(saved) != 1 {
 		t.Fatalf("saved = %+v", saved)
 	}
+	if response := postUsageCredential(t, http.MethodPost, `{"file":"../kiro-b.json","disabled":false}`); response.StatusCode != http.StatusOK || saved["kiro-b.json"]["disabled"] != false {
+		t.Fatalf("a path prefix must reduce to the file name: %d %s", response.StatusCode, response.Body)
+	}
 
-	for _, query := range []url.Values{
-		{"op": {"delete"}, "file": {"kiro-a.json"}},
-		{"op": {"disable"}},
-	} {
-		if response := usageAction(t, query); response.StatusCode != http.StatusBadRequest {
-			t.Fatalf("%v: status = %d, want 400", query, response.StatusCode)
+	for _, body := range []string{`{"file":"kiro-a.json"}`, `{"disabled":true}`, `{"file":"","disabled":true}`, `not json`} {
+		if response := postUsageCredential(t, http.MethodPost, body); response.StatusCode != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d, want 400", body, response.StatusCode)
 		}
 	}
-	if response := usageAction(t, url.Values{"op": {"enable"}, "file": {"kiro-missing.json"}}); response.StatusCode != http.StatusBadGateway {
+	if response := postUsageCredential(t, http.MethodGet, `{"file":"kiro-a.json","disabled":false}`); response.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("GET: status = %d, want 405", response.StatusCode)
+	}
+	if response := postUsageCredential(t, http.MethodPost, `{"file":"kiro-missing.json","disabled":false}`); response.StatusCode != http.StatusBadGateway {
 		t.Fatalf("unknown file: status = %d", response.StatusCode)
 	}
 }
@@ -169,7 +167,7 @@ func TestUsageCellShowsFileNameThenNote(t *testing.T) {
 		{Label: "Free · Builder ID · 1", FileName: "kiro-a.json", Note: "a@example.com", StateKey: usageStateActive},
 		{Label: "Free · Builder ID · 2", FileName: "kiro-b.json", StateKey: usageStateActive},
 	}
-	page, err := renderUsagePage(newUsagePageView(accounts, usagePageOptions{Nonce: "n"}, ""))
+	page, err := renderUsagePage(newUsagePageView(accounts, usagePageOptions{}, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +187,7 @@ func TestUsageCellShowsFileNameThenNote(t *testing.T) {
 // between its email_off markers; the page's CSP blocks the decoder it injects.
 func TestUsagePageOptsOutOfCloudflareEmailObfuscation(t *testing.T) {
 	accounts := []usageAccountView{{FileName: "kiro-a.json", Note: "a@example.com", StateKey: usageStateActive}}
-	page, err := renderUsagePage(newUsagePageView(accounts, usagePageOptions{Nonce: "n"}, ""))
+	page, err := renderUsagePage(newUsagePageView(accounts, usagePageOptions{}, ""))
 	if err != nil {
 		t.Fatal(err)
 	}

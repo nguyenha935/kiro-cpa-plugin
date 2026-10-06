@@ -14,7 +14,7 @@ The plugin:
 - supports streaming, tool calls, token refresh, multiple accounts, and failover;
 - forwards client-executed function tools, bounds their descriptions to Kiro's upstream limit, and omits server-side tools that Kiro cannot execute;
 - preserves system and developer instructions exactly once, anchored to the first user turn, because the upstream `systemPrompt` field is feature-gated;
-- provides a read-only `Kiro Usage` page for subscription usage.
+- provides a `Kiro Usage` page for subscription usage, with per-account reload and enable/disable.
 
 `Kiro` is the name shown in the CLIProxyAPI interface. The provider ID stays `kiro`; the plugin ID, library filename, and `plugins.configs` key are `kiro-ha` (see [Build](#build)).
 
@@ -71,18 +71,26 @@ CPA owns credential selection, failover and the 429 backoff ladder; the plugin r
 
 Reasoning controls are advertised only when the authenticated account's Kiro model schema declares an `effort` enum. Claude models currently use `additionalModelRequestFields.output_config.effort`; GPT models use `additionalModelRequestFields.reasoning.effort`. The plugin forwards the selected level through that declared path for OpenAI Responses, Chat Completions, and Anthropic Messages.
 
-The loopback resource `/v0/resource/plugins/kiro-ha/capabilities` exposes only the intersection of non-secret model capability metadata discovered for the connected accounts. Local catalog synchronizers can use it instead of maintaining guessed model lists. It contains no account identifiers, profile ARNs, tokens, or quota data.
+The Management API route `GET /v0/management/plugins/kiro/capabilities` (management key required) exposes only the intersection of non-secret model capability metadata discovered for the connected accounts. Local catalog synchronizers can use it instead of maintaining guessed model lists. It contains no account identifiers, profile ARNs, tokens, or quota data.
 
 ## Kiro Usage
 
-Open `Kiro Usage` from the plugin menu in the Management Center. The plugin renders one card per connected Kiro account with the plan, usage buckets, balance, renewal date, and overage information returned by Kiro.
+Open `Kiro Usage` from the plugin menu in the Management Center. The page shows one row group per connected Kiro account with the plan, credit pools, balance, renewal date, and overage information returned by Kiro, plus fleet totals.
 
-The page is read-only. Its only script, allowed by a nonce-based Content-Security-Policy, formats dates in the browser locale, updates renewal countdowns, and toggles account detail rows; it makes no network requests. Its 192-bit random route is generated when CLIProxyAPI starts and is revealed only through the authenticated plugin list. The route changes after a process restart. Results remain in memory for 60 seconds, and a manual refresh is limited to one upstream call per account every 10 seconds.
+CLIProxyAPI serves plugin resource routes without the management key, so the page is split accordingly:
 
-Quota data and credentials are never written by the page. If Kiro changes or rejects its private usage endpoint, the affected account displays an error instead of an estimated value.
+| Route | Auth | Purpose |
+| --- | --- | --- |
+| `GET /v0/resource/plugins/kiro-ha/usage` | none | Static shell: layout and one script, identical bytes on every request, no account data. |
+| `GET /v0/management/plugins/kiro/usage/view?lang=&refresh=` | management key | The account table as an HTML fragment. `refresh` names one credential file or `all`. |
+| `POST /v0/management/plugins/kiro/usage/credential` | management key | Body `{"file": "<credential file>", "disabled": true\|false}`; sets only that credential's `disabled` flag. |
+
+The shell reads the key the Management Center keeps when it signs in with “Remember” ticked; otherwise it asks for the key and holds it in memory only. Its Content-Security-Policy admits only its own script by hash and allows network requests to the same origin only, so the injected fragment cannot run code. Results remain in memory for 60 seconds, and a manual reload is limited to one upstream call per account every 10 seconds.
+
+The page never writes quota data and changes nothing but the `disabled` flag of a credential you toggle. If Kiro changes or rejects its private usage endpoint, the affected account displays an error instead of an estimated value.
 
 ## Architecture
 
-This is a standalone Go module built against the public CLIProxyAPI v7 plugin SDK. The repository contains only the Kiro provider: IAM Identity Center authentication, model discovery, request and response translation, execution, and the read-only usage page. It does not embed the CLIProxyAPI server or unrelated providers.
+This is a standalone Go module built against the public CLIProxyAPI v7 plugin SDK. The repository contains only the Kiro provider: IAM Identity Center authentication, model discovery, request and response translation, execution, and the usage page. It does not embed the CLIProxyAPI server or unrelated providers.
 
 The plugin is distributed under the [MIT License](LICENSE).

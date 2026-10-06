@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -25,6 +24,14 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
+// The usage page is a static shell on a resource route plus two Management API
+// routes that carry everything account-specific.
+const (
+	usageResourcePath    = "/usage"
+	usageViewRoute       = "/plugins/kiro/usage/view"
+	usageCredentialRoute = "/plugins/kiro/usage/credential"
+)
+
 const (
 	usageCacheTTL       = 60 * time.Second
 	usageRefreshFloor   = 10 * time.Second
@@ -32,9 +39,8 @@ const (
 )
 
 var (
-	usageResourcePath = newUsageResourcePath()
-	usageLocks        sync.Map
-	usageState        = struct {
+	usageLocks sync.Map
+	usageState = struct {
 		sync.Mutex
 		cache       map[string]usageCacheEntry
 		lastRefresh map[string]time.Time
@@ -327,14 +333,6 @@ type usageCredential struct {
 	err        error
 }
 
-func newUsageResourcePath() string {
-	random := make([]byte, 24)
-	if _, err := io.ReadFull(cryptorand.Reader, random); err != nil {
-		panic(fmt.Sprintf("generate Kiro usage resource path: %v", err))
-	}
-	return "/usage/" + hex.EncodeToString(random)
-}
-
 func credentialUsageLock(token *kiroauth.KiroTokenData, fallback string) *sync.Mutex {
 	key := strings.TrimSpace(fallback)
 	if token != nil {
@@ -563,39 +561,47 @@ func refreshExternalIDP(ctx context.Context, token *kiroauth.KiroTokenData) (*ki
 	return &copy, nil
 }
 
-// handleUsagePage answers both the legacy resource route and the authenticated
-// management route. Theme and language come from the embedding panel; both are
-// validated against a closed set before reaching the document.
+// handleUsageView renders the account table as an HTML fragment for the static
+// usage shell. It is a Management API route, so CPA has checked the management
+// key before the request reaches it; the shell's resource route serves no data.
 //
 // Opening the page reads the per-credential cache; only ?refresh=<file> or
-// ?refresh=all asks AWS again, so viewing the page no longer costs one usage
-// call per connected account.
-func handleUsagePage(req pluginapi.ManagementRequest) ([]byte, error) {
+// ?refresh=all asks AWS again, so viewing the page does not cost one usage call
+// per connected account.
+func handleUsageView(req pluginapi.ManagementRequest) ([]byte, error) {
 	accounts := collectUsageAccounts(context.Background(), strings.TrimSpace(req.Query.Get("refresh")))
-	view := newUsagePageView(accounts, usagePageOptions{
-		Theme: req.Query.Get("theme"),
-		Lang:  req.Query.Get("lang"),
-	}, usageNow().Format(time.RFC3339))
-	view.ActionPath = resourceBasePath + usageActionPath()
-	page, err := renderUsagePage(view)
+	view := newUsagePageView(accounts, usagePageOptions{Lang: req.Query.Get("lang")}, usageNow().Format(time.RFC3339))
+	fragment, err := renderUsagePage(view)
 	if err != nil {
 		return nil, err
 	}
 	return okEnvelope(pluginapi.ManagementResponse{
 		StatusCode: http.StatusOK,
-		Headers:    usagePageHeaders(view.Options.Nonce),
-		Body:       page,
+		Headers: http.Header{
+			"Content-Type":           []string{"text/html; charset=utf-8"},
+			"Cache-Control":          []string{"no-store"},
+			"X-Content-Type-Options": []string{"nosniff"},
+		},
+		Body: fragment,
 	})
 }
 
-func usagePageHeaders(nonce string) http.Header {
-	return http.Header{
-		"Content-Type":            []string{"text/html; charset=utf-8"},
-		"Cache-Control":           []string{"no-store"},
-		"Content-Security-Policy": []string{"default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-" + nonce + "'; frame-ancestors 'self'; base-uri 'none'"},
-		"Referrer-Policy":         []string{"no-referrer"},
-		"X-Content-Type-Options":  []string{"nosniff"},
-	}
+// handleUsageShell serves the usage page itself. The bytes are the same on
+// every request and carry no account data, which is what an unauthenticated
+// resource route may serve: the shell fetches the table from handleUsageView
+// with the panel's management key.
+func handleUsageShell() ([]byte, error) {
+	return okEnvelope(pluginapi.ManagementResponse{
+		StatusCode: http.StatusOK,
+		Headers: http.Header{
+			"Content-Type":            []string{"text/html; charset=utf-8"},
+			"Cache-Control":           []string{"no-cache"},
+			"Content-Security-Policy": []string{usageShellCSP},
+			"Referrer-Policy":         []string{"no-referrer"},
+			"X-Content-Type-Options":  []string{"nosniff"},
+		},
+		Body: usageShellPage,
+	})
 }
 
 // usageRefreshAll is the ?refresh value that re-reads every account.
@@ -885,39 +891,40 @@ func credentialNote(raw []byte) string {
 	return strings.TrimSpace(document.Note)
 }
 
-// usageActionPath is the resource route that toggles a credential, under the
-// same unguessable prefix as the page itself.
-func usageActionPath() string {
-	return usageResourcePath + "/action"
+// usageCredentialRequest is the body of the enable/disable call.
+type usageCredentialRequest struct {
+	File     string `json:"file"`
+	Disabled *bool  `json:"disabled"`
 }
 
-// handleUsageAction enables or disables one Kiro credential and returns to the
-// page. Resource routes are GET only and carry no management key, so the
-// action lives under the page's own random path, like the page; it only sets
+// handleUsageCredential enables or disables one Kiro credential. It only sets
 // the credential's disabled flag through the host, which CPA then applies.
-func handleUsageAction(req pluginapi.ManagementRequest) ([]byte, error) {
-	back := resourceBasePath + usageResourcePath + "?" + url.Values{
-		"theme": {resolveUsageTheme(req.Query.Get("theme"))},
-		"lang":  {resolveUsageLang(req.Query.Get("lang"))},
-	}.Encode()
-	op := strings.TrimSpace(req.Query.Get("op"))
-	name := filepath.Base(strings.TrimSpace(req.Query.Get("file")))
-	if (op != "disable" && op != "enable") || name == "." || name == "" {
-		return usageActionResponse(http.StatusBadRequest, "", "unknown Kiro usage action")
+func handleUsageCredential(req pluginapi.ManagementRequest) ([]byte, error) {
+	if req.Method != http.MethodPost {
+		return usageCredentialResponse(http.StatusMethodNotAllowed, map[string]any{"error": "use POST"})
 	}
-	if err := setCredentialDisabled(name, op == "disable"); err != nil {
-		return usageActionResponse(http.StatusBadGateway, "", err.Error())
+	var body usageCredentialRequest
+	if err := json.Unmarshal(req.Body, &body); err != nil || body.Disabled == nil {
+		return usageCredentialResponse(http.StatusBadRequest, map[string]any{"error": "expected {\"file\": string, \"disabled\": bool}"})
+	}
+	name := filepath.Base(strings.TrimSpace(body.File))
+	if name == "." || name == "" || name == string(filepath.Separator) {
+		return usageCredentialResponse(http.StatusBadRequest, map[string]any{"error": "file is required"})
+	}
+	if err := setCredentialDisabled(name, *body.Disabled); err != nil {
+		return usageCredentialResponse(http.StatusBadGateway, map[string]any{"error": err.Error()})
 	}
 	clearUsageCache()
-	return usageActionResponse(http.StatusSeeOther, back, "")
+	return usageCredentialResponse(http.StatusOK, map[string]any{"file": name, "disabled": *body.Disabled})
 }
 
-func usageActionResponse(status int, location, message string) ([]byte, error) {
-	headers := http.Header{"Cache-Control": []string{"no-store"}, "Content-Type": []string{"text/plain; charset=utf-8"}}
-	if location != "" {
-		headers.Set("Location", location)
-	}
-	return okEnvelope(pluginapi.ManagementResponse{StatusCode: status, Headers: headers, Body: []byte(message)})
+func usageCredentialResponse(status int, payload map[string]any) ([]byte, error) {
+	body, _ := json.Marshal(payload)
+	return okEnvelope(pluginapi.ManagementResponse{
+		StatusCode: status,
+		Headers:    http.Header{"Cache-Control": []string{"no-store"}, "Content-Type": []string{"application/json"}},
+		Body:       body,
+	})
 }
 
 // setCredentialDisabled flips the disabled flag of the Kiro credential stored

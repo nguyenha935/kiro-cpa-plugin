@@ -88,7 +88,10 @@ const (
 	providerName      = "kiro"
 	pluginDisplayName = "Kiro"
 	resourceBasePath  = "/v0/resource/plugins/" + pluginID
-	maxPages          = 10
+	// managementBasePath prefixes every route in Routes when CPA hands the
+	// request to handleManagement.
+	managementBasePath = "/v0/management"
+	maxPages           = 10
 
 	// refreshIntervalKey is the only channel through which a plugin credential
 	// enters CPA's refresh scheduler. Without it the scheduler drops the auth:
@@ -300,15 +303,15 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			Routes: []pluginapi.ManagementRoute{
 				{Method: http.MethodGet, Path: "/plugins/kiro/status"},
 				{Method: http.MethodPost, Path: "/plugins/kiro/connect"},
-				// Authenticated twin of the usage resource page. Resource routes are
-				// served without the management key (only the random path guards
-				// them), so the panel embeds this one instead.
-				{Method: http.MethodGet, Path: "/plugins/kiro/usage"},
+				{Method: http.MethodGet, Path: "/plugins/kiro/capabilities"},
+				{Method: http.MethodGet, Path: usageViewRoute},
+				{Method: http.MethodPost, Path: usageCredentialRoute},
 			},
+			// Resource routes are served without the management key, so the only
+			// one is the static usage shell; its data and its actions go through
+			// the routes above.
 			Resources: []pluginapi.ResourceRoute{
-				{Path: "/capabilities"},
 				{Path: usageResourcePath, Menu: "Kiro Usage", Description: "Shows Kiro subscription usage for connected accounts."},
-				{Path: usageActionPath()},
 			},
 		})
 	case pluginabi.MethodManagementHandle:
@@ -2034,14 +2037,18 @@ func handleManagement(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	switch req.Path {
-	case "/v0/management/plugins/kiro/status":
+	case managementBasePath + "/plugins/kiro/status":
 		body, _ := json.Marshal(map[string]any{"provider": providerName, "version": pluginVersion, "auth": "multi-method", "model_catalog": "dynamic"})
 		return okEnvelope(pluginapi.ManagementResponse{StatusCode: http.StatusOK, Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: body})
-	case "/v0/management/plugins/kiro/connect":
+	case managementBasePath + "/plugins/kiro/connect":
 		return handleConnectAPI(req)
-	case "/v0/management/plugins/kiro/usage":
-		return handleUsagePage(req)
-	case resourceBasePath + "/capabilities":
+	case managementBasePath + usageViewRoute:
+		return handleUsageView(req)
+	case managementBasePath + usageCredentialRoute:
+		return handleUsageCredential(req)
+	case resourceBasePath + usageResourcePath:
+		return handleUsageShell()
+	case managementBasePath + "/plugins/kiro/capabilities":
 		capabilities := modelcapabilities.Snapshot()
 		sort.Slice(capabilities, func(i, j int) bool { return capabilities[i].ModelID < capabilities[j].ModelID })
 		body, _ := json.Marshal(map[string]any{"provider": providerName, "models": capabilities})
@@ -2054,12 +2061,6 @@ func handleManagement(raw []byte) ([]byte, error) {
 			},
 			Body: body,
 		})
-	}
-	switch req.Path {
-	case resourceBasePath + usageResourcePath:
-		return handleUsagePage(req)
-	case resourceBasePath + usageActionPath():
-		return handleUsageAction(req)
 	}
 	return okEnvelope(pluginapi.ManagementResponse{StatusCode: http.StatusNotFound, Headers: http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}}, Body: []byte("Not found")})
 }

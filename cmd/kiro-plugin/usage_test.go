@@ -11,7 +11,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -27,18 +26,6 @@ type httpDoerFunc func(*http.Request) (*http.Response, error)
 
 func (fn httpDoerFunc) Do(request *http.Request) (*http.Response, error) {
 	return fn(request)
-}
-
-func TestUsageResourcePathUses192Bits(t *testing.T) {
-	pattern := regexp.MustCompile(`^/usage/[0-9a-f]{48}$`)
-	first := newUsageResourcePath()
-	second := newUsageResourcePath()
-	if !pattern.MatchString(first) || !pattern.MatchString(second) {
-		t.Fatalf("unexpected capability paths: %q and %q", first, second)
-	}
-	if first == second {
-		t.Fatal("independent capability paths must differ")
-	}
 }
 
 func TestManagementRegistrationAndIncorrectResourcePath(t *testing.T) {
@@ -72,16 +59,18 @@ func TestManagementRegistrationAndIncorrectResourcePath(t *testing.T) {
 			found = resource.Path == usageResourcePath
 		}
 	}
-	if !found {
-		t.Fatalf("Kiro Usage resource was not registered at the process capability path: %+v", registration.Resources)
+	if !found || len(registration.Resources) != 1 {
+		t.Fatalf("the static Kiro Usage shell must be the only resource: %+v", registration.Resources)
 	}
 	// The host prefixes resource routes with its own id for the plugin, which is
 	// the shared-library name, not the provider name.
 	for path, want := range map[string]int{
-		resourceBasePath + usageResourcePath + "x":      http.StatusNotFound,
-		"/v0/resource/plugins/kiro" + usageResourcePath: http.StatusNotFound,
-		"/v0/resource/plugins/kiro/capabilities":        http.StatusNotFound,
-		resourceBasePath + "/capabilities":              http.StatusOK,
+		resourceBasePath + usageResourcePath + "x":                            http.StatusNotFound,
+		resourceBasePath + usageResourcePath + "/" + strings.Repeat("ab", 24): http.StatusNotFound,
+		"/v0/resource/plugins/kiro" + usageResourcePath:                       http.StatusNotFound,
+		resourceBasePath + "/capabilities":                                    http.StatusNotFound,
+		resourceBasePath + usageResourcePath:                                  http.StatusOK,
+		"/v0/management/plugins/kiro/capabilities":                            http.StatusOK,
 	} {
 		request, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodGet, Path: path})
 		responseRaw, err := handleManagement(request)
@@ -253,12 +242,12 @@ func TestRefreshImportedDesktopCredentialUsesKiroAuthService(t *testing.T) {
 	}
 }
 
-func TestUsagePageEscapesContentAndSetsSecurityHeaders(t *testing.T) {
+func TestUsageViewEscapesContentAndCarriesNoScript(t *testing.T) {
 	view := newUsagePageView([]usageAccountView{{
 		Label: `<script>alert("account")</script>`, State: "Active", StateKey: usageStateActive, StateClass: "active",
 		Plan:    `<img src=x onerror=alert(1)>`,
 		Buckets: []usageBucketView{{Name: `Credits <unsafe>`, Used: 1.5, Limit: 10, Remaining: 8.5, Percent: 15}},
-	}}, usagePageOptions{Nonce: "test-nonce"}, "2026-09-05T00:00:00Z")
+	}}, usagePageOptions{}, "2026-09-05T00:00:00Z")
 	page, err := renderUsagePage(view)
 	if err != nil {
 		t.Fatal(err)
@@ -267,20 +256,8 @@ func TestUsagePageEscapesContentAndSetsSecurityHeaders(t *testing.T) {
 	if strings.Contains(html, `<script>alert`) || strings.Contains(html, `<img src=x`) || !strings.Contains(html, `&lt;script&gt;`) || !strings.Contains(html, `Credits &lt;unsafe&gt;`) {
 		t.Fatalf("dynamic content was not escaped: %s", html)
 	}
-	if strings.Contains(strings.ToLower(html), "javascript:") {
-		t.Fatal("rendered page contains JavaScript")
-	}
-	if !strings.Contains(html, `<script nonce="test-nonce">`) || !strings.Contains(html, "script-src 'nonce-test-nonce'") {
-		t.Fatalf("page script is not nonce-bound: %s", html)
-	}
-	headers := usagePageHeaders(view.Options.Nonce)
-	if headers.Get("Cache-Control") != "no-store" || headers.Get("X-Content-Type-Options") != "nosniff" || headers.Get("Referrer-Policy") != "no-referrer" {
-		t.Fatalf("missing security headers: %v", headers)
-	}
-	csp := headers.Get("Content-Security-Policy")
-	if !strings.Contains(csp, "default-src 'none'") || !strings.Contains(csp, "frame-ancestors 'self'") ||
-		!strings.Contains(csp, "script-src 'nonce-test-nonce'") {
-		t.Fatalf("unexpected CSP: %s", csp)
+	if strings.Contains(strings.ToLower(html), "javascript:") || strings.Contains(strings.ToLower(html), "<script") {
+		t.Fatal("rendered fragment contains script")
 	}
 }
 
@@ -697,7 +674,7 @@ func TestRenderUsagePageLocalizesTheSameCachedView(t *testing.T) {
 	for _, lang := range []string{usageLangEN, usageLangVI} {
 		page, err := renderUsagePage(newUsagePageView(
 			[]usageAccountView{account},
-			usagePageOptions{Lang: lang, Nonce: "n"},
+			usagePageOptions{Lang: lang},
 			"2026-09-05T00:00:00Z",
 		))
 		if err != nil {
@@ -721,24 +698,19 @@ func TestRenderUsagePageLocalizesTheSameCachedView(t *testing.T) {
 	}
 }
 
-func TestUsagePageOptionsRejectUnknownThemeAndLanguage(t *testing.T) {
-	if resolveUsageTheme(`"><script>`) != usageThemeDark || resolveUsageTheme("LIGHT") != usageThemeLight {
-		t.Fatal("theme must resolve to a closed set")
-	}
+func TestUsagePageOptionsRejectUnknownLanguage(t *testing.T) {
 	if resolveUsageLang("de") != usageLangEN || resolveUsageLang("VI-vn") != usageLangVI {
 		t.Fatal("language must resolve to a closed set")
 	}
-	page, err := renderUsagePage(newUsagePageView(nil, usagePageOptions{
-		Theme: `dark" onload="alert(1)`, Lang: "ru", Nonce: "n",
-	}, ""))
+	page, err := renderUsagePage(newUsagePageView(nil, usagePageOptions{Lang: `ru" onload="alert(1)`}, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
 	html := string(page)
-	if !strings.Contains(html, `data-theme="dark"`) || strings.Contains(html, "onload") {
-		t.Fatalf("hostile theme reached the document: %s", html)
+	if strings.Contains(html, "onload") {
+		t.Fatalf("hostile language reached the fragment: %s", html)
 	}
-	if !strings.Contains(html, `<html lang="en"`) {
+	if !strings.Contains(html, `<div class="kiro-view" lang="en"`) {
 		t.Fatalf("unknown language was not narrowed to english: %s", html)
 	}
 }
@@ -748,14 +720,14 @@ func TestUsagePageSummaryCountsReportingAndAttention(t *testing.T) {
 		{Label: "a", StateKey: usageStateActive, Buckets: []usageBucketView{{Name: "Credits", Limit: 10}}},
 		{Label: "b", StateKey: usageStateUnavailable, ErrorKey: "err_rejected"},
 		{Label: "c", StateKey: usageStateDisabled},
-	}, usagePageOptions{Nonce: "n"}, "")
+	}, usagePageOptions{}, "")
 	if view.Summary.Accounts != 3 || view.Summary.Reporting != 1 || view.Summary.Attention != 1 {
 		t.Fatalf("unexpected summary: %+v", view.Summary)
 	}
 	if view.Empty {
 		t.Fatal("a populated view must not be empty")
 	}
-	if empty := newUsagePageView(nil, usagePageOptions{Nonce: "n"}, ""); !empty.Empty || empty.Summary.Accounts != 0 {
+	if empty := newUsagePageView(nil, usagePageOptions{}, ""); !empty.Empty || empty.Summary.Accounts != 0 {
 		t.Fatalf("unexpected empty view: %+v", empty)
 	}
 }
@@ -789,7 +761,7 @@ func TestUsagePageShowsPlanTypeCurrencyAndCredentialFacts(t *testing.T) {
 		account.TokenExpiresAt == "" || account.LastRefresh == "" {
 		t.Fatalf("credential facts were not attached: %+v", account)
 	}
-	page, err := renderUsagePage(newUsagePageView([]usageAccountView{account}, usagePageOptions{Nonce: "n"}, ""))
+	page, err := renderUsagePage(newUsagePageView([]usageAccountView{account}, usagePageOptions{}, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -851,29 +823,7 @@ func TestPublicUsageErrorKeyMirrorsPublicUsageError(t *testing.T) {
 	}
 }
 
-func TestAuthenticatedUsageRouteIsRegisteredAndServesTheSamePage(t *testing.T) {
-	raw, err := handleMethod(pluginabi.MethodManagementRegister, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var envelope hostCallEnvelope
-	if err := json.Unmarshal(raw, &envelope); err != nil {
-		t.Fatal(err)
-	}
-	var registration managementRegistrationResponse
-	if err := json.Unmarshal(envelope.Result, &registration); err != nil {
-		t.Fatal(err)
-	}
-	registered := false
-	for _, route := range registration.Routes {
-		if route.Path == "/plugins/kiro/usage" {
-			registered = route.Method == http.MethodGet
-		}
-	}
-	if !registered {
-		t.Fatalf("authenticated usage route was not registered: %+v", registration.Routes)
-	}
-
+func TestUsageViewRouteServesTheFragment(t *testing.T) {
 	originalHostCall := usageHostCall
 	t.Cleanup(func() {
 		usageHostCall = originalHostCall
@@ -886,35 +836,17 @@ func TestAuthenticatedUsageRouteIsRegisteredAndServesTheSamePage(t *testing.T) {
 		}
 		return errorEnvelope("unexpected", method), nil
 	}
-	body, err := json.Marshal(pluginapi.ManagementRequest{
+	page := serveManagement(t, pluginapi.ManagementRequest{
 		Method: http.MethodGet,
-		Path:   "/v0/management/plugins/kiro/usage",
-		Query:  url.Values{"lang": []string{"vi"}, "theme": []string{"light"}},
+		Path:   managementBasePath + usageViewRoute,
+		Query:  url.Values{"lang": []string{"vi"}},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	served, err := handleManagement(body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var response hostCallEnvelope
-	if err := json.Unmarshal(served, &response); err != nil {
-		t.Fatal(err)
-	}
-	var page pluginapi.ManagementResponse
-	if err := json.Unmarshal(response.Result, &page); err != nil {
-		t.Fatal(err)
-	}
-	if page.StatusCode != http.StatusOK || !strings.Contains(page.Headers.Get("Content-Type"), "text/html") {
+	if page.StatusCode != http.StatusOK || !strings.Contains(page.Headers.Get("Content-Type"), "text/html") || page.Headers.Get("Cache-Control") != "no-store" {
 		t.Fatalf("unexpected usage response: %d %v", page.StatusCode, page.Headers)
 	}
 	html := string(page.Body)
-	if !strings.Contains(html, `data-theme="light"`) || !strings.Contains(html, usagePageTextPacks[usageLangVI]["empty"]) {
-		t.Fatalf("panel theme and language were not honoured: %s", html)
-	}
-	if !strings.Contains(page.Headers.Get("Content-Security-Policy"), "script-src 'nonce-") {
-		t.Fatalf("served page lost its nonce CSP: %v", page.Headers)
+	if !strings.Contains(html, `lang="vi"`) || !strings.Contains(html, usagePageTextPacks[usageLangVI]["empty"]) {
+		t.Fatalf("the requested language was not honoured: %s", html)
 	}
 }
 
@@ -1144,7 +1076,7 @@ func TestUsagePageShowsTheAWSIdentityParameters(t *testing.T) {
 		Account: "9f3a1b2c", Directory: "d-90667c527c", AWSAccountID: "123456789012", ProfileName: "KiroProfile-us-east-1",
 		Buckets: []usageBucketView{{Name: "Credits", Used: 1, Limit: 2, Remaining: 1, Percent: 50}},
 	}
-	view := newUsagePageView([]usageAccountView{account}, usagePageOptions{Theme: usageThemeDark, Lang: usageLangVI, Nonce: "n"}, "")
+	view := newUsagePageView([]usageAccountView{account}, usagePageOptions{Lang: usageLangVI}, "")
 	page, err := renderUsagePage(view)
 	if err != nil {
 		t.Fatalf("render: %v", err)
@@ -1165,7 +1097,7 @@ func TestUsagePageShowsTheAWSIdentityParameters(t *testing.T) {
 	// The account row repeated the identity store plus the user key, and the
 	// identity row repeated both. Neither may come back.
 	account.Identity = "kiro-idc-d-90667c527c-9f3a1b2c"
-	repeated, err := renderUsagePage(newUsagePageView([]usageAccountView{account}, usagePageOptions{Theme: usageThemeDark, Lang: usageLangVI, Nonce: "n"}, ""))
+	repeated, err := renderUsagePage(newUsagePageView([]usageAccountView{account}, usagePageOptions{Lang: usageLangVI}, ""))
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
@@ -1182,7 +1114,7 @@ func TestUsagePageShowsTheAWSIdentityParameters(t *testing.T) {
 // provider rather than disappear.
 func TestUsagePageNamesBuilderIDAsItsIdentityStore(t *testing.T) {
 	account := usageAccountView{Label: "d-1 · 2222", StateKey: usageStateActive, StateClass: "active", AuthMethod: "builder-id", Account: "2222"}
-	view := newUsagePageView([]usageAccountView{account}, usagePageOptions{Nonce: "n"}, "")
+	view := newUsagePageView([]usageAccountView{account}, usagePageOptions{}, "")
 	page, err := renderUsagePage(view)
 	if err != nil {
 		t.Fatalf("render: %v", err)
@@ -1538,7 +1470,7 @@ func TestUsagePageRendersOneRowPerAccountWithFleetTotals(t *testing.T) {
 				Currency: "USD", OverageCap: 10000, OverageRate: 0.04, OverageCharges: 1.25,
 			}},
 		},
-	}, usagePageOptions{Lang: usageLangEN, Nonce: "n"}, "2026-09-05T00:00:00Z"))
+	}, usagePageOptions{Lang: usageLangEN}, "2026-09-05T00:00:00Z"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1576,11 +1508,11 @@ func TestUsagePageRendersOneRowPerAccountWithFleetTotals(t *testing.T) {
 	}
 	// Uppercase column heads with letter spacing were the cramped shouting;
 	// vertical centring was the misalignment.
-	if strings.Contains(html, "text-transform:uppercase") || strings.Contains(html, "letter-spacing:.04em") {
-		t.Fatalf("column heads went back to uppercase tracking: %s", html)
+	if strings.Contains(usageShellCSS, "text-transform:uppercase") || strings.Contains(usageShellCSS, "letter-spacing:.04em") {
+		t.Fatal("column heads went back to uppercase tracking")
 	}
-	if !strings.Contains(html, "vertical-align:middle") {
-		t.Fatalf("cells must centre vertically: %s", html)
+	if !strings.Contains(usageShellCSS, "vertical-align:middle") {
+		t.Fatal("cells must centre vertically")
 	}
 }
 
@@ -1598,7 +1530,7 @@ func TestUsagePageShowsEveryAWSUsageFigure(t *testing.T) {
 			FreeTrialUsed: 0.05, FreeTrialLimit: 500, FreeTrialStatus: "EXPIRED", FreeTrialExpiry: "2026-05-13T05:44:10Z",
 		}},
 	}
-	page, err := renderUsagePage(newUsagePageView([]usageAccountView{account}, usagePageOptions{Lang: usageLangEN, Nonce: "n"}, ""))
+	page, err := renderUsagePage(newUsagePageView([]usageAccountView{account}, usagePageOptions{Lang: usageLangEN}, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1637,7 +1569,7 @@ func TestUsagePageOpensDetailByClickingTheRowItself(t *testing.T) {
 		Buckets: []usageBucketView{{Name: "Credits", Used: 1, Limit: 2, Remaining: 1, Percent: 50, Unit: "INVOCATIONS", Currency: "USD"}},
 	}
 	page, err := renderUsagePage(newUsagePageView([]usageAccountView{account, account},
-		usagePageOptions{Lang: usageLangEN, Nonce: "n"}, ""))
+		usagePageOptions{Lang: usageLangEN}, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1674,9 +1606,9 @@ func TestUsagePageOpensDetailByClickingTheRowItself(t *testing.T) {
 			t.Fatalf("collapsed row lost %q: %s", fact, html)
 		}
 	}
-	// Without scripting no row can be clicked, so the details must open themselves.
-	if !strings.Contains(html, "tr.meta[hidden]{display:table-row}") || !strings.Contains(html, "<noscript>") {
-		t.Fatalf("the no-script fallback is missing: %s", html)
+	// Without scripting the shell cannot fetch the table at all, so it says so.
+	if !strings.Contains(string(usageShellPage), "<noscript>") {
+		t.Fatal("the no-script notice is missing")
 	}
 	if strings.Contains(html, "!col_") || strings.Contains(html, "!total_") || strings.Contains(html, "!row_hint") {
 		t.Fatalf("an unresolved new text key reached the page: %s", html)
@@ -1695,7 +1627,7 @@ func TestUsagePageKeepsAnAccountWithNoBucket(t *testing.T) {
 			Label: "quiet@example.com", StateKey: usageStateUnavailable, StateClass: "error",
 			ErrorKey: "err_no_buckets", AuthMethod: "builder-id",
 		},
-	}, usagePageOptions{Lang: usageLangEN, Nonce: "n"}, "")
+	}, usagePageOptions{Lang: usageLangEN}, "")
 	if view.Totals.Accounts != 1 || view.Totals.Limit != 100 {
 		t.Fatalf("a bucketless account must not enter the totals: %+v", view.Totals)
 	}
@@ -1812,7 +1744,7 @@ func TestUsagePageRendersEveryCreditPoolAsItsOwnRow(t *testing.T) {
 			{Kind: usageKindOverageCredit, NameKey: "quota_overage_credit", Limit: 45, Remaining: 45, Grants: 1},
 		},
 	}
-	page, err := renderUsagePage(newUsagePageView([]usageAccountView{account}, usagePageOptions{Lang: usageLangEN, Nonce: "n"}, ""))
+	page, err := renderUsagePage(newUsagePageView([]usageAccountView{account}, usagePageOptions{Lang: usageLangEN}, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1850,7 +1782,7 @@ func TestUsagePageHasNoPrintedCaptionAndAOneLineShareCell(t *testing.T) {
 	page, err := renderUsagePage(newUsagePageView([]usageAccountView{{
 		Label: "first@example.com", StateKey: usageStateActive, StateClass: "active",
 		Buckets: []usageBucketView{{Name: "Credits", Used: 1, Limit: 2, Remaining: 1, Percent: 50}},
-	}}, usagePageOptions{Lang: usageLangEN, Nonce: "n"}, ""))
+	}}, usagePageOptions{Lang: usageLangEN}, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1864,11 +1796,11 @@ func TestUsagePageHasNoPrintedCaptionAndAOneLineShareCell(t *testing.T) {
 	}
 	// The rail and the figure share one flex line; a grid stack is what made the
 	// cell two lines tall.
-	if !strings.Contains(html, ".gauge{display:flex;align-items:center") {
-		t.Fatalf("the share cell must lay the rail beside the figure: %s", html)
+	if !strings.Contains(usageShellCSS, ".gauge{display:flex;align-items:center") {
+		t.Fatal("the share cell must lay the rail beside the figure")
 	}
-	if strings.Contains(html, ".gauge{display:grid") {
-		t.Fatalf("the stacked share cell is back: %s", html)
+	if strings.Contains(usageShellCSS, ".gauge{display:grid") {
+		t.Fatal("the stacked share cell is back")
 	}
 	// The plan type used to be a second line under the plan name; it belongs in
 	// the detail row so every cell in the row is one line.
@@ -1887,7 +1819,7 @@ func TestUsagePageHighlightsTheWholeAccountNotOneRow(t *testing.T) {
 			{Kind: usageKindPlan, Name: "Credits", Used: 0.51, Limit: 50, Remaining: 49.49, Percent: 1, HasShare: true, AmountKnown: true},
 			{Kind: usageKindTrial, NameKey: "quota_trial", Used: 0.05, Limit: 500, Remaining: 499.95, Percent: 0.01, HasShare: true, AmountKnown: true},
 		},
-	}}, usagePageOptions{Lang: usageLangEN, Nonce: "n"}, ""))
+	}}, usagePageOptions{Lang: usageLangEN}, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1898,19 +1830,19 @@ func TestUsagePageHighlightsTheWholeAccountNotOneRow(t *testing.T) {
 		"tbody.account:focus-within>tr.row>td",
 		`tbody.account:has(tr.row[aria-expanded="true"])>tr.row>td`,
 	} {
-		if !strings.Contains(html, selector) {
-			t.Fatalf("group highlight rule %q is missing: %s", selector, html)
+		if !strings.Contains(usageShellCSS, selector) {
+			t.Fatalf("group highlight rule %q is missing", selector)
 		}
 	}
 	// A bare per-row hover would repaint only the row under the pointer, leaving
 	// the spanning cells behind.
-	if strings.Contains(html, "\ntr.row:hover>td{") {
-		t.Fatalf("the per-row hover is back: %s", html)
+	if strings.Contains(usageShellCSS, "\ntr.row:hover>td{") {
+		t.Fatal("the per-row hover is back")
 	}
 	// The stripe must be declared before the highlight, or an even group would
 	// keep its zebra colour while hovered.
-	zebra := strings.Index(html, "tbody.account:nth-of-type(even)>tr.row>td{background:var(--zebra)}")
-	hover := strings.Index(html, "tbody.account:hover>tr.row>td")
+	zebra := strings.Index(usageShellCSS, "tbody.account:nth-of-type(even)>tr.row>td{background:var(--zebra)}")
+	hover := strings.Index(usageShellCSS, "tbody.account:hover>tr.row>td")
 	if zebra < 0 || hover < 0 || zebra > hover {
 		t.Fatalf("the zebra stripe must be declared before the highlight (zebra=%d hover=%d)", zebra, hover)
 	}
