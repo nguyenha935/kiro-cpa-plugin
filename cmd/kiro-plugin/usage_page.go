@@ -1,27 +1,22 @@
 package main
 
 import (
-	cryptorand "crypto/rand"
-	"encoding/base64"
 	"fmt"
 	"html/template"
-	"io"
 	"math"
 	"strings"
 )
 
 // Kiro usage page presentation. Kept apart from the transport in usage.go so
-// the layout, its text packs and its CSP nonce can be exercised on their own.
+// the layout and its text packs can be exercised on their own.
 //
 // Every localized string is resolved at render time, never when an account view
 // is built: views are cached per credential (usageCacheTTL) and a cached view
 // must be renderable in any language the next request asks for.
 
 const (
-	usageThemeDark  = "dark"
-	usageThemeLight = "light"
-	usageLangEN     = "en"
-	usageLangVI     = "vi"
+	usageLangEN = "en"
+	usageLangVI = "vi"
 )
 
 // usagePageText maps a text key to its localized string.
@@ -259,16 +254,9 @@ var usageAuthMethodTextKeys = map[string]string{
 	"imported":     "auth_imported",
 }
 
-// resolveUsageTheme and resolveUsageLang accept only known values: the page is
-// embedded by the management panel, and an unvalidated value would reach the
-// rendered document as an attribute.
-func resolveUsageTheme(value string) string {
-	if strings.EqualFold(strings.TrimSpace(value), usageThemeLight) {
-		return usageThemeLight
-	}
-	return usageThemeDark
-}
-
+// resolveUsageLang accepts only known values: the language comes from the
+// request, and an unvalidated value would reach the rendered fragment as an
+// attribute.
 func resolveUsageLang(value string) string {
 	normalized := strings.ToLower(strings.TrimSpace(value))
 	if normalized == usageLangVI || strings.HasPrefix(normalized, usageLangVI+"-") {
@@ -281,20 +269,8 @@ func usageTexts(lang string) usagePageText {
 	return usagePageTextPacks[resolveUsageLang(lang)]
 }
 
-// newUsageNonce returns a per-response CSP nonce so the page keeps
-// default-src 'none' while still running its own countdown script.
-func newUsageNonce() string {
-	random := make([]byte, 16)
-	if _, err := io.ReadFull(cryptorand.Reader, random); err != nil {
-		panic(fmt.Sprintf("generate Kiro usage nonce: %v", err))
-	}
-	return base64.RawURLEncoding.EncodeToString(random)
-}
-
 type usagePageOptions struct {
-	Theme string
-	Lang  string
-	Nonce string
+	Lang string
 }
 
 type usagePageSummary struct {
@@ -336,16 +312,6 @@ type usagePageView struct {
 	Totals      usagePageTotals
 	Options     usagePageOptions
 	GeneratedAt string
-	// ActionPath is the absolute resource path of the enable/disable action.
-	// Empty hides the toggle, as on a page rendered outside the host.
-	ActionPath string
-}
-
-// usageAccountCell carries one account together with the page it renders on,
-// because the account cell needs the page's options to build its links.
-type usageAccountCell struct {
-	Account usageAccountView
-	View    usagePageView
 }
 
 // newUsageTotals folds every bucket of every account into one row.
@@ -431,11 +397,7 @@ func normalizeUsageBuckets(accounts []usageAccountView) []usageAccountView {
 }
 
 func newUsagePageView(accounts []usageAccountView, options usagePageOptions, generatedAt string) usagePageView {
-	options.Theme = resolveUsageTheme(options.Theme)
 	options.Lang = resolveUsageLang(options.Lang)
-	if strings.TrimSpace(options.Nonce) == "" {
-		options.Nonce = newUsageNonce()
-	}
 	accounts = normalizeUsageBuckets(accounts)
 	summary := usagePageSummary{Accounts: len(accounts)}
 	for _, account := range accounts {
@@ -467,7 +429,7 @@ func renderUsagePage(view usagePageView) ([]byte, error) {
 	document = document.Funcs(usagePageFuncs(text))
 	var page strings.Builder
 	if err := document.Execute(&page, view); err != nil {
-		return nil, fmt.Errorf("render Kiro usage page: %w", err)
+		return nil, fmt.Errorf("render Kiro usage view: %w", err)
 	}
 	return []byte(page.String()), nil
 }
@@ -560,9 +522,6 @@ func usagePageFuncs(text usagePageText) template.FuncMap {
 		// because html/template drops comments written in the template.
 		"emailOff": func() template.HTML { return "<!--email_off-->" },
 		"emailOn":  func() template.HTML { return "<!--/email_off-->" },
-		"cell": func(account usageAccountView, view usagePageView) usageAccountCell {
-			return usageAccountCell{Account: account, View: view}
-		},
 		// bucketName localises the pool rows this code creates and leaves the plan
 		// row named the way AWS named it.
 		"bucketName": func(bucket usageBucketView) string {
