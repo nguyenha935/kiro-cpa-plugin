@@ -20,7 +20,7 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        os: [windows-latest, ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -218,9 +218,75 @@ jobs:
             "kiro-ha_${version}_linux_${GOARCH}.zip.sha256" \
             --repo "$GITHUB_REPOSITORY" --clobber
 
+  # macos-latest is an arm64 runner; clang builds the amd64 library from the
+  # same host with -arch x86_64, so both store archives come from one image.
+  darwin:
+    needs: prepare-release
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            clang_arch: arm64
+          - arch: amd64
+            clang_arch: x86_64
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build package
+        env:
+          GOOS: darwin
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: "1"
+          CC: clang -arch ${{ matrix.clang_arch }}
+          CLANG_ARCH: ${{ matrix.clang_arch }}
+        run: |
+          mkdir -p package
+          version="dev-$(git rev-parse --short=7 HEAD)"
+          if [[ -n "$RELEASE_TAG" ]]; then version="${RELEASE_TAG#v}"; fi
+          go build -trimpath -buildmode=c-shared \
+            -ldflags "-X github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro.clientVersion=2.19.0 -X main.pluginVersion=$version" \
+            -o package/kiro-ha.dylib ./cmd/kiro-plugin
+          # The linker drops an -X that names a missing symbol without an error;
+          # both source defaults are "dev", so the strings prove the stamps.
+          grep -aFq "$version" package/kiro-ha.dylib
+          grep -aFq '2.19.0' package/kiro-ha.dylib
+          nm -gU package/kiro-ha.dylib | grep -Fq 'cliproxy_plugin_init'
+          [[ "$(lipo -archs package/kiro-ha.dylib)" == "$CLANG_ARCH" ]]
+          (cd package && shasum -a 256 kiro-ha.dylib > kiro-ha.dylib.sha256)
+          tar -C package -czf "kiro-ha-darwin-${GOARCH}.tar.gz" kiro-ha.dylib kiro-ha.h kiro-ha.dylib.sha256
+          shasum -a 256 "kiro-ha-darwin-${GOARCH}.tar.gz" > "kiro-ha-darwin-${GOARCH}.tar.gz.sha256"
+          if [[ -n "$RELEASE_TAG" ]]; then
+            store_zip="kiro-ha_${version}_darwin_${GOARCH}.zip"
+            zip -j -q "$store_zip" package/kiro-ha.dylib package/kiro-ha.h package/kiro-ha.dylib.sha256
+            shasum -a 256 "$store_zip" > "$store_zip.sha256"
+          fi
+      - name: Upload release assets
+        if: env.RELEASE_TAG != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          gh release upload "$RELEASE_TAG" \
+            "kiro-ha-darwin-${GOARCH}.tar.gz" \
+            "kiro-ha-darwin-${GOARCH}.tar.gz.sha256" \
+            "kiro-ha_${version}_darwin_${GOARCH}.zip" \
+            "kiro-ha_${version}_darwin_${GOARCH}.zip.sha256" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
   release:
     if: needs.prepare-release.outputs.tag != ''
-    needs: [prepare-release, windows-amd64, linux]
+    needs: [prepare-release, windows-amd64, linux, darwin]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -238,7 +304,7 @@ jobs:
           # trailing newline cannot merge two entries into one unreadable line,
           # and a CRLF file cannot leave a stray return in the asset name.
           awk '{ sub(/\r$/, ""); if (NF) print }' sums/*.sha256 > checksums.txt
-          for target in linux_amd64 linux_arm64 windows_amd64; do
+          for target in darwin_amd64 darwin_arm64 linux_amd64 linux_arm64 windows_amd64; do
             archive="kiro-ha_${version}_${target}.zip"
             grep -q " ${archive}\$" checksums.txt || { echo "checksums.txt is missing $archive" >&2; exit 1; }
           done
