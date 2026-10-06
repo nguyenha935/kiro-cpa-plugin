@@ -57,11 +57,14 @@ plugins:
       priority: 1
 ```
 
-Restart CLIProxyAPI and open the OAuth page in the Vietnamese Management Center fork. Expand the Kiro card and choose an authentication method inline; the result is stored as a standard CPA Authentication File. API keys are deliberately not stored in `config.yaml`.
+Restart CLIProxyAPI and open the OAuth page in the Management Center. Every sign-in method is stored as a standard CPA Authentication File; API keys are deliberately not stored in `config.yaml`.
 
-The standalone plugin does not serve a separate credential-entry page. Its `StartLogin` call creates a short-lived state, while the panel submits the selected Kiro method to the authenticated `POST /v0/management/plugins/kiro/connect` route. This keeps API keys, refresh tokens, and imported JSON inside CPA's authenticated Management API.
+- **Stock Management Center.** Press `Start Kiro Login`, then `Open Link`. The link opens the plugin's sign-in page (`/v0/resource/plugins/kiro-ha/login`) in a new tab. Choose a method there; the Kiro card on the OAuth page finishes on its own. Nothing needs to be pasted into the card's Callback URL field.
+- **Vietnamese Management Center fork.** Expand the Kiro card and choose a method inline.
 
-Builder ID and IAM Identity Center use Kiro CLI's remote device flow, so they also work in containers and on hosts without a browser. The panel displays only the real AWS verification URL and device code inside the expanded Kiro card. The plugin identifies itself as the pinned Kiro CLI version and reports the real operating system and architecture; it does not fabricate a machine identifier or depend on Windows `MachineGuid`.
+Both paths submit the method to the same authenticated `POST /v0/management/plugins/kiro/connect` route, so API keys, refresh tokens and imported JSON only travel through CPA's Management API. The sign-in page is a static shell like the Usage page: it reads the key the Management Center keeps when it signs in with “Remember password” ticked, or asks for it and holds it in memory only. The sign-in state that `StartLogin` issues travels in the URL fragment, which the browser never sends to the server. The page must be served from the same origin as the Management Center, which is the case when CPA serves `management.html` itself.
+
+Builder ID and IAM Identity Center use Kiro CLI's remote device flow, so they also work in containers and on hosts without a browser. The sign-in page or the fork's Kiro card displays only the real AWS verification URL and device code. The plugin identifies itself as the pinned Kiro CLI version and reports the real operating system and architecture; it does not fabricate a machine identifier or depend on Windows `MachineGuid`.
 
 The plugin stores credentials through the CLIProxyAPI authentication mechanism. Do not put passwords, management keys, access tokens, refresh tokens, or client secrets in the configuration or repository.
 
@@ -85,12 +88,14 @@ CLIProxyAPI serves plugin resource routes without the management key, so the pag
 | `GET /v0/management/plugins/kiro/usage/view?lang=&refresh=` | management key | The account table as an HTML fragment. `refresh` names one credential file or `all`. |
 | `POST /v0/management/plugins/kiro/usage/credential` | management key | Body `{"file": "<credential file>", "disabled": true\|false}`; sets only that credential's `disabled` flag. |
 
-The shell reads the key the Management Center keeps when it signs in with “Remember” ticked; otherwise it asks for the key and holds it in memory only. Its Content-Security-Policy admits only its own script by hash and allows network requests to the same origin only, so the injected fragment cannot run code. Results remain in memory for 60 seconds, and a manual reload is limited to one upstream call per account every 10 seconds.
+The Usage and sign-in pages are available in English, Vietnamese and Simplified Chinese, following the Management Center's language.
+
+The shell reads the key the Management Center keeps when it signs in with “Remember password” ticked; otherwise it asks for the key and holds it in memory only. Its Content-Security-Policy admits only its own script by hash and allows network requests to the same origin only, so the injected fragment cannot run code. Results remain in memory for 60 seconds, and a manual reload is limited to one upstream call per account every 10 seconds.
 
 The page never writes quota data and changes nothing but the `disabled` flag of a credential you toggle. If Kiro changes or rejects its private usage endpoint, the affected account displays an error instead of an estimated value.
 
 ## Architecture
 
-This is a standalone Go module built against the public CLIProxyAPI v7 plugin SDK. The repository contains only the Kiro provider: IAM Identity Center authentication, model discovery, request and response translation, execution, and the usage page. It does not embed the CLIProxyAPI server or unrelated providers.
+This is a standalone Go module built against the public CLIProxyAPI v7 plugin SDK. The repository contains only the Kiro provider: IAM Identity Center authentication, model discovery, request and response translation, execution, and the usage and sign-in pages. It does not embed the CLIProxyAPI server or unrelated providers.
 
 The plugin is distributed under the [MIT License](LICENSE).

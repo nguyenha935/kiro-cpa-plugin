@@ -1,10 +1,6 @@
 package main
 
-import (
-	"crypto/sha256"
-	"encoding/base64"
-	"html/template"
-)
+import "html/template"
 
 // usagePageTemplate is parsed once with placeholder helpers; renderUsagePage
 // clones it per response and rebinds the helpers to the requested language.
@@ -14,33 +10,19 @@ var usagePageTemplate = template.Must(
 
 // The usage page is split in two so the resource route serves nothing but
 // static bytes. CPA serves resource routes without the management key, so the
-// shell below holds only the layout and its script; the account data comes
-// from usageViewHTML on the authenticated view route, and enable/disable is a
-// POST to the credential route. The shell's CSP admits exactly its own script
-// by hash, so the fragment it injects can never run one.
+// shell holds only the layout and its script; the account data comes from
+// usageViewHTML on the authenticated view route, and enable/disable is a POST
+// to the credential route. The shell's CSP admits exactly its own script by
+// hash, so the fragment it injects can never run one.
 var (
-	usageShellScriptHash = func() string {
-		sum := sha256.Sum256([]byte(usageShellScript))
-		return "'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) + "'"
-	}()
-	usageShellPolicy = "default-src 'none'; style-src 'unsafe-inline'; script-src " + usageShellScriptHash +
-		"; connect-src 'self'; base-uri 'none'; form-action 'none'"
-	// usageShellCSP adds frame-ancestors, which a meta policy may not carry.
-	usageShellCSP  = usageShellPolicy + "; frame-ancestors 'self'"
-	usageShellPage = []byte(`<!doctype html>
-<html lang="en" data-theme="dark">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="` + usageShellPolicy + `">
-<meta name="referrer" content="no-referrer">
-<title>Kiro Usage</title>
-<style>
-` + usageShellCSS + `</style>
-<script>` + usageShellScript + `</script>
-</head>
-<body>
-<main>
+	usageShell       = newShellPage("Kiro Usage", usageShellCSS, usageShellScript, usageShellBody)
+	usageShellPage   = usageShell.Body
+	usageShellPolicy = usageShell.Policy
+	usageShellCSP    = usageShell.Header
+	usageShellScript = shellScript(usageShellText, usageShellLogic)
+)
+
+const usageShellBody = `<main>
   <section id="kiro-gate" class="page-head gate">
     <h1 data-t="title">Kiro Usage</h1>
     <p id="kiro-state" class="intro" role="status" aria-live="polite"></p>
@@ -54,10 +36,7 @@ var (
   <p id="kiro-flash" class="notice flash" role="alert" hidden></p>
   <div id="kiro-usage" aria-busy="false"></div>
 </main>
-</body>
-</html>
-`)
-)
+`
 
 // The page is a comparison table with a fleet totals strip above it and a totals
 // row below it, so the same figure of every account reads down one column and
@@ -79,39 +58,11 @@ var (
 //   - AWS reported daysUntilReset = 0 on both accounts while nextDateReset was 26
 //     days out, so the reset column counts down from the timestamp and the AWS
 //     field is shown as its own labelled fact instead of as the headline.
-const usageShellCSS = `html[data-theme="dark"]{
-  color-scheme:dark;
-  --page:#141118;--surface:#1c1922;--surface-2:#232029;--text:#f3f0f6;
-  --text-2:#c8c2d2;--muted:#9d96a8;--border:#302b39;--border-2:#3c3646;
-  --accent:#9b7bf7;
-  --ok:#7fd6a9;--ok-bg:#182a22;
-  --warn:#f4c37d;--warn-bg:#2c2418;--warn-line:#5d4a20;
-  --bad:#ffa8bf;--bad-bg:#2c1c24;--bad-line:#60364a;
-  --track:#2a2632;--zebra:#1a1721;--shadow:0 1px 0 rgba(0,0,0,.4),0 18px 46px rgba(0,0,0,.3);
-}
-html[data-theme="light"]{
-  color-scheme:light;
-  --page:#f6f4f9;--surface:#ffffff;--surface-2:#f7f5fa;--text:#1a1720;
-  --text-2:#3f3949;--muted:#6b6478;--border:#e4e0ea;--border-2:#d2ccdb;
-  --accent:#6d47e0;
-  --ok:#136b45;--ok-bg:#eaf7f1;
-  --warn:#8a5804;--warn-bg:#fdf4e6;--warn-line:#efdcb6;
-  --bad:#9c1e3b;--bad-bg:#fdeef2;--bad-line:#f1c4d1;
-  --track:#e9e5f0;--zebra:#fbfafd;--shadow:0 1px 0 rgba(26,23,32,.04),0 14px 34px rgba(26,23,32,.07);
-}
-*{box-sizing:border-box}
-body{
-  margin:0;background:var(--page);color:var(--text);
-  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,Helvetica,Arial,sans-serif;
-  font-size:13px;line-height:1.5;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
-}
-main{width:min(1560px,100%);margin:0 auto;padding:18px 20px 26px}
+const usageShellCSS = `main{width:min(1560px,100%);margin:0 auto;padding:18px 20px 26px}
 /* The panel's floating button cluster sits over this page's top right corner
    (fixed, 24px inset, 36-38px controls). The title row keeps that corner clear
    instead of putting text under it. */
 .page-head{padding-right:clamp(150px,17vw,208px)}
-h1{margin:0;font-size:17px;line-height:1.3;font-weight:600;letter-spacing:-.01em}
-.intro{margin:2px 0 0;color:var(--muted);font-size:12px}
 
 /* Fleet totals: the same figures as the last table row, read before the detail. */
 /* Wrapping flex rather than a grid: a grid left the unfilled end of its last
@@ -174,16 +125,6 @@ tr.row[aria-expanded="true"]>td{background:var(--surface-2)}
 .status-line{color:var(--bad);font-size:12px;overflow-wrap:break-word}
 .actions{display:flex;flex-wrap:wrap;gap:6px;margin:7px 0 0 27px}
 .page-actions{margin:8px 0 0}
-.act{
-  display:inline-flex;align-items:center;min-height:26px;padding:0 10px;
-  border:1px solid var(--border-2);border-radius:999px;background:var(--surface);
-  color:var(--text-2);font-size:12px;font-weight:500;text-decoration:none;white-space:nowrap;
-}
-.act:hover{border-color:var(--accent);color:var(--text)}
-.act:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
-.act.primary{border-color:var(--bad-line);background:var(--bad-bg);color:var(--bad)}
-button.act{font-family:inherit;line-height:1.5;cursor:pointer}
-button.act:disabled{cursor:progress;opacity:.6}
 .chev{flex:none;width:12px;color:var(--muted);font-size:12px;line-height:1;transition:transform .12s ease-out}
 tr.row[aria-expanded="true"] .chev{transform:rotate(90deg);color:var(--accent)}
 /* break-word, not anywhere: a name wraps only when it cannot fit, and never
@@ -233,10 +174,6 @@ tfoot .sub::before{content:"·";margin:0 5px}
 tr.meta>td{padding:0 14px 14px;background:var(--surface-2);border-top:0}
 tr.meta[hidden]{display:none}
 .meta-body{display:grid;gap:11px;padding:11px 0 0;border-top:1px dashed var(--border-2)}
-.notice{
-  margin:0;padding:8px 11px;border:1px solid var(--bad-line);border-radius:8px;
-  background:var(--bad-bg);color:var(--bad);font-size:12px;
-}
 .facts{
   display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,344px),1fr));
   gap:4px 26px;margin:0;
@@ -249,20 +186,6 @@ tr.meta[hidden]{display:none}
   margin:14px 0 0;max-width:620px;padding:16px;border:1px solid var(--border);
   border-radius:10px;background:var(--surface);color:var(--muted);
 }
-/* Shell states: loading, the key prompt and failures, shown before the
-   authenticated fragment arrives or in place of it. */
-.gate[hidden],.flash[hidden],.keyform[hidden]{display:none}
-.keyform{display:grid;gap:6px;max-width:460px;margin:14px 0 0}
-.keyform label{color:var(--text-2);font-size:12px;font-weight:500}
-.keyrow{display:flex;gap:8px}
-.keyrow input{
-  flex:1 1 auto;min-width:0;min-height:30px;padding:0 10px;border:1px solid var(--border-2);border-radius:8px;
-  background:var(--surface);color:var(--text);font:inherit;
-}
-.keyrow input:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
-.keyhint{margin:0;color:var(--muted);font-size:12px}
-.flash{margin:12px 0 0}
-.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 
 /* The eight-column table needs a 1240px viewport (measured 2026-09-25: at
    1180px it overflowed by 60px), and the panel frames this page narrower than
@@ -295,21 +218,13 @@ tr.meta[hidden]{display:none}
 }
 `
 
-// usageShellScript loads the fragment with the panel's management key, asks
-// for the key when the panel did not keep one, and drives the row toggles,
-// countdowns and account actions through event delegation on the fragment.
-const usageShellScript = `
-(function () {
-  'use strict';
-  var TEXT = {
+// usageShellText holds the shell's own strings; the key prompt shares the
+// rest with the sign-in page through shellCommonScript.
+const usageShellText = `  var TEXT = {
     en: {
       title: 'Kiro Usage',
       loading: 'Loading Kiro usage…',
       keyPrompt: 'Enter the CLIProxyAPI management key to view Kiro usage.',
-      keyRejected: 'CLIProxyAPI rejected that management key. Enter it again.',
-      keyLabel: 'Management key',
-      keyHint: 'The key stays in this page and is forgotten when it closes. Sign in to the panel with “Remember” ticked to skip this step.',
-      keySubmit: 'Open',
       loadFailed: 'Kiro usage could not be loaded: {message}',
       actionFailed: 'The credential could not be changed: {message}'
     },
@@ -317,120 +232,23 @@ const usageShellScript = `
       title: 'Hạn mức Kiro',
       loading: 'Đang tải hạn mức Kiro…',
       keyPrompt: 'Nhập management key của CLIProxyAPI để xem hạn mức Kiro.',
-      keyRejected: 'CLIProxyAPI từ chối management key này. Nhập lại.',
-      keyLabel: 'Management key',
-      keyHint: 'Key chỉ nằm trong trang này và mất khi đóng trang. Đăng nhập panel có tích “Ghi nhớ” để bỏ qua bước này.',
-      keySubmit: 'Mở',
       loadFailed: 'Không tải được hạn mức Kiro: {message}',
       actionFailed: 'Không đổi được credential: {message}'
+    },
+    'zh-CN': {
+      title: 'Kiro 用量',
+      loading: '正在加载 Kiro 用量…',
+      keyPrompt: '请输入 CLIProxyAPI 管理密钥以查看 Kiro 用量。',
+      loadFailed: '无法加载 Kiro 用量：{message}',
+      actionFailed: '无法更改凭证：{message}'
     }
   };
-  var STORAGE_KEY = 'cli-proxy-auth';
-  var OBFUSCATED = 'enc::v1::';
-  var SALT = 'cli-proxy-api-webui::secure-storage';
-  var params = new URLSearchParams(window.location.search);
-  var root = document.documentElement;
-  var api = window.location.pathname.split('/v0/resource/')[0] + '/v0/management/plugins/kiro/usage/';
-  var memoryKey = '';
-  var busy = false;
+`
 
-  // The panel embeds this page in a same-origin frame, so its theme and
-  // language are read from its document; a query value wins when present.
-  function panelRoot() {
-    try {
-      if (window.parent && window.parent !== window && window.parent.document) {
-        return window.parent.document.documentElement;
-      }
-    } catch (error) {
-      return null;
-    }
-    return null;
-  }
-
-  function pickTheme() {
-    var asked = params.get('theme');
-    if (asked) {
-      return asked.toLowerCase() === 'light' ? 'light' : 'dark';
-    }
-    var panel = panelRoot();
-    if (panel) {
-      return panel.getAttribute('data-theme') === 'dark' ? 'dark' : 'light';
-    }
-    return window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
-  }
-
-  function pickLang() {
-    var panel = panelRoot();
-    var value = params.get('lang') || (panel && panel.getAttribute('lang')) || navigator.language || 'en';
-    return /^vi(-|$)/i.test(value) ? 'vi' : 'en';
-  }
-
-  var lang = pickLang();
-  function t(key) {
-    return (TEXT[lang] || TEXT.en)[key];
-  }
-  root.setAttribute('data-theme', pickTheme());
-  root.setAttribute('lang', lang);
-
-  // storedKey reads the key the panel keeps when "Remember" is ticked. The
-  // panel obfuscates it with a XOR over its host and user agent; this is the
-  // inverse of src/utils/encryption.ts in the panel, not a secret.
-  function storedKey() {
-    try {
-      var raw = window.localStorage.getItem(STORAGE_KEY);
-      if (!raw) {
-        return '';
-      }
-      var text = raw;
-      if (raw.indexOf(OBFUSCATED) === 0) {
-        var binary = window.atob(raw.slice(OBFUSCATED.length));
-        var salt = new TextEncoder().encode(SALT + '|' + window.location.host + '|' + navigator.userAgent);
-        var bytes = new Uint8Array(binary.length);
-        for (var index = 0; index < binary.length; index += 1) {
-          bytes[index] = binary.charCodeAt(index) ^ salt[index % salt.length];
-        }
-        text = new TextDecoder().decode(bytes);
-      }
-      var parsed = JSON.parse(text);
-      var state = parsed && parsed.state ? parsed.state : parsed;
-      return state && typeof state.managementKey === 'string' ? state.managementKey.trim() : '';
-    } catch (error) {
-      return '';
-    }
-  }
-
-  function currentKey() {
-    return memoryKey || storedKey();
-  }
-
-  function request(path, options) {
-    var key = currentKey();
-    if (!key) {
-      return Promise.reject({ needKey: true });
-    }
-    options.headers = options.headers || {};
-    options.headers.Authorization = 'Bearer ' + key;
-    options.cache = 'no-store';
-    options.credentials = 'omit';
-    return window.fetch(api + path, options).then(function (response) {
-      if (response.status === 401) {
-        memoryKey = '';
-        throw { needKey: true, rejected: true };
-      }
-      if (response.ok) {
-        return response;
-      }
-      return response.text().then(function (body) {
-        var message = body;
-        try {
-          message = JSON.parse(body).error || body;
-        } catch (error) {
-          message = body;
-        }
-        throw { message: String(message || 'HTTP ' + response.status).slice(0, 300) };
-      });
-    });
-  }
+// usageShellLogic loads the fragment with the panel's management key, asks for
+// the key when the panel did not keep one, and drives the row toggles,
+// countdowns and account actions through event delegation on the fragment.
+const usageShellLogic = `  var busy = false;
 
   function start() {
     var gate = document.getElementById('kiro-gate');
@@ -439,14 +257,6 @@ const usageShellScript = `
     var input = document.getElementById('kiro-key');
     var flash = document.getElementById('kiro-flash');
     var host = document.getElementById('kiro-usage');
-
-    function localise() {
-      document.title = t('title');
-      var labelled = document.querySelectorAll('[data-t]');
-      for (var index = 0; index < labelled.length; index += 1) {
-        labelled[index].textContent = t(labelled[index].getAttribute('data-t'));
-      }
-    }
 
     function showGate(message, askKey) {
       host.textContent = '';
@@ -591,7 +401,7 @@ const usageShellScript = `
       if (refresh) {
         query.set('refresh', refresh);
       }
-      request('view?' + query.toString(), { method: 'GET' })
+      request('usage/view?' + query.toString(), { method: 'GET' })
         .then(function (response) {
           return response.text();
         })
@@ -618,7 +428,7 @@ const usageShellScript = `
 
     function setCredential(file, disabled) {
       setBusy(true);
-      request('credential', {
+      request('usage/credential', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ file: file, disabled: disabled })
@@ -708,12 +518,7 @@ const usageShellScript = `
     window.setInterval(tick, 30000);
   }
 
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', start);
-  } else {
-    start();
-  }
-})();
+  whenReady(start);
 `
 
 // usageViewHTML is the authenticated fragment the shell injects. It holds no

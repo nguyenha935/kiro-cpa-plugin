@@ -109,7 +109,13 @@ func TestUsageDataAndActionsAreManagementRoutes(t *testing.T) {
 	if _, ok := routes["/plugins/kiro/usage"]; ok {
 		t.Fatal("the old HTML usage route is still registered")
 	}
-	if len(registration.Resources) != 1 || registration.Resources[0].Path != usageResourcePath {
+	// Two static shells and nothing else: Usage in the plugin menu, and the
+	// sign-in page, which only the OAuth card opens.
+	shells := map[string]string{}
+	for _, resource := range registration.Resources {
+		shells[resource.Path] = resource.Menu
+	}
+	if len(shells) != 2 || shells[usageResourcePath] != "Kiro Usage" || shells[loginResourcePath] != "" {
 		t.Fatalf("resources = %+v", registration.Resources)
 	}
 	for _, path := range []string{

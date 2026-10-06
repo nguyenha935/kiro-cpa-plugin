@@ -307,11 +307,12 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 				{Method: http.MethodGet, Path: usageViewRoute},
 				{Method: http.MethodPost, Path: usageCredentialRoute},
 			},
-			// Resource routes are served without the management key, so the only
-			// one is the static usage shell; its data and its actions go through
-			// the routes above.
+			// Resource routes are served without the management key, so they are
+			// only static shells; their data and actions go through the routes
+			// above.
 			Resources: []pluginapi.ResourceRoute{
 				{Path: usageResourcePath, Menu: "Kiro Usage", Description: "Shows Kiro subscription usage for connected accounts."},
+				{Path: loginResourcePath, Description: "Adds a Kiro account; the OAuth page opens it with a sign-in state."},
 			},
 		})
 	case pluginabi.MethodManagementHandle:
@@ -481,7 +482,7 @@ func handleLoginStart(raw []byte) ([]byte, error) {
 	cleanupLoginFlowsLocked(time.Now().UTC())
 	loginFlows[state] = loginFlow{ExpiresAt: expiresAt}
 	loginFlowsMu.Unlock()
-	return okEnvelope(pluginapi.AuthLoginStartResponse{Provider: providerName, State: state, ExpiresAt: expiresAt})
+	return okEnvelope(pluginapi.AuthLoginStartResponse{Provider: providerName, URL: loginURL(state), State: state, ExpiresAt: expiresAt})
 }
 
 func handleLoginPoll(raw []byte) ([]byte, error) {
@@ -2048,6 +2049,8 @@ func handleManagement(raw []byte) ([]byte, error) {
 		return handleUsageCredential(req)
 	case resourceBasePath + usageResourcePath:
 		return handleUsageShell()
+	case resourceBasePath + loginResourcePath:
+		return handleLoginShell()
 	case managementBasePath + "/plugins/kiro/capabilities":
 		capabilities := modelcapabilities.Snapshot()
 		sort.Slice(capabilities, func(i, j int) bool { return capabilities[i].ModelID < capabilities[j].ModelID })

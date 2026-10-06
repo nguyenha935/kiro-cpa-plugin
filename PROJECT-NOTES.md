@@ -10,8 +10,10 @@ compatible, while owning its CPA integration:
 - Builder ID, IAM Identity Center, API-key, refresh-token, and external_idp
   credentials persist as CPA Authentication Files.
 - The Vietnamese Management Center fork renders all Kiro credential flows
-  inline on CPA's OAuth page. The plugin exposes an authenticated Management
-  API for form submission and does not serve a separate login page.
+  inline on CPA's OAuth page. The stock Management Center has no Kiro form, so
+  `StartLogin` returns a static sign-in page as its URL (since 0.9.8). Both
+  submit to the same authenticated Management API route; the page itself holds
+  no data and carries the sign-in state only in its URL fragment.
 - Executor errors carry CPA-compatible HTTP status and retry metadata.
 - Kiro's account-protection limiter remains independent from CPA scheduler
   cooldown. CPA owns credential selection, round-robin, and failover.
