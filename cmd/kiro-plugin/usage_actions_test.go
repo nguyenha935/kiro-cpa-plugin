@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -35,7 +36,12 @@ func usageFixture(t *testing.T) (*int, map[string]map[string]any) {
 		}
 	}
 	saved := map[string]map[string]any{}
+	// collectUsageAccounts reads the credentials in parallel, so every stub
+	// shares one lock for the map and the counter it writes.
+	var mu sync.Mutex
 	usageHostCall = func(method string, request []byte) ([]byte, error) {
+		mu.Lock()
+		defer mu.Unlock()
 		switch method {
 		case pluginabi.MethodHostAuthList:
 			return okEnvelope(hostAuthListResponse{Files: []pluginapi.HostAuthFileEntry{
@@ -62,7 +68,9 @@ func usageFixture(t *testing.T) (*int, map[string]map[string]any) {
 	calls := 0
 	usageHTTPClient = func() httpDoer {
 		return httpDoerFunc(func(*http.Request) (*http.Response, error) {
+			mu.Lock()
 			calls++
+			mu.Unlock()
 			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(
 				`{"subscriptionInfo":{"subscriptionTitle":"KIRO FREE"},"usageBreakdownList":[{"displayNamePlural":"Credits","currentUsageWithPrecision":1,"usageLimitWithPrecision":50}]}`))}, nil
 		})
