@@ -1,11 +1,62 @@
 package main
 
-import "html/template"
+import (
+	"crypto/sha256"
+	"encoding/base64"
+	"html/template"
+)
 
 // usagePageTemplate is parsed once with placeholder helpers; renderUsagePage
 // clones it per response and rebinds the helpers to the requested language.
 var usagePageTemplate = template.Must(
-	template.New("kiro-usage").Funcs(usagePageFuncs(usagePageTextPacks[usageLangEN])).Parse(usagePageHTML),
+	template.New("kiro-usage").Funcs(usagePageFuncs(usagePageTextPacks[usageLangEN])).Parse(usageViewHTML),
+)
+
+// The usage page is split in two so the resource route serves nothing but
+// static bytes. CPA serves resource routes without the management key, so the
+// shell below holds only the layout and its script; the account data comes
+// from usageViewHTML on the authenticated view route, and enable/disable is a
+// POST to the credential route. The shell's CSP admits exactly its own script
+// by hash, so the fragment it injects can never run one.
+var (
+	usageShellScriptHash = func() string {
+		sum := sha256.Sum256([]byte(usageShellScript))
+		return "'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) + "'"
+	}()
+	usageShellPolicy = "default-src 'none'; style-src 'unsafe-inline'; script-src " + usageShellScriptHash +
+		"; connect-src 'self'; base-uri 'none'; form-action 'none'"
+	// usageShellCSP adds frame-ancestors, which a meta policy may not carry.
+	usageShellCSP  = usageShellPolicy + "; frame-ancestors 'self'"
+	usageShellPage = []byte(`<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="` + usageShellPolicy + `">
+<meta name="referrer" content="no-referrer">
+<title>Kiro Usage</title>
+<style>
+` + usageShellCSS + `</style>
+<script>` + usageShellScript + `</script>
+</head>
+<body>
+<main>
+  <section id="kiro-gate" class="page-head gate">
+    <h1 data-t="title">Kiro Usage</h1>
+    <p id="kiro-state" class="intro" role="status" aria-live="polite"></p>
+    <noscript><p class="intro">This page needs JavaScript.</p></noscript>
+    <form id="kiro-key-form" class="keyform" hidden>
+      <label for="kiro-key" data-t="keyLabel">Management key</label>
+      <span class="keyrow"><input id="kiro-key" type="password" autocomplete="off" spellcheck="false"><button class="act" type="submit" data-t="keySubmit">Open</button></span>
+      <p class="keyhint" data-t="keyHint"></p>
+    </form>
+  </section>
+  <p id="kiro-flash" class="notice flash" role="alert" hidden></p>
+  <div id="kiro-usage" aria-busy="false"></div>
+</main>
+</body>
+</html>
+`)
 )
 
 // The page is a comparison table with a fleet totals strip above it and a totals
@@ -28,15 +79,7 @@ var usagePageTemplate = template.Must(
 //   - AWS reported daysUntilReset = 0 on both accounts while nextDateReset was 26
 //     days out, so the reset column counts down from the timestamp and the AWS
 //     field is shown as its own labelled fact instead of as the headline.
-const usagePageHTML = `<!doctype html>
-<html lang="{{.Options.Lang}}" data-theme="{{.Options.Theme}}">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-{{.Options.Nonce}}'; base-uri 'none'">
-<title>{{text "title"}}</title>
-<style>
-html[data-theme="dark"]{
+const usageShellCSS = `html[data-theme="dark"]{
   color-scheme:dark;
   --page:#141118;--surface:#1c1922;--surface-2:#232029;--text:#f3f0f6;
   --text-2:#c8c2d2;--muted:#9d96a8;--border:#302b39;--border-2:#3c3646;
@@ -139,6 +182,8 @@ tr.row[aria-expanded="true"]>td{background:var(--surface-2)}
 .act:hover{border-color:var(--accent);color:var(--text)}
 .act:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
 .act.primary{border-color:var(--bad-line);background:var(--bad-bg);color:var(--bad)}
+button.act{font-family:inherit;line-height:1.5;cursor:pointer}
+button.act:disabled{cursor:progress;opacity:.6}
 .chev{flex:none;width:12px;color:var(--muted);font-size:12px;line-height:1;transition:transform .12s ease-out}
 tr.row[aria-expanded="true"] .chev{transform:rotate(90deg);color:var(--accent)}
 /* break-word, not anywhere: a name wraps only when it cannot fit, and never
@@ -204,6 +249,19 @@ tr.meta[hidden]{display:none}
   margin:14px 0 0;max-width:620px;padding:16px;border:1px solid var(--border);
   border-radius:10px;background:var(--surface);color:var(--muted);
 }
+/* Shell states: loading, the key prompt and failures, shown before the
+   authenticated fragment arrives or in place of it. */
+.gate[hidden],.flash[hidden],.keyform[hidden]{display:none}
+.keyform{display:grid;gap:6px;max-width:460px;margin:14px 0 0}
+.keyform label{color:var(--text-2);font-size:12px;font-weight:500}
+.keyrow{display:flex;gap:8px}
+.keyrow input{
+  flex:1 1 auto;min-width:0;min-height:30px;padding:0 10px;border:1px solid var(--border-2);border-radius:8px;
+  background:var(--surface);color:var(--text);font:inherit;
+}
+.keyrow input:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.keyhint{margin:0;color:var(--muted);font-size:12px}
+.flash{margin:12px 0 0}
 .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 
 /* The eight-column table needs a 1240px viewport (measured 2026-09-25: at
@@ -235,16 +293,438 @@ tr.meta[hidden]{display:none}
   tr.meta>td{padding:0}
   .fact dt{width:10.5em}
 }
-</style>
-</head>
-<body data-text-in="{{text "countdown_in"}}" data-text-due="{{text "countdown_due"}}">
-<noscript><style>tr.meta[hidden]{display:table-row}.chev{display:none}tr.row{cursor:default}</style></noscript>
+`
+
+// usageShellScript loads the fragment with the panel's management key, asks
+// for the key when the panel did not keep one, and drives the row toggles,
+// countdowns and account actions through event delegation on the fragment.
+const usageShellScript = `
+(function () {
+  'use strict';
+  var TEXT = {
+    en: {
+      title: 'Kiro Usage',
+      loading: 'Loading Kiro usage…',
+      keyPrompt: 'Enter the CLIProxyAPI management key to view Kiro usage.',
+      keyRejected: 'CLIProxyAPI rejected that management key. Enter it again.',
+      keyLabel: 'Management key',
+      keyHint: 'The key stays in this page and is forgotten when it closes. Sign in to the panel with “Remember” ticked to skip this step.',
+      keySubmit: 'Open',
+      loadFailed: 'Kiro usage could not be loaded: {message}',
+      actionFailed: 'The credential could not be changed: {message}'
+    },
+    vi: {
+      title: 'Hạn mức Kiro',
+      loading: 'Đang tải hạn mức Kiro…',
+      keyPrompt: 'Nhập management key của CLIProxyAPI để xem hạn mức Kiro.',
+      keyRejected: 'CLIProxyAPI từ chối management key này. Nhập lại.',
+      keyLabel: 'Management key',
+      keyHint: 'Key chỉ nằm trong trang này và mất khi đóng trang. Đăng nhập panel có tích “Ghi nhớ” để bỏ qua bước này.',
+      keySubmit: 'Mở',
+      loadFailed: 'Không tải được hạn mức Kiro: {message}',
+      actionFailed: 'Không đổi được credential: {message}'
+    }
+  };
+  var STORAGE_KEY = 'cli-proxy-auth';
+  var OBFUSCATED = 'enc::v1::';
+  var SALT = 'cli-proxy-api-webui::secure-storage';
+  var params = new URLSearchParams(window.location.search);
+  var root = document.documentElement;
+  var api = window.location.pathname.split('/v0/resource/')[0] + '/v0/management/plugins/kiro/usage/';
+  var memoryKey = '';
+  var busy = false;
+
+  // The panel embeds this page in a same-origin frame, so its theme and
+  // language are read from its document; a query value wins when present.
+  function panelRoot() {
+    try {
+      if (window.parent && window.parent !== window && window.parent.document) {
+        return window.parent.document.documentElement;
+      }
+    } catch (error) {
+      return null;
+    }
+    return null;
+  }
+
+  function pickTheme() {
+    var asked = params.get('theme');
+    if (asked) {
+      return asked.toLowerCase() === 'light' ? 'light' : 'dark';
+    }
+    var panel = panelRoot();
+    if (panel) {
+      return panel.getAttribute('data-theme') === 'dark' ? 'dark' : 'light';
+    }
+    return window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+  }
+
+  function pickLang() {
+    var panel = panelRoot();
+    var value = params.get('lang') || (panel && panel.getAttribute('lang')) || navigator.language || 'en';
+    return /^vi(-|$)/i.test(value) ? 'vi' : 'en';
+  }
+
+  var lang = pickLang();
+  function t(key) {
+    return (TEXT[lang] || TEXT.en)[key];
+  }
+  root.setAttribute('data-theme', pickTheme());
+  root.setAttribute('lang', lang);
+
+  // storedKey reads the key the panel keeps when "Remember" is ticked. The
+  // panel obfuscates it with a XOR over its host and user agent; this is the
+  // inverse of src/utils/encryption.ts in the panel, not a secret.
+  function storedKey() {
+    try {
+      var raw = window.localStorage.getItem(STORAGE_KEY);
+      if (!raw) {
+        return '';
+      }
+      var text = raw;
+      if (raw.indexOf(OBFUSCATED) === 0) {
+        var binary = window.atob(raw.slice(OBFUSCATED.length));
+        var salt = new TextEncoder().encode(SALT + '|' + window.location.host + '|' + navigator.userAgent);
+        var bytes = new Uint8Array(binary.length);
+        for (var index = 0; index < binary.length; index += 1) {
+          bytes[index] = binary.charCodeAt(index) ^ salt[index % salt.length];
+        }
+        text = new TextDecoder().decode(bytes);
+      }
+      var parsed = JSON.parse(text);
+      var state = parsed && parsed.state ? parsed.state : parsed;
+      return state && typeof state.managementKey === 'string' ? state.managementKey.trim() : '';
+    } catch (error) {
+      return '';
+    }
+  }
+
+  function currentKey() {
+    return memoryKey || storedKey();
+  }
+
+  function request(path, options) {
+    var key = currentKey();
+    if (!key) {
+      return Promise.reject({ needKey: true });
+    }
+    options.headers = options.headers || {};
+    options.headers.Authorization = 'Bearer ' + key;
+    options.cache = 'no-store';
+    options.credentials = 'omit';
+    return window.fetch(api + path, options).then(function (response) {
+      if (response.status === 401) {
+        memoryKey = '';
+        throw { needKey: true, rejected: true };
+      }
+      if (response.ok) {
+        return response;
+      }
+      return response.text().then(function (body) {
+        var message = body;
+        try {
+          message = JSON.parse(body).error || body;
+        } catch (error) {
+          message = body;
+        }
+        throw { message: String(message || 'HTTP ' + response.status).slice(0, 300) };
+      });
+    });
+  }
+
+  function start() {
+    var gate = document.getElementById('kiro-gate');
+    var state = document.getElementById('kiro-state');
+    var form = document.getElementById('kiro-key-form');
+    var input = document.getElementById('kiro-key');
+    var flash = document.getElementById('kiro-flash');
+    var host = document.getElementById('kiro-usage');
+
+    function localise() {
+      document.title = t('title');
+      var labelled = document.querySelectorAll('[data-t]');
+      for (var index = 0; index < labelled.length; index += 1) {
+        labelled[index].textContent = t(labelled[index].getAttribute('data-t'));
+      }
+    }
+
+    function showGate(message, askKey) {
+      host.textContent = '';
+      flash.hidden = true;
+      gate.hidden = false;
+      state.textContent = message;
+      form.hidden = !askKey;
+      if (askKey) {
+        input.focus();
+      }
+    }
+
+    function showFlash(message) {
+      flash.textContent = message;
+      flash.hidden = !message;
+    }
+
+    function failWith(template) {
+      return function (error) {
+        if (error && error.needKey) {
+          showGate(error.rejected ? t('keyRejected') : t('keyPrompt'), true);
+          return;
+        }
+        var message = template.replace('{message}', error && error.message ? error.message : String(error));
+        if (host.firstChild) {
+          showFlash(message);
+        } else {
+          showGate(message, false);
+        }
+      };
+    }
+
+    function setBusy(flag) {
+      busy = flag;
+      host.setAttribute('aria-busy', flag ? 'true' : 'false');
+      var controls = host.querySelectorAll('button[data-refresh], button[data-credential]');
+      for (var index = 0; index < controls.length; index += 1) {
+        controls[index].disabled = flag;
+      }
+    }
+
+    function toggle(row, force) {
+      var id = row.getAttribute('data-target');
+      var detail = document.getElementById(id);
+      if (!detail) {
+        return;
+      }
+      var open = typeof force === 'boolean' ? force : detail.hidden;
+      // An account can own several credit rows; they share one detail, so every
+      // row of that account reports the same state.
+      var rows = host.querySelectorAll('tr.row[data-target="' + id + '"]');
+      for (var index = 0; index < rows.length; index += 1) {
+        rows[index].setAttribute('aria-expanded', open ? 'true' : 'false');
+      }
+      detail.hidden = !open;
+    }
+
+    function openDetails() {
+      var open = [];
+      var details = host.querySelectorAll('tr.meta[id]:not([hidden])');
+      for (var index = 0; index < details.length; index += 1) {
+        open.push(details[index].id);
+      }
+      return open;
+    }
+
+    function formatTimes() {
+      var formatter = null;
+      try {
+        formatter = new Intl.DateTimeFormat(lang, { dateStyle: 'medium', timeStyle: 'short' });
+      } catch (error) {
+        formatter = null;
+      }
+      var stamps = host.querySelectorAll('time[datetime]');
+      for (var index = 0; index < stamps.length; index += 1) {
+        var node = stamps[index];
+        var parsed = new Date(node.getAttribute('datetime'));
+        if (isNaN(parsed.getTime())) {
+          continue;
+        }
+        node.setAttribute('data-ms', String(parsed.getTime()));
+        node.setAttribute('title', parsed.toISOString());
+        node.textContent = formatter ? formatter.format(parsed) : parsed.toLocaleString();
+      }
+    }
+
+    function spell(ms) {
+      var total = Math.floor(ms / 1000);
+      var days = Math.floor(total / 86400);
+      var hours = Math.floor((total % 86400) / 3600);
+      var minutes = Math.floor((total % 3600) / 60);
+      if (days > 0) {
+        return days + 'd ' + hours + 'h';
+      }
+      if (hours > 0) {
+        return hours + 'h ' + minutes + 'm';
+      }
+      return Math.max(minutes, 1) + 'm';
+    }
+
+    function tick() {
+      var view = host.querySelector('.kiro-view');
+      if (!view) {
+        return;
+      }
+      var inPattern = view.getAttribute('data-text-in') || 'in {duration}';
+      var duePattern = view.getAttribute('data-text-due') || 'due now';
+      var now = Date.now();
+      var pending = host.querySelectorAll('time[data-countdown][data-ms]');
+      for (var index = 0; index < pending.length; index += 1) {
+        var node = pending[index];
+        var holder = node.parentNode;
+        if (!holder) {
+          continue;
+        }
+        var badge = holder.querySelector('.countdown');
+        if (!badge) {
+          badge = document.createElement('span');
+          holder.appendChild(badge);
+        }
+        var left = Number(node.getAttribute('data-ms')) - now;
+        if (left <= 0) {
+          badge.textContent = duePattern;
+          badge.className = 'countdown';
+          continue;
+        }
+        badge.textContent = inPattern.replace('{duration}', spell(left));
+        badge.className = left < 3600000 ? 'countdown soon' : 'countdown';
+      }
+    }
+
+    function load(refresh) {
+      if (busy) {
+        return;
+      }
+      var open = openDetails();
+      if (!host.firstChild) {
+        showGate(t('loading'), false);
+      }
+      setBusy(true);
+      var query = new URLSearchParams({ lang: lang });
+      if (refresh) {
+        query.set('refresh', refresh);
+      }
+      request('view?' + query.toString(), { method: 'GET' })
+        .then(function (response) {
+          return response.text();
+        })
+        .then(function (fragment) {
+          // The fragment is rendered by html/template on the authenticated
+          // route; it carries no script, and this page's CSP would not run one.
+          host.innerHTML = fragment;
+          gate.hidden = true;
+          showFlash('');
+          formatTimes();
+          for (var index = 0; index < open.length; index += 1) {
+            var row = host.querySelector('tr.row[data-target="' + open[index] + '"]');
+            if (row) {
+              toggle(row, true);
+            }
+          }
+          tick();
+        })
+        .catch(failWith(t('loadFailed')))
+        .then(function () {
+          setBusy(false);
+        });
+    }
+
+    function setCredential(file, disabled) {
+      setBusy(true);
+      request('credential', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ file: file, disabled: disabled })
+      })
+        .then(function () {
+          setBusy(false);
+          load('');
+        })
+        .catch(function (error) {
+          setBusy(false);
+          failWith(t('actionFailed'))(error);
+        });
+    }
+
+    host.addEventListener('click', function (event) {
+      var target = event.target;
+      if (!target || !target.closest) {
+        return;
+      }
+      var control = target.closest('button[data-refresh], button[data-credential]');
+      if (control) {
+        if (busy) {
+          return;
+        }
+        if (control.hasAttribute('data-refresh')) {
+          load(control.getAttribute('data-refresh'));
+          return;
+        }
+        var question = control.getAttribute('data-confirm');
+        if (question && !window.confirm(question)) {
+          return;
+        }
+        setCredential(control.getAttribute('data-credential'), control.getAttribute('data-disabled') === 'true');
+        return;
+      }
+      if (target.closest('a,button,input,select,textarea')) {
+        return;
+      }
+      var row = target.closest('tr.row[data-target]');
+      if (!row) {
+        return;
+      }
+      // Dragging across the row to select a figure is not a click on the row.
+      var selection = window.getSelection && window.getSelection();
+      if (selection && selection.type === 'Range' && String(selection).length > 0) {
+        return;
+      }
+      toggle(row);
+    });
+
+    host.addEventListener('keydown', function (event) {
+      var row = event.target;
+      if (!row || !row.matches || !row.matches('tr.row[data-target]')) {
+        return;
+      }
+      if (event.key === 'Enter' || event.key === ' ' || event.key === 'Spacebar') {
+        event.preventDefault();
+        toggle(row);
+      }
+    });
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      memoryKey = input.value.trim();
+      input.value = '';
+      if (memoryKey) {
+        load('');
+      }
+    });
+
+    var panel = panelRoot();
+    if (panel && window.MutationObserver) {
+      new MutationObserver(function () {
+        root.setAttribute('data-theme', pickTheme());
+        var next = pickLang();
+        if (next !== lang) {
+          lang = next;
+          root.setAttribute('lang', lang);
+          localise();
+          load('');
+        }
+      }).observe(panel, { attributes: true, attributeFilter: ['data-theme', 'lang'] });
+    }
+
+    localise();
+    load('');
+    window.setInterval(tick, 30000);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', start);
+  } else {
+    start();
+  }
+})();
+`
+
+// usageViewHTML is the authenticated fragment the shell injects. It holds no
+// script and no inline handler; its controls are plain buttons the shell
+// script handles.
+const usageViewHTML = `<div class="kiro-view" lang="{{.Options.Lang}}" data-text-in="{{text "countdown_in"}}" data-text-due="{{text "countdown_due"}}">
 {{emailOff}}
-<main>
   <header class="page-head">
     <h1>{{text "title"}}</h1>
     <p class="intro">{{text "intro"}}</p>
-    {{if not .Empty}}<p class="page-actions"><a class="act" href="?refresh=all&amp;theme={{.Options.Theme}}&amp;lang={{.Options.Lang}}">{{text "action_refresh_all"}}</a></p>{{end}}
+    {{if not .Empty}}<p class="page-actions"><button type="button" class="act" data-refresh="all">{{text "action_refresh_all"}}</button></p>{{end}}
   </header>
   {{if .Empty}}<div class="empty" role="status">{{text "empty"}}</div>{{else}}
   {{$totals := .Totals}}
@@ -310,7 +790,7 @@ tr.meta[hidden]{display:none}
         <tr class="row" tabindex="0" role="button" aria-expanded="false" aria-controls="{{$metaID}}" data-target="{{$metaID}}">
           {{if eq $row 0}}
           <td class="account" rowspan="{{$rows}}" data-label="{{text "col_account"}}">
-            {{template "account-cell" (cell $account $)}}
+            {{template "account-cell" $account}}
           </td>
           <td rowspan="{{$rows}}" data-label="{{text "col_plan"}}"><span class="plan">{{if $account.Plan}}{{$account.Plan}}{{else}}{{text "plan_unknown"}}{{end}}</span></td>
           {{end}}
@@ -343,7 +823,7 @@ tr.meta[hidden]{display:none}
         {{if eq (len $account.Buckets) 0}}
         <tr class="row" tabindex="0" role="button" aria-expanded="false" aria-controls="{{$metaID}}" data-target="{{$metaID}}">
           <td class="account" data-label="{{text "col_account"}}">
-            {{template "account-cell" (cell $account $)}}
+            {{template "account-cell" $account}}
           </td>
           <td data-label="{{text "col_plan"}}"><span class="plan">{{if $account.Plan}}{{$account.Plan}}{{else}}{{text "plan_unknown"}}{{end}}</span></td>
           <td data-label="{{text "col_quota"}}"><span class="none">&mdash;</span></td>
@@ -422,126 +902,9 @@ tr.meta[hidden]{display:none}
       {{end}}
     </table>
   </div>{{end}}
-</main>
 {{emailOn}}
-<script nonce="{{.Options.Nonce}}">
-(function () {
-  var root = document.documentElement;
-  var lang = root.getAttribute('lang') || 'en';
-  var inPattern = document.body.getAttribute('data-text-in') || 'in {duration}';
-  var duePattern = document.body.getAttribute('data-text-due') || 'due now';
-  var formatter = null;
-  try {
-    formatter = new Intl.DateTimeFormat(lang, { dateStyle: 'medium', timeStyle: 'short' });
-  } catch (error) {
-    formatter = null;
-  }
-  var stamps = document.querySelectorAll('time[datetime]');
-  for (var index = 0; index < stamps.length; index += 1) {
-    var node = stamps[index];
-    var parsed = new Date(node.getAttribute('datetime'));
-    if (isNaN(parsed.getTime())) {
-      continue;
-    }
-    node.setAttribute('data-ms', String(parsed.getTime()));
-    node.setAttribute('title', parsed.toISOString());
-    node.textContent = formatter ? formatter.format(parsed) : parsed.toLocaleString();
-  }
-  // The row itself is the control: there is no separate button to hunt for. It
-  // keeps role=button and tabindex so a keyboard reaches it the way a pointer does.
-  var rows = document.querySelectorAll('tr.row[data-target]');
-  for (var r = 0; r < rows.length; r += 1) {
-    (function (row) {
-      var detail = document.getElementById(row.getAttribute('data-target'));
-      if (!detail) {
-        row.removeAttribute('role');
-        row.removeAttribute('tabindex');
-        row.removeAttribute('aria-expanded');
-        row.style.cursor = 'default';
-        return;
-      }
-      // An account can own several credit rows. Clicking any of them opens the one
-      // detail they share, so every row of that account reports the same state.
-      var siblings = document.querySelectorAll('tr.row[data-target="' + row.getAttribute('data-target') + '"]');
-      function flip() {
-        var open = row.getAttribute('aria-expanded') === 'true';
-        for (var s = 0; s < siblings.length; s += 1) {
-          siblings[s].setAttribute('aria-expanded', open ? 'false' : 'true');
-        }
-        detail.hidden = open;
-      }
-      row.addEventListener('click', function (event) {
-        // Dragging across the row to select a figure is not a click on the row.
-        var selection = window.getSelection && window.getSelection();
-        if (selection && selection.type === 'Range' && String(selection).length > 0) {
-          return;
-        }
-        if (event.target && event.target.closest && event.target.closest('a,button,input,select,textarea')) {
-          return;
-        }
-        flip();
-      });
-      row.addEventListener('keydown', function (event) {
-        if (event.key === 'Enter' || event.key === ' ' || event.key === 'Spacebar') {
-          event.preventDefault();
-          flip();
-        }
-      });
-    })(rows[r]);
-  }
-  function spell(ms) {
-    var total = Math.floor(ms / 1000);
-    var days = Math.floor(total / 86400);
-    var hours = Math.floor((total % 86400) / 3600);
-    var minutes = Math.floor((total % 3600) / 60);
-    if (days > 0) {
-      return days + 'd ' + hours + 'h';
-    }
-    if (hours > 0) {
-      return hours + 'h ' + minutes + 'm';
-    }
-    return Math.max(minutes, 1) + 'm';
-  }
-  function tick() {
-    var now = Date.now();
-    var pending = document.querySelectorAll('time[data-countdown][data-ms]');
-    for (var index = 0; index < pending.length; index += 1) {
-      var node = pending[index];
-      var holder = node.parentNode;
-      if (!holder) {
-        continue;
-      }
-      var badge = holder.querySelector('.countdown');
-      if (!badge) {
-        badge = document.createElement('span');
-        badge.className = 'countdown';
-        holder.appendChild(badge);
-      }
-      var left = Number(node.getAttribute('data-ms')) - now;
-      if (left <= 0) {
-        badge.textContent = duePattern;
-        badge.className = 'countdown';
-        continue;
-      }
-      badge.textContent = inPattern.replace('{duration}', spell(left));
-      badge.className = left < 3600000 ? 'countdown soon' : 'countdown';
-    }
-  }
-  var confirmLinks = document.querySelectorAll('a[data-confirm]');
-  for (var c = 0; c < confirmLinks.length; c += 1) {
-    confirmLinks[c].addEventListener('click', function (event) {
-      if (!window.confirm(this.getAttribute('data-confirm'))) {
-        event.preventDefault();
-      }
-    });
-  }
-  tick();
-  setInterval(tick, 30000);
-})();
-</script>
-</body>
-</html>
-{{define "account-cell"}}{{$account := .Account}}{{$view := .View}}
+</div>
+{{define "account-cell"}}{{$account := .}}
 <span class="name">
   <span class="chev" aria-hidden="true">&#9656;</span>
   <span class="dot {{$account.StateClass}}" aria-hidden="true"></span>
@@ -554,7 +917,7 @@ tr.meta[hidden]{display:none}
 </span>
 {{if $account.FileName}}<span class="actions">
   {{if needsAttention $account}}<a class="act primary" href="/management.html#/oauth" target="_top">{{text "action_relogin"}}</a>{{end}}
-  {{if ne $account.StateKey "disabled"}}<a class="act" href="?refresh={{$account.FileName}}&amp;theme={{$view.Options.Theme}}&amp;lang={{$view.Options.Lang}}">{{text "action_refresh"}}</a>{{end}}
-  {{if $view.ActionPath}}{{if eq $account.StateKey "disabled"}}<a class="act" href="{{$view.ActionPath}}?op=enable&amp;file={{$account.FileName}}&amp;theme={{$view.Options.Theme}}&amp;lang={{$view.Options.Lang}}">{{text "action_enable"}}</a>{{else}}<a class="act" data-confirm="{{text "confirm_disable"}}" href="{{$view.ActionPath}}?op=disable&amp;file={{$account.FileName}}&amp;theme={{$view.Options.Theme}}&amp;lang={{$view.Options.Lang}}">{{text "action_disable"}}</a>{{end}}{{end}}
+  {{if ne $account.StateKey "disabled"}}<button type="button" class="act" data-refresh="{{$account.FileName}}">{{text "action_refresh"}}</button>{{end}}
+  {{if eq $account.StateKey "disabled"}}<button type="button" class="act" data-credential="{{$account.FileName}}" data-disabled="false">{{text "action_enable"}}</button>{{else}}<button type="button" class="act" data-credential="{{$account.FileName}}" data-disabled="true" data-confirm="{{text "confirm_disable"}}">{{text "action_disable"}}</button>{{end}}
 </span>{{end}}
 {{end}}`
