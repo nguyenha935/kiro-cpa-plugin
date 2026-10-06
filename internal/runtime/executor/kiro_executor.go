@@ -14,9 +14,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -339,8 +336,7 @@ func kiroEndpointFor(auth *cliproxyauth.Auth) (kiroEndpointConfig, error) {
 
 // KiroExecutor handles requests to AWS CodeWhisperer (Kiro) API.
 type KiroExecutor struct {
-	cfg          *config.Config
-	refreshLocks sync.Map // one mutex per credential; unrelated accounts refresh concurrently
+	cfg *config.Config
 }
 
 // applyKiroRetryHeaders records which attempt this actually is.
@@ -670,6 +666,21 @@ func isSuspendedBody(body string) bool {
 	return strings.Contains(body, "SUSPENDED")
 }
 
+var errAccessTokenExpired = statusErr{code: http.StatusUnauthorized, msg: "kiro: access token expired"}
+
+// forbiddenStatus maps a non-suspension OAuth 403. Kiro reports an expired or
+// revoked bearer token as 403; CPA only renews credentials after a 401
+// (tryRefreshAfterUnauthorized), so a token-related 403 is returned as 401 and
+// every other 403 is passed through unchanged.
+func forbiddenStatus(body string) int {
+	for _, marker := range []string{"token", "expired", "invalid", "unauthorized"} {
+		if strings.Contains(body, marker) {
+			return http.StatusUnauthorized
+		}
+	}
+	return http.StatusForbidden
+}
+
 // sleepWithContext waits for a retry delay but gives up as soon as the caller
 // does, so a disconnected client never holds a credential's slot.
 func sleepWithContext(ctx context.Context, delay time.Duration) error {
@@ -709,7 +720,8 @@ func retryAfterHeader(header http.Header) *time.Duration {
 }
 
 // Execute sends the request to Kiro API and returns the response.
-// Supports automatic token refresh on 401/403 errors.
+// A missing, expired or rejected token is returned as 401: CPA owns renewal,
+// refreshes through auth.refresh and retries with the stored result.
 func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	accessToken, profileArn := kiroRuntimeCredentials(auth)
 	if accessToken == "" {
@@ -721,33 +733,8 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		return resp, err
 	}
 
-	// Check if token is expired before making the request.
 	if e.isTokenExpired(accessToken) {
-		log.Infof("kiro: access token expired, attempting recovery")
-
-		// 方案 B: 先尝试从文件重新加载 token（后台刷新器可能已更新文件）
-		reloadedAuth, reloadErr := e.reloadAuthFromFile(auth)
-		if reloadErr == nil && reloadedAuth != nil {
-			// 文件中有更新的 token，使用它
-			auth = reloadedAuth
-			accessToken, profileArn = kiroRuntimeCredentials(auth)
-			log.Infof("kiro: recovered token from file (background refresh), expires_at: %v", auth.Metadata["expires_at"])
-		} else {
-			// 文件中的 token 也过期了，执行主动刷新
-			log.Debugf("kiro: file reload failed (%v), attempting active refresh", reloadErr)
-			refreshedAuth, refreshErr := e.Refresh(ctx, auth)
-			if refreshErr != nil {
-				log.Warnf("kiro: pre-request token refresh failed: %v", refreshErr)
-			} else if refreshedAuth != nil {
-				auth = refreshedAuth
-				// Persist the refreshed auth to file so subsequent requests use it
-				if persistErr := e.persistRefreshedAuth(auth); persistErr != nil {
-					log.Warnf("kiro: failed to persist refreshed auth: %v", persistErr)
-				}
-				accessToken, profileArn = kiroRuntimeCredentials(auth)
-				log.Infof("kiro: token refreshed successfully before request")
-			}
-		}
+		return resp, errAccessTokenExpired
 	}
 
 	from := opts.SourceFormat
@@ -774,7 +761,7 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 // the plugin's protection state.
 func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, accessToken, profileArn string, body []byte, from, to sdktranslator.Format, kiroModelID, tokenKey string) (cliproxyexecutor.Response, error) {
 	var resp cliproxyexecutor.Response
-	maxRetries := 2 // Allow retries for token refresh
+	maxRetries := 2
 	endpoint, err := kiroEndpointFor(auth)
 	if err != nil {
 		return resp, err
@@ -899,43 +886,12 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 			return resp, statusErr{code: http.StatusBadRequest, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 		}
 
-		// Handle 401 errors with token refresh and retry
-		// 401 = Unauthorized (token expired/invalid) - refresh token
 		if httpResp.StatusCode == 401 {
 			respBody := readUpstreamErrorBody(httpResp.Body)
 			_ = httpResp.Body.Close()
 			appendAPIResponseChunk(ctx, e.cfg, respBody)
-			if isAPIKeyAuth(auth) {
-				log.Warnf("kiro: API key rejected with HTTP 401; returning without OAuth refresh")
-				return resp, statusErr{code: http.StatusUnauthorized, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
-			}
-
-			log.Warnf("kiro: received 401 error, attempting token refresh")
-			refreshedAuth, refreshErr := e.Refresh(ctx, auth)
-			if refreshErr != nil {
-				log.Errorf("kiro: token refresh failed: %v", refreshErr)
-				return resp, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
-			}
-
-			if refreshedAuth != nil {
-				auth = refreshedAuth
-				// Persist the refreshed auth to file so subsequent requests use it
-				if persistErr := e.persistRefreshedAuth(auth); persistErr != nil {
-					log.Warnf("kiro: failed to persist refreshed auth: %v", persistErr)
-					// Continue anyway - the token is valid for this request
-				}
-				accessToken, profileArn = kiroRuntimeCredentials(auth)
-				// Rebuild payload with new profile ARN if changed
-				kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, endpoint.Origin, from, opts.Metadata)
-				if attempt < maxRetries {
-					log.Infof("kiro: token refreshed successfully, retrying request (attempt %d/%d)", attempt+1, maxRetries+1)
-					continue
-				}
-				log.Infof("kiro: token refreshed successfully, no retries remaining")
-			}
-
 			log.Warnf("kiro request error, status: 401, body: %s", summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
-			return resp, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
+			return resp, statusErr{code: http.StatusUnauthorized, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 		}
 
 		// Handle 402 errors - Monthly Limit Reached. CPA needs a 429 to
@@ -976,37 +932,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				return resp, statusErr{code: http.StatusForbidden, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 			}
 
-			// Check if this looks like a token-related 403 (some APIs return 403 for expired tokens)
-			isTokenRelated := strings.Contains(respBodyStr, "token") ||
-				strings.Contains(respBodyStr, "expired") ||
-				strings.Contains(respBodyStr, "invalid") ||
-				strings.Contains(respBodyStr, "unauthorized")
-
-			if isTokenRelated && attempt < maxRetries {
-				log.Warnf("kiro: 403 appears token-related, attempting token refresh")
-				refreshedAuth, refreshErr := e.Refresh(ctx, auth)
-				if refreshErr != nil {
-					log.Errorf("kiro: token refresh failed: %v", refreshErr)
-					// Token refresh failed - return error immediately
-					return resp, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
-				}
-				if refreshedAuth != nil {
-					auth = refreshedAuth
-					// Persist the refreshed auth to file so subsequent requests use it
-					if persistErr := e.persistRefreshedAuth(auth); persistErr != nil {
-						log.Warnf("kiro: failed to persist refreshed auth: %v", persistErr)
-						// Continue anyway - the token is valid for this request
-					}
-					accessToken, profileArn = kiroRuntimeCredentials(auth)
-					kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, endpoint.Origin, from, opts.Metadata)
-					log.Infof("kiro: token refreshed for 403, retrying request")
-					continue
-				}
-			}
-
-			// For non-token 403 or after max retries, return error immediately
-			log.Warnf("kiro: 403 error, returning immediately")
-			return resp, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
+			return resp, statusErr{code: forbiddenStatus(respBodyStr), msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 		}
 
 		if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
@@ -1026,18 +952,14 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 			}
 		}()
 
-		content, reasoning, toolUses, usageInfo, stopReason, err := e.parseEventStream(httpResp.Body)
+		content, reasoning, toolUses, usageInfo, contextPercentage, stopReason, err := e.parseEventStream(httpResp.Body)
 		if err != nil {
 			recordAPIResponseError(ctx, e.cfg, err)
 			return resp, normalizeTransportError(err)
 		}
 
 		appendAPIResponseChunk(ctx, e.cfg, []byte(content))
-		requestPayload := opts.OriginalRequest
-		if len(bytes.TrimSpace(requestPayload)) == 0 {
-			requestPayload = req.Payload
-		}
-		usageInfo = completeKiroUsage(usageInfo, requestPayload, content, reasoning, toolUses)
+		usageInfo = completeKiroUsage(usageInfo, contextPercentage, kiroContextWindow(auth, kiroModelID), content, reasoning, toolUses)
 
 		// Build response in Claude format for Kiro translator
 		// stopReason is extracted from upstream response by parseEventStream
@@ -1054,7 +976,8 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 }
 
 // ExecuteStream handles streaming requests to Kiro API.
-// Supports automatic token refresh on 401/403 errors.
+// A missing, expired or rejected token is returned as 401: CPA owns renewal,
+// refreshes through auth.refresh and retries with the stored result.
 func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	accessToken, profileArn := kiroRuntimeCredentials(auth)
 	if accessToken == "" {
@@ -1066,33 +989,8 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		return nil, err
 	}
 
-	// Check if token is expired before making the request.
 	if e.isTokenExpired(accessToken) {
-		log.Infof("kiro: access token expired, attempting recovery before stream request")
-
-		// 方案 B: 先尝试从文件重新加载 token（后台刷新器可能已更新文件）
-		reloadedAuth, reloadErr := e.reloadAuthFromFile(auth)
-		if reloadErr == nil && reloadedAuth != nil {
-			// 文件中有更新的 token，使用它
-			auth = reloadedAuth
-			accessToken, profileArn = kiroRuntimeCredentials(auth)
-			log.Infof("kiro: recovered token from file (background refresh) for stream, expires_at: %v", auth.Metadata["expires_at"])
-		} else {
-			// 文件中的 token 也过期了，执行主动刷新
-			log.Debugf("kiro: file reload failed (%v), attempting active refresh for stream", reloadErr)
-			refreshedAuth, refreshErr := e.Refresh(ctx, auth)
-			if refreshErr != nil {
-				log.Warnf("kiro: pre-request token refresh failed: %v", refreshErr)
-			} else if refreshedAuth != nil {
-				auth = refreshedAuth
-				// Persist the refreshed auth to file so subsequent requests use it
-				if persistErr := e.persistRefreshedAuth(auth); persistErr != nil {
-					log.Warnf("kiro: failed to persist refreshed auth: %v", persistErr)
-				}
-				accessToken, profileArn = kiroRuntimeCredentials(auth)
-				log.Infof("kiro: token refreshed successfully before stream request")
-			}
-		}
+		return nil, errAccessTokenExpired
 	}
 
 	from := opts.SourceFormat
@@ -1122,7 +1020,7 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 // endpoint resolution, retry and protection rules, but a 2xx hands the body to
 // a goroutine that feeds the returned channel.
 func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, accessToken, profileArn string, body []byte, from sdktranslator.Format, kiroModelID, tokenKey string) (<-chan cliproxyexecutor.StreamChunk, error) {
-	maxRetries := 2 // Allow retries for token refresh
+	maxRetries := 2
 	endpoint, err := kiroEndpointFor(auth)
 	if err != nil {
 		return nil, err
@@ -1239,43 +1137,12 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 			return nil, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 		}
 
-		// Handle 401 errors with token refresh and retry
-		// 401 = Unauthorized (token expired/invalid) - refresh token
 		if httpResp.StatusCode == 401 {
 			respBody := readUpstreamErrorBody(httpResp.Body)
 			_ = httpResp.Body.Close()
 			appendAPIResponseChunk(ctx, e.cfg, respBody)
-			if isAPIKeyAuth(auth) {
-				log.Warnf("kiro: stream API key rejected with HTTP 401; returning without OAuth refresh")
-				return nil, statusErr{code: http.StatusUnauthorized, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
-			}
-
-			log.Warnf("kiro: stream received 401 error, attempting token refresh")
-			refreshedAuth, refreshErr := e.Refresh(ctx, auth)
-			if refreshErr != nil {
-				log.Errorf("kiro: token refresh failed: %v", refreshErr)
-				return nil, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
-			}
-
-			if refreshedAuth != nil {
-				auth = refreshedAuth
-				// Persist the refreshed auth to file so subsequent requests use it
-				if persistErr := e.persistRefreshedAuth(auth); persistErr != nil {
-					log.Warnf("kiro: failed to persist refreshed auth: %v", persistErr)
-					// Continue anyway - the token is valid for this request
-				}
-				accessToken, profileArn = kiroRuntimeCredentials(auth)
-				// Rebuild payload with new profile ARN if changed
-				kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, endpoint.Origin, from, opts.Metadata)
-				if attempt < maxRetries {
-					log.Infof("kiro: token refreshed successfully, retrying stream request (attempt %d/%d)", attempt+1, maxRetries+1)
-					continue
-				}
-				log.Infof("kiro: token refreshed successfully, no retries remaining")
-			}
-
 			log.Warnf("kiro stream error, status: 401, body: %s", summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
-			return nil, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
+			return nil, statusErr{code: http.StatusUnauthorized, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 		}
 
 		// Handle 402 errors - Monthly Limit Reached.
@@ -1314,37 +1181,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 				return nil, statusErr{code: http.StatusForbidden, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 			}
 
-			// Check if this looks like a token-related 403 (some APIs return 403 for expired tokens)
-			isTokenRelated := strings.Contains(respBodyStr, "token") ||
-				strings.Contains(respBodyStr, "expired") ||
-				strings.Contains(respBodyStr, "invalid") ||
-				strings.Contains(respBodyStr, "unauthorized")
-
-			if isTokenRelated && attempt < maxRetries {
-				log.Warnf("kiro: 403 appears token-related, attempting token refresh")
-				refreshedAuth, refreshErr := e.Refresh(ctx, auth)
-				if refreshErr != nil {
-					log.Errorf("kiro: token refresh failed: %v", refreshErr)
-					// Token refresh failed - return error immediately
-					return nil, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
-				}
-				if refreshedAuth != nil {
-					auth = refreshedAuth
-					// Persist the refreshed auth to file so subsequent requests use it
-					if persistErr := e.persistRefreshedAuth(auth); persistErr != nil {
-						log.Warnf("kiro: failed to persist refreshed auth: %v", persistErr)
-						// Continue anyway - the token is valid for this request
-					}
-					accessToken, profileArn = kiroRuntimeCredentials(auth)
-					kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, endpoint.Origin, from, opts.Metadata)
-					log.Infof("kiro: token refreshed for 403, retrying stream request")
-					continue
-				}
-			}
-
-			// For non-token 403 or after max retries, return error immediately
-			log.Warnf("kiro: 403 error, returning immediately")
-			return nil, statusErr{code: httpResp.StatusCode, msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
+			return nil, statusErr{code: forbiddenStatus(respBodyStr), msg: summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody)}
 		}
 
 		if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
@@ -1378,7 +1215,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 			if len(bytes.TrimSpace(requestPayload)) == 0 {
 				requestPayload = req.Payload
 			}
-			if e.streamToChannel(ctx, resp.Body, out, from, payloadRequestedModel(opts, req.Model), requestPayload, body) {
+			if e.streamToChannel(withStreamTraceLabel(ctx, authID), resp.Body, out, from, payloadRequestedModel(opts, req.Model), requestPayload, body, kiroContextWindow(auth, kiroModelID)) {
 				log.Debugf("kiro: stream completed successfully for token %s", tokenKey)
 			}
 		}(httpResp)
@@ -1489,8 +1326,9 @@ func (e *EventStreamError) Error() string {
 
 // eventStreamMessage represents a parsed AWS Event Stream message
 type eventStreamMessage struct {
-	EventType string // Event type from headers (e.g., "assistantResponseEvent")
-	Payload   []byte // JSON payload of the message
+	EventType string            // Event type from headers (e.g., "assistantResponseEvent")
+	Headers   map[string]string // Every string-valued header, e.g. :message-type, :exception-type
+	Payload   []byte            // JSON payload of the message
 }
 
 // NOTE: Request building functions moved to internal/translator/kiro/claude/kiro_claude_request.go
@@ -1500,8 +1338,8 @@ type eventStreamMessage struct {
 // Extracts text content, signed or redacted reasoning, tool uses, and
 // stop_reason from the response.
 // Buffers official toolUseEvent fragments without altering their input.
-// Returns: content, reasoning, toolUses, usageInfo, stopReason, error
-func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.KiroReasoningContent, []kiroclaude.KiroToolUse, usage.Detail, string, error) {
+// Returns: content, reasoning, toolUses, usageInfo, contextUsagePercentage, stopReason, error
+func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.KiroReasoningContent, []kiroclaude.KiroToolUse, usage.Detail, float64, string, error) {
 	var content strings.Builder
 	var reasoningText strings.Builder
 	var reasoningSignature string
@@ -1522,7 +1360,7 @@ func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.Kir
 		msg, eventErr := e.readEventStreamMessage(reader)
 		if eventErr != nil {
 			log.Errorf("kiro: parseEventStream error: %v", eventErr)
-			return content.String(), nil, toolUses, usageInfo, stopReason, eventErr
+			return content.String(), nil, toolUses, usageInfo, 0, stopReason, eventErr
 		}
 		if msg == nil {
 			// Normal end of stream (EOF)
@@ -1550,7 +1388,7 @@ func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.Kir
 				errMsg = msg
 			}
 			log.Errorf("kiro: received AWS error in event stream: type=%s, message=%s", errType, errMsg)
-			return "", nil, nil, usageInfo, stopReason, streamStatusError(errType, errMsg)
+			return "", nil, nil, usageInfo, 0, stopReason, streamStatusError(errType, errMsg)
 		}
 		if errType, hasErrType := event["type"].(string); hasErrType && (errType == "error" || errType == "exception") {
 			// Generic error event
@@ -1563,7 +1401,7 @@ func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.Kir
 				}
 			}
 			log.Errorf("kiro: received error event in stream: type=%s, message=%s", errType, errMsg)
-			return "", nil, nil, usageInfo, stopReason, streamStatusError(errType, errMsg)
+			return "", nil, nil, usageInfo, 0, stopReason, streamStatusError(errType, errMsg)
 		}
 
 		// Extract stop_reason from various event formats
@@ -1605,7 +1443,7 @@ func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.Kir
 							toolUseID := kirocommon.GetStringValue(tu, "toolUseId")
 							duplicate, err := kiroclaude.ClaimToolUseID(processedIDs, toolUseID)
 							if err != nil {
-								return "", nil, nil, usageInfo, stopReason, err
+								return "", nil, nil, usageInfo, 0, stopReason, err
 							}
 							if duplicate {
 								log.Debugf("kiro: skipping duplicate tool use from assistantResponse: %s", toolUseID)
@@ -1635,7 +1473,7 @@ func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.Kir
 						toolUseID := kirocommon.GetStringValue(tu, "toolUseId")
 						duplicate, err := kiroclaude.ClaimToolUseID(processedIDs, toolUseID)
 						if err != nil {
-							return "", nil, nil, usageInfo, stopReason, err
+							return "", nil, nil, usageInfo, 0, stopReason, err
 						}
 						if duplicate {
 							log.Debugf("kiro: skipping duplicate direct tool use: %s", toolUseID)
@@ -1658,7 +1496,7 @@ func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.Kir
 			// Handle dedicated tool use events with input buffering
 			completedToolUses, newState, toolErr := kiroclaude.ProcessToolUseEvent(event, currentToolUse, processedIDs)
 			if toolErr != nil {
-				return "", nil, nil, usageInfo, stopReason, toolErr
+				return "", nil, nil, usageInfo, 0, stopReason, toolErr
 			}
 			currentToolUse = newState
 			toolUses = append(toolUses, completedToolUses...)
@@ -1897,7 +1735,7 @@ func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.Kir
 			if errMsg == "" {
 				errMsg = errType
 			}
-			return "", nil, nil, usageInfo, stopReason, streamStatusError(errType, errMsg)
+			return "", nil, nil, usageInfo, 0, stopReason, streamStatusError(errType, errMsg)
 
 		default:
 			// Check for contextUsagePercentage in any event
@@ -1997,7 +1835,7 @@ func (e *KiroExecutor) parseEventStream(body io.Reader) (string, *kiroclaude.Kir
 		log.Warn("kiro: dropping unsigned reasoning from buffered response")
 	}
 
-	return cleanedContent, reasoning, toolUses, usageInfo, stopReason, nil
+	return cleanedContent, reasoning, toolUses, usageInfo, upstreamContextPercentage, stopReason, nil
 }
 
 // readEventStreamMessage reads and validates a single AWS Event Stream message.
@@ -2065,12 +1903,12 @@ func (e *KiroExecutor) readEventStreamMessage(reader *bufio.Reader) (*eventStrea
 		}
 	}
 
-	// Extract event type from headers
 	// Headers start at beginning of 'remaining', length is headersLength
-	var eventType string
+	var headers map[string]string
 	if headersLength > 0 && headersLength <= uint32(len(remaining)) {
-		eventType = e.extractEventTypeFromBytes(remaining[:headersLength])
+		headers = e.eventStreamStringHeaders(remaining[:headersLength])
 	}
+	eventType := headers[":event-type"]
 
 	// Calculate payload boundaries
 	// Payload starts after headers, ends before message_crc (last 4 bytes)
@@ -2082,6 +1920,7 @@ func (e *KiroExecutor) readEventStreamMessage(reader *bufio.Reader) (*eventStrea
 		// No payload, return empty message
 		return &eventStreamMessage{
 			EventType: eventType,
+			Headers:   headers,
 			Payload:   nil,
 		}, nil
 	}
@@ -2090,6 +1929,7 @@ func (e *KiroExecutor) readEventStreamMessage(reader *bufio.Reader) (*eventStrea
 
 	return &eventStreamMessage{
 		EventType: eventType,
+		Headers:   headers,
 		Payload:   payload,
 	}, nil
 }
@@ -2143,8 +1983,13 @@ func skipEventStreamHeaderValue(headers []byte, offset int, valueType byte) (int
 	}
 }
 
-// extractEventTypeFromBytes extracts the event type from raw header bytes (without prelude CRC prefix)
-func (e *KiroExecutor) extractEventTypeFromBytes(headers []byte) string {
+// eventStreamStringHeaders returns the string-valued headers of one frame (raw
+// header bytes, without the prelude). Besides :event-type, an AWS exception
+// frame names its type and message here (:message-type "exception",
+// :exception-type, :error-code, :error-message), possibly with no payload.
+// A repeated name keeps its first value.
+func (e *KiroExecutor) eventStreamStringHeaders(headers []byte) map[string]string {
+	values := make(map[string]string)
 	offset := 0
 	for offset < len(headers) {
 		nameLen := int(headers[offset])
@@ -2170,12 +2015,10 @@ func (e *KiroExecutor) extractEventTypeFromBytes(headers []byte) string {
 			if offset+valueLen > len(headers) {
 				break
 			}
-			value := string(headers[offset : offset+valueLen])
-			offset += valueLen
-
-			if name == ":event-type" {
-				return value
+			if _, seen := values[name]; !seen {
+				values[name] = string(headers[offset : offset+valueLen])
 			}
+			offset += valueLen
 			continue
 		}
 
@@ -2185,14 +2028,14 @@ func (e *KiroExecutor) extractEventTypeFromBytes(headers []byte) string {
 		}
 		offset = nextOffset
 	}
-	return ""
+	return values
 }
 
 // streamToChannel converts AWS Event Stream to channel-based streaming.
 // Supports tool calling - emits tool_use content blocks when tools are used.
 // Buffers official toolUseEvent input fragments without repairing malformed JSON.
 // Extracts stop_reason from upstream events when available.
-func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out chan<- cliproxyexecutor.StreamChunk, targetFormat sdktranslator.Format, model string, originalReq, claudeBody []byte) bool {
+func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out chan<- cliproxyexecutor.StreamChunk, targetFormat sdktranslator.Format, model string, originalReq, claudeBody []byte, contextWindow int64) bool {
 	reader := bufio.NewReader(body)
 	var totalUsage usage.Detail
 	var outputForUsage strings.Builder
@@ -2224,6 +2067,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 	contentBlockIndex := -1
 	messageStartSent := false
 	isTextBlockOpen := false
+	var trace streamFrameTrace
 
 	// emitMessageStart opens the Anthropic message exactly once. message_delta
 	// and message_stop are meaningless before it: a client that receives a
@@ -2274,6 +2118,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 
 			break
 		}
+		trace.record(msg)
 
 		eventType := msg.EventType
 		payload := msg.Payload
@@ -3021,6 +2866,10 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 		}
 	}
 
+	if contentBlockIndex < 0 {
+		log.Warnf("kiro: stream ended without a content block (credential=%s model=%s): %s", streamTraceLabel(ctx), model, &trace)
+	}
+
 	// Close content block if open
 	if isThinkingBlockOpen && thinkingBlockIndex >= 0 {
 		blockStop := kiroclaude.BuildClaudeThinkingBlockStopEvent(thinkingBlockIndex)
@@ -3043,7 +2892,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 		}
 	}
 
-	totalUsage = completeKiroUsageFromText(totalUsage, originalReq, outputForUsage.String())
+	totalUsage = completeKiroUsageFromText(totalUsage, upstreamContextPercentage, contextWindow, outputForUsage.String())
 
 	// Log upstream usage information if received
 	if hasUpstreamUsage {
@@ -3092,396 +2941,6 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 
 // NOTE: Claude SSE event builders moved to internal/translator/kiro/claude/kiro_claude_stream.go
 // The executor now uses kiroclaude.BuildClaude*Event() functions instead
-
-// Refresh refreshes the Kiro OAuth token.
-// Supports both AWS Builder ID (SSO OIDC) and Google OAuth (social login).
-// Uses mutex to prevent race conditions when multiple concurrent requests try to refresh.
-func (e *KiroExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
-	// Serialize refreshes only for this credential. A global lock lets one slow
-	// account block every other Kiro account and increases stale-token races.
-	lockKey := "<nil>"
-	if auth != nil && strings.TrimSpace(auth.ID) != "" {
-		lockKey = auth.ID
-	}
-	lockValue, _ := e.refreshLocks.LoadOrStore(lockKey, &sync.Mutex{})
-	refreshLock := lockValue.(*sync.Mutex)
-	refreshLock.Lock()
-	defer refreshLock.Unlock()
-
-	var authID string
-	if auth != nil {
-		authID = auth.ID
-	} else {
-		authID = "<nil>"
-	}
-	log.Debugf("kiro executor: refresh called for auth %s", authID)
-	if auth == nil {
-		return nil, fmt.Errorf("kiro executor: auth is nil")
-	}
-
-	// Double-check: After acquiring lock, verify token still needs refresh
-	// Another goroutine may have already refreshed while we were waiting
-	// NOTE: This check has a design limitation - it reads from the auth object passed in,
-	// not from persistent storage. If another goroutine returns a new Auth object (via Clone),
-	// this check won't see those updates. The mutex still prevents truly concurrent refreshes,
-	// but queued goroutines may still attempt redundant refreshes. This is acceptable as
-	// the refresh operation is idempotent and the extra API calls are infrequent.
-	if auth.Metadata != nil {
-		if lastRefresh, ok := auth.Metadata["last_refresh"].(string); ok {
-			if refreshTime, err := time.Parse(time.RFC3339, lastRefresh); err == nil {
-				// If token was refreshed within the last 30 seconds, skip refresh
-				if time.Since(refreshTime) < 30*time.Second {
-					log.Debugf("kiro executor: token was recently refreshed by another goroutine, skipping")
-					return auth, nil
-				}
-			}
-		}
-		// Also check if expires_at is now in the future with sufficient buffer
-		if expiresAt, ok := auth.Metadata["expires_at"].(string); ok {
-			if expTime, err := time.Parse(time.RFC3339, expiresAt); err == nil {
-				// If token expires more than 20 minutes from now, it's still valid
-				if time.Until(expTime) > 20*time.Minute {
-					log.Debugf("kiro executor: token is still valid (expires in %v), skipping refresh", time.Until(expTime))
-					// CRITICAL FIX: Set NextRefreshAfter to prevent frequent refresh checks
-					// Without this, shouldRefresh() will return true again in 30 seconds
-					updated := auth.Clone()
-					// Set next refresh to 20 minutes before expiry, or at least 30 seconds from now
-					nextRefresh := expTime.Add(-20 * time.Minute)
-					minNextRefresh := time.Now().Add(30 * time.Second)
-					if nextRefresh.Before(minNextRefresh) {
-						nextRefresh = minNextRefresh
-					}
-					updated.NextRefreshAfter = nextRefresh
-					log.Debugf("kiro executor: setting NextRefreshAfter to %v (in %v)", nextRefresh.Format(time.RFC3339), time.Until(nextRefresh))
-					return updated, nil
-				}
-			}
-		}
-	}
-
-	var refreshToken string
-	var clientID, clientSecret string
-	var authMethod string
-	var region, startURL string
-
-	if auth.Metadata != nil {
-		if rt, ok := auth.Metadata["refresh_token"].(string); ok {
-			refreshToken = rt
-		}
-		if cid, ok := auth.Metadata["client_id"].(string); ok {
-			clientID = cid
-		}
-		if cs, ok := auth.Metadata["client_secret"].(string); ok {
-			clientSecret = cs
-		}
-		if am, ok := auth.Metadata["auth_method"].(string); ok {
-			authMethod = am
-		}
-		if r, ok := auth.Metadata["region"].(string); ok {
-			region = r
-		}
-		if su, ok := auth.Metadata["start_url"].(string); ok {
-			startURL = su
-		}
-	}
-
-	if refreshToken == "" {
-		return nil, fmt.Errorf("kiro executor: refresh token not found")
-	}
-
-	var tokenData *kiroauth.KiroTokenData
-	var err error
-
-	ssoClient := kiroauth.NewSSOOIDCClient(e.cfg)
-
-	// Kiro desktop credentials: social always, and imported only when it carries
-	// no AWS device registration. Parenthesised because the two arms are not
-	// interchangeable and precedence alone is easy to misread.
-	if authMethod == "social" || (authMethod == "imported" && clientID == "" && clientSecret == "") {
-		tokenData, err = ssoClient.RefreshDesktopToken(ctx, refreshToken, region)
-		if tokenData != nil {
-			tokenData.AuthMethod, tokenData.Provider = authMethod, "CLIProxyAPI"
-			if tokenData.ProfileArn == "" {
-				tokenData.ProfileArn, _ = auth.Metadata["profile_arn"].(string)
-			}
-		}
-	} else if authMethod == "external_idp" {
-		endpoint, _ := auth.Metadata["token_endpoint"].(string)
-		scopes, _ := auth.Metadata["scopes"].(string)
-		if endpoint == "" || clientID == "" || region == "" {
-			return nil, fmt.Errorf("kiro executor: external_idp refresh material is incomplete")
-		}
-		endpoint, err = validateExternalIDPTokenEndpoint(endpoint)
-		if err != nil {
-			return nil, statusErr{code: http.StatusBadRequest, msg: err.Error()}
-		}
-		form := url.Values{"grant_type": {"refresh_token"}, "client_id": {clientID}, "refresh_token": {refreshToken}}
-		if clientSecret != "" {
-			form.Set("client_secret", clientSecret)
-		}
-		if scopes != "" {
-			form.Set("scope", scopes)
-		}
-		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
-		if reqErr != nil {
-			return nil, reqErr
-		}
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		response, doErr := (&http.Client{Timeout: 30 * time.Second}).Do(req)
-		if doErr != nil {
-			return nil, fmt.Errorf("kiro executor: external_idp refresh failed: %w", doErr)
-		}
-		defer response.Body.Close()
-		body, readErr := io.ReadAll(io.LimitReader(response.Body, 1<<20))
-		if readErr != nil {
-			return nil, readErr
-		}
-		if response.StatusCode < 200 || response.StatusCode >= 300 {
-			return nil, statusErr{code: response.StatusCode, msg: "external_idp refresh rejected"}
-		}
-		var payload struct {
-			AccessToken  string `json:"access_token"`
-			RefreshToken string `json:"refresh_token"`
-			ExpiresIn    int    `json:"expires_in"`
-		}
-		if json.Unmarshal(body, &payload) != nil || payload.AccessToken == "" {
-			return nil, fmt.Errorf("kiro executor: external_idp refresh returned invalid token")
-		}
-		if payload.RefreshToken == "" {
-			payload.RefreshToken = refreshToken
-		}
-		expires := time.Now().UTC().Add(time.Duration(payload.ExpiresIn) * time.Second).Format(time.RFC3339)
-		if payload.ExpiresIn <= 0 {
-			expires = time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
-		}
-		profileArn, _ := auth.Metadata["profile_arn"].(string)
-		tokenData = &kiroauth.KiroTokenData{AccessToken: payload.AccessToken, RefreshToken: payload.RefreshToken, ProfileArn: profileArn, ExpiresAt: expires, AuthMethod: "external_idp", Provider: "CLIProxyAPI", ClientID: clientID, Region: region, TokenEndpoint: endpoint, Scopes: scopes}
-	} else if clientID == "" || clientSecret == "" || region == "" || authMethod != "idc" && authMethod != "builder-id" {
-		return nil, fmt.Errorf("kiro executor: credential is not a complete AWS device registration")
-	} else {
-		log.Debugf("kiro executor: refreshing AWS device token (method=%s, region=%s)", authMethod, region)
-		tokenData, err = ssoClient.RefreshTokenWithRegion(ctx, clientID, clientSecret, refreshToken, region, startURL)
-		if tokenData != nil {
-			tokenData.AuthMethod = authMethod
-		}
-	}
-
-	if err != nil {
-		return nil, fmt.Errorf("kiro executor: token refresh failed: %w", err)
-	}
-
-	updated := auth.Clone()
-	now := time.Now()
-	updated.UpdatedAt = now
-	updated.LastRefreshedAt = now
-
-	if updated.Metadata == nil {
-		updated.Metadata = make(map[string]any)
-	}
-	updated.Metadata["access_token"] = tokenData.AccessToken
-	updated.Metadata["refresh_token"] = tokenData.RefreshToken
-	updated.Metadata["expires_at"] = tokenData.ExpiresAt
-	updated.Metadata["last_refresh"] = now.Format(time.RFC3339)
-	if tokenData.ProfileArn != "" {
-		updated.Metadata["profile_arn"] = tokenData.ProfileArn
-	}
-	if tokenData.AuthMethod != "" {
-		updated.Metadata["auth_method"] = tokenData.AuthMethod
-	}
-	if tokenData.Provider != "" {
-		updated.Metadata["provider"] = tokenData.Provider
-	}
-	// Preserve client credentials for future refreshes (AWS Builder ID)
-	if tokenData.ClientID != "" {
-		updated.Metadata["client_id"] = tokenData.ClientID
-	}
-	if tokenData.ClientSecret != "" {
-		updated.Metadata["client_secret"] = tokenData.ClientSecret
-	}
-	// Preserve region and start_url for IDC token refresh
-	if tokenData.Region != "" {
-		updated.Metadata["region"] = tokenData.Region
-	}
-	if tokenData.StartURL != "" {
-		updated.Metadata["start_url"] = tokenData.StartURL
-	}
-
-	if updated.Attributes == nil {
-		updated.Attributes = make(map[string]string)
-	}
-	updated.Attributes["access_token"] = tokenData.AccessToken
-	if tokenData.ProfileArn != "" {
-		updated.Attributes["profile_arn"] = tokenData.ProfileArn
-	}
-
-	// NextRefreshAfter is aligned with RefreshLead (20min)
-	if expiresAt, parseErr := time.Parse(time.RFC3339, tokenData.ExpiresAt); parseErr == nil {
-		updated.NextRefreshAfter = expiresAt.Add(-20 * time.Minute)
-	}
-
-	log.Infof("kiro executor: token refreshed successfully, expires at %s", tokenData.ExpiresAt)
-	return updated, nil
-}
-
-// persistRefreshedAuth persists a refreshed auth record to disk.
-// This ensures token refreshes from inline retry are saved to the auth file.
-func (e *KiroExecutor) persistRefreshedAuth(auth *cliproxyauth.Auth) error {
-	if auth == nil || auth.Metadata == nil {
-		return fmt.Errorf("kiro executor: cannot persist nil auth or metadata")
-	}
-
-	// Determine the file path from auth attributes or filename
-	var authPath string
-	if auth.Attributes != nil {
-		if p := strings.TrimSpace(auth.Attributes["path"]); p != "" {
-			authPath = p
-		}
-	}
-	if authPath == "" {
-		fileName := strings.TrimSpace(auth.FileName)
-		if fileName == "" {
-			return fmt.Errorf("kiro executor: auth has no file path or filename")
-		}
-		if filepath.IsAbs(fileName) {
-			authPath = fileName
-		} else if e.cfg != nil && e.cfg.AuthDir != "" {
-			authPath = filepath.Join(e.cfg.AuthDir, fileName)
-		} else {
-			return fmt.Errorf("kiro executor: cannot determine auth file path")
-		}
-	}
-
-	// Prefer the host/plugin storage implementation. It preserves the original
-	// credential JSON (including type, provider, identity and auth method) while
-	// merging refreshed runtime metadata. Falling back to metadata-only writes
-	// would corrupt Kiro auth files and is intentionally no longer supported.
-	if auth.Storage != nil {
-		if setter, ok := auth.Storage.(interface{ SetMetadata(map[string]any) }); ok {
-			setter.SetMetadata(auth.Metadata)
-		}
-		if err := auth.Storage.SaveTokenToFile(authPath); err != nil {
-			return fmt.Errorf("kiro executor: persist refreshed auth via storage failed: %w", err)
-		}
-		log.Debugf("kiro executor: persisted refreshed auth to %s", authPath)
-		return nil
-	}
-	return fmt.Errorf("kiro executor: auth storage is unavailable")
-}
-
-// reloadAuthFromFile 从文件重新加载 auth 数据（方案 B: Fallback 机制）
-// 当内存中的 token 已过期时，尝试从文件读取最新的 token
-// 这解决了后台刷新器已更新文件但内存中 Auth 对象尚未同步的时间差问题
-func (e *KiroExecutor) reloadAuthFromFile(auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
-	if auth == nil {
-		return nil, fmt.Errorf("kiro executor: cannot reload nil auth")
-	}
-
-	// 确定文件路径
-	var authPath string
-	if auth.Attributes != nil {
-		if p := strings.TrimSpace(auth.Attributes["path"]); p != "" {
-			authPath = p
-		}
-	}
-	if authPath == "" {
-		fileName := strings.TrimSpace(auth.FileName)
-		if fileName == "" {
-			return nil, fmt.Errorf("kiro executor: auth has no file path or filename for reload")
-		}
-		if filepath.IsAbs(fileName) {
-			authPath = fileName
-		} else if e.cfg != nil && e.cfg.AuthDir != "" {
-			authPath = filepath.Join(e.cfg.AuthDir, fileName)
-		} else {
-			return nil, fmt.Errorf("kiro executor: cannot determine auth file path for reload")
-		}
-	}
-
-	// 读取文件
-	raw, err := os.ReadFile(authPath)
-	if err != nil {
-		return nil, fmt.Errorf("kiro executor: failed to read auth file %s: %w", authPath, err)
-	}
-
-	// 解析 JSON
-	var metadata map[string]any
-	if err := json.Unmarshal(raw, &metadata); err != nil {
-		return nil, fmt.Errorf("kiro executor: failed to parse auth file %s: %w", authPath, err)
-	}
-
-	// 检查文件中的 token 是否比内存中的更新
-	fileExpiresAt, _ := metadata["expires_at"].(string)
-	fileAccessToken, _ := metadata["access_token"].(string)
-	memExpiresAt, _ := auth.Metadata["expires_at"].(string)
-	memAccessToken, _ := auth.Metadata["access_token"].(string)
-
-	// 文件中必须有有效的 access_token
-	if fileAccessToken == "" {
-		return nil, fmt.Errorf("kiro executor: auth file has no access_token field")
-	}
-
-	// 如果有 expires_at，检查是否过期
-	if fileExpiresAt != "" {
-		fileExpTime, parseErr := time.Parse(time.RFC3339, fileExpiresAt)
-		if parseErr == nil {
-			// 如果文件中的 token 也已过期，不使用它
-			if time.Now().After(fileExpTime) {
-				log.Debugf("kiro executor: file token also expired at %s, not using", fileExpiresAt)
-				return nil, fmt.Errorf("kiro executor: file token also expired")
-			}
-		}
-	}
-
-	// 判断文件中的 token 是否比内存中的更新
-	// 条件1: access_token 不同（说明已刷新）
-	// 条件2: expires_at 更新（说明已刷新）
-	isNewer := false
-
-	// 优先检查 access_token 是否变化
-	if fileAccessToken != memAccessToken {
-		isNewer = true
-		log.Debugf("kiro executor: file access_token differs from memory, using file token")
-	}
-
-	// 如果 access_token 相同，检查 expires_at
-	if !isNewer && fileExpiresAt != "" && memExpiresAt != "" {
-		fileExpTime, fileParseErr := time.Parse(time.RFC3339, fileExpiresAt)
-		memExpTime, memParseErr := time.Parse(time.RFC3339, memExpiresAt)
-		if fileParseErr == nil && memParseErr == nil && fileExpTime.After(memExpTime) {
-			isNewer = true
-			log.Debugf("kiro executor: file expires_at (%s) is newer than memory (%s)", fileExpiresAt, memExpiresAt)
-		}
-	}
-
-	// 如果文件中没有 expires_at 但 access_token 相同，无法判断是否更新
-	if !isNewer && fileExpiresAt == "" && fileAccessToken == memAccessToken {
-		return nil, fmt.Errorf("kiro executor: cannot determine if file token is newer (no expires_at, same access_token)")
-	}
-
-	if !isNewer {
-		log.Debugf("kiro executor: file token not newer than memory token")
-		return nil, fmt.Errorf("kiro executor: file token not newer")
-	}
-
-	// 创建更新后的 auth 对象
-	updated := auth.Clone()
-	updated.Metadata = metadata
-	updated.UpdatedAt = time.Now()
-
-	// 同步更新 Attributes
-	if updated.Attributes == nil {
-		updated.Attributes = make(map[string]string)
-	}
-	if accessToken, ok := metadata["access_token"].(string); ok {
-		updated.Attributes["access_token"] = accessToken
-	}
-	if profileArn, ok := metadata["profile_arn"].(string); ok {
-		updated.Attributes["profile_arn"] = profileArn
-	}
-
-	log.Infof("kiro executor: reloaded auth from file %s, new expires_at: %s", authPath, fileExpiresAt)
-	return updated, nil
-}
 
 // isTokenExpired checks if a JWT access token has expired.
 // Returns true if the token is expired or cannot be parsed.

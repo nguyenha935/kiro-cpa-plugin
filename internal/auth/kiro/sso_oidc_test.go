@@ -63,6 +63,31 @@ func TestCreateTokenWithRegionReportsPendingAuthorization(t *testing.T) {
 	}
 }
 
+func TestRefreshTokenSurfacesAWSErrorCode(t *testing.T) {
+	long := strings.Repeat("x", 500)
+	client := &SSOOIDCClient{httpClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusBadRequest,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"error":"invalid_grant","error_description":"Invalid refresh\ntoken ` + long + `"}`)),
+			Request:    request,
+		}, nil
+	})}}
+
+	_, err := client.RefreshTokenWithRegion(context.Background(), "client", "secret", "refresh", "us-east-1", "")
+	var status OIDCStatusError
+	if !errors.As(err, &status) || status.Status != http.StatusBadRequest {
+		t.Fatalf("error = %T %v, want OIDCStatusError 400", err, err)
+	}
+	message := err.Error()
+	if !strings.Contains(message, "HTTP 400: invalid_grant (Invalid refresh token ") {
+		t.Fatalf("AWS error code or description missing: %q", message)
+	}
+	if strings.Contains(message, "\n") || len(status.Message) > 300 {
+		t.Fatalf("description is not bounded to one line: %d bytes", len(status.Message))
+	}
+}
+
 func TestOIDCStatusErrorPreservesHTTPStatus(t *testing.T) {
 	err := OIDCStatusError{Status: http.StatusUnauthorized, Message: "rejected"}
 	if err.StatusCode() != http.StatusUnauthorized || err.Error() != "rejected" {

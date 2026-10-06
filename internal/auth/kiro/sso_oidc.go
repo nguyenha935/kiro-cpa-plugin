@@ -224,7 +224,8 @@ func (c *SSOOIDCClient) postJSON(ctx context.Context, endpoint string, payload a
 	}
 	if response.StatusCode != http.StatusOK {
 		var oidcError struct {
-			Error string `json:"error"`
+			Error       string `json:"error"`
+			Description string `json:"error_description"`
 		}
 		_ = json.Unmarshal(responseBody, &oidcError)
 		switch oidcError.Error {
@@ -233,10 +234,31 @@ func (c *SSOOIDCClient) postJSON(ctx context.Context, endpoint string, payload a
 		case ErrSlowDown.Error():
 			return ErrSlowDown
 		}
-		return OIDCStatusError{Status: response.StatusCode, Message: fmt.Sprintf("OIDC endpoint returned HTTP %d", response.StatusCode)}
+		return OIDCStatusError{Status: response.StatusCode, Message: oidcFailureMessage(response.StatusCode, oidcError.Error, oidcError.Description)}
 	}
 	if err := json.Unmarshal(responseBody, target); err != nil {
 		return fmt.Errorf("decode OIDC response: %w", err)
 	}
 	return nil
+}
+
+// oidcDescriptionLimit bounds the AWS-supplied description carried into logs.
+const oidcDescriptionLimit = 200
+
+// oidcFailureMessage keeps the OAuth error code AWS returned. Without it every
+// dead refresh token read as a bare "HTTP 400", indistinguishable from a
+// malformed request, and operators could not tell invalid_grant apart.
+func oidcFailureMessage(status int, code, description string) string {
+	message := fmt.Sprintf("OIDC endpoint returned HTTP %d", status)
+	if code = strings.TrimSpace(code); code != "" {
+		message += ": " + code
+	}
+	description = strings.Join(strings.Fields(description), " ")
+	if runes := []rune(description); len(runes) > oidcDescriptionLimit {
+		description = string(runes[:oidcDescriptionLimit]) + "…"
+	}
+	if description != "" {
+		message += " (" + description + ")"
+	}
+	return message
 }
