@@ -66,14 +66,24 @@ func isThinkingSignatureInvalid(body []byte) bool {
 const maxKiroToolDescriptionBytes = 10240
 
 func normalizeKiroRequest(body []byte, source sdktranslator.Format) ([]byte, error) {
+	normalized, _, err := normalizeKiroRequestWithAliases(body, source)
+	return normalized, err
+}
+
+func normalizeKiroRequestWithAliases(body []byte, source sdktranslator.Format) ([]byte, toolNameAliases, error) {
 	normalized, err := normalizeKiroTools(body, source)
 	if err != nil {
-		return nil, err
+		return nil, toolNameAliases{}, err
+	}
+	normalized, aliases, err := aliasKiroToolNames(normalized, source)
+	if err != nil {
+		return nil, toolNameAliases{}, err
 	}
 	if source.String() == sdktranslator.FormatOpenAI.String() {
-		return normalized, nil
+		return normalized, aliases, nil
 	}
-	return normalizeClaudeSystemMessages(normalized)
+	normalized, err = normalizeClaudeSystemMessages(normalized)
+	return normalized, aliases, err
 }
 
 // normalizeKiroTools removes server-side tools that Kiro cannot execute and
@@ -524,7 +534,7 @@ func validateOpenAITools(body []byte) error {
 }
 
 func validateToolDefinition(name, description string, schema gjson.Result) error {
-	if strings.TrimSpace(name) == "" || len(name) > 64 {
+	if strings.TrimSpace(name) == "" || len(name) > maxKiroToolNameBytes {
 		return fmt.Errorf("Kiro tool names must contain between 1 and 64 bytes")
 	}
 	if strings.TrimSpace(description) == "" || len(description) > maxKiroToolDescriptionBytes {
