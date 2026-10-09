@@ -739,8 +739,7 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("kiro")
-	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
-	body, normalizeErr := normalizeKiroRequest(body, from)
+	body, aliases, normalizeErr := prepareKiroRequest(req.Payload, req.Model, from, to)
 	if normalizeErr != nil {
 		return resp, requestValidationErr{msg: normalizeErr.Error()}
 	}
@@ -753,13 +752,13 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		return resp, err
 	}
 
-	return e.executeWithRetry(ctx, auth, req, opts, accessToken, profileArn, body, from, to, kiroModelID, tokenKey)
+	return e.executeWithRetry(ctx, auth, req, opts, accessToken, profileArn, body, aliases, from, to, kiroModelID, tokenKey)
 }
 
 // executeWithRetry performs the HTTP request against the credential's runtime
 // with automatic retry on auth errors. tokenKey identifies the credential in
 // the plugin's protection state.
-func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, accessToken, profileArn string, body []byte, from, to sdktranslator.Format, kiroModelID, tokenKey string) (cliproxyexecutor.Response, error) {
+func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, accessToken, profileArn string, body []byte, aliases toolNameAliases, from, to sdktranslator.Format, kiroModelID, tokenKey string) (cliproxyexecutor.Response, error) {
 	var resp cliproxyexecutor.Response
 	maxRetries := 2
 	endpoint, err := kiroEndpointFor(auth)
@@ -963,6 +962,9 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 
 		// Build response in Claude format for Kiro translator
 		// stopReason is extracted from upstream response by parseEventStream
+		for i := range toolUses {
+			toolUses[i].Name = aliases.original(toolUses[i].Name)
+		}
 		requestedModel := payloadRequestedModel(opts, req.Model)
 		kiroResponse := kiroclaude.BuildClaudeResponse(content, reasoning, toolUses, requestedModel, usageInfo, stopReason)
 		out := sdktranslator.TranslateNonStream(ctx, to, from, requestedModel, bytes.Clone(opts.OriginalRequest), body, kiroResponse, nil)
@@ -995,8 +997,7 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("kiro")
-	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
-	body, normalizeErr := normalizeKiroRequest(body, from)
+	body, aliases, normalizeErr := prepareKiroRequest(req.Payload, req.Model, from, to)
 	if normalizeErr != nil {
 		return nil, requestValidationErr{msg: normalizeErr.Error()}
 	}
@@ -1009,7 +1010,7 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		return nil, err
 	}
 
-	streamKiro, errStreamKiro := e.executeStreamWithRetry(ctx, auth, req, opts, accessToken, profileArn, body, from, kiroModelID, tokenKey)
+	streamKiro, errStreamKiro := e.executeStreamWithRetry(ctx, auth, req, opts, accessToken, profileArn, body, aliases, from, kiroModelID, tokenKey)
 	if errStreamKiro != nil {
 		return nil, errStreamKiro
 	}
@@ -1019,7 +1020,7 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 // executeStreamWithRetry is the streaming twin of executeWithRetry: same
 // endpoint resolution, retry and protection rules, but a 2xx hands the body to
 // a goroutine that feeds the returned channel.
-func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, accessToken, profileArn string, body []byte, from sdktranslator.Format, kiroModelID, tokenKey string) (<-chan cliproxyexecutor.StreamChunk, error) {
+func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, accessToken, profileArn string, body []byte, aliases toolNameAliases, from sdktranslator.Format, kiroModelID, tokenKey string) (<-chan cliproxyexecutor.StreamChunk, error) {
 	maxRetries := 2
 	endpoint, err := kiroEndpointFor(auth)
 	if err != nil {
@@ -1215,7 +1216,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 			if len(bytes.TrimSpace(requestPayload)) == 0 {
 				requestPayload = req.Payload
 			}
-			if e.streamToChannel(withStreamTraceLabel(ctx, authID), resp.Body, out, from, payloadRequestedModel(opts, req.Model), requestPayload, body, kiroContextWindow(auth, kiroModelID)) {
+			if e.streamToChannelWithAliases(withStreamTraceLabel(ctx, authID), resp.Body, out, from, payloadRequestedModel(opts, req.Model), requestPayload, body, kiroContextWindow(auth, kiroModelID), aliases) {
 				log.Debugf("kiro: stream completed successfully for token %s", tokenKey)
 			}
 		}(httpResp)
@@ -2036,6 +2037,10 @@ func (e *KiroExecutor) eventStreamStringHeaders(headers []byte) map[string]strin
 // Buffers official toolUseEvent input fragments without repairing malformed JSON.
 // Extracts stop_reason from upstream events when available.
 func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out chan<- cliproxyexecutor.StreamChunk, targetFormat sdktranslator.Format, model string, originalReq, claudeBody []byte, contextWindow int64) bool {
+	return e.streamToChannelWithAliases(ctx, body, out, targetFormat, model, originalReq, claudeBody, contextWindow, toolNameAliases{})
+}
+
+func (e *KiroExecutor) streamToChannelWithAliases(ctx context.Context, body io.Reader, out chan<- cliproxyexecutor.StreamChunk, targetFormat sdktranslator.Format, model string, originalReq, claudeBody []byte, contextWindow int64, aliases toolNameAliases) bool {
 	reader := bufio.NewReader(body)
 	var totalUsage usage.Detail
 	var outputForUsage strings.Builder
@@ -2112,7 +2117,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 			// An incomplete tool event is a malformed upstream response. Do not
 			// repair or invent arguments that the model did not send.
 			if currentToolUse != nil && !processedIDs[currentToolUse.ToolUseID] {
-				out <- cliproxyexecutor.StreamChunk{Err: streamStatusError("upstream ended", fmt.Sprintf("upstream ended during tool call %q", currentToolUse.Name))}
+				out <- cliproxyexecutor.StreamChunk{Err: streamStatusError("upstream ended", fmt.Sprintf("upstream ended during tool call %q", aliases.original(currentToolUse.Name)))}
 				return false
 			}
 
@@ -2389,7 +2394,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 				// Emit tool_use content block
 				contentBlockIndex++
 
-				blockStart := kiroclaude.BuildClaudeContentBlockStartEvent(contentBlockIndex, "tool_use", toolUseID, toolName)
+				blockStart := kiroclaude.BuildClaudeContentBlockStartEvent(contentBlockIndex, "tool_use", toolUseID, aliases.original(toolName))
 				sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStart, &translatorParam)
 				for _, chunk := range sseData {
 					if len(chunk) > 0 {
@@ -2594,7 +2599,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 
 				contentBlockIndex++
 
-				blockStart := kiroclaude.BuildClaudeContentBlockStartEvent(contentBlockIndex, "tool_use", tu.ToolUseID, tu.Name)
+				blockStart := kiroclaude.BuildClaudeContentBlockStartEvent(contentBlockIndex, "tool_use", tu.ToolUseID, aliases.original(tu.Name))
 				sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStart, &translatorParam)
 				for _, chunk := range sseData {
 					if len(chunk) > 0 {
