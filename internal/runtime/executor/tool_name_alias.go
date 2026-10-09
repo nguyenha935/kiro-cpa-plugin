@@ -14,7 +14,13 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-const maxKiroToolNameBytes = 64
+const (
+	maxKiroToolNameBytes = 64
+	// An alias keeps a readable prefix of the client name plus a short hash:
+	// at most 39 + 1 + 8 = 48 bytes, well below Kiro's 64-byte limit.
+	kiroToolAliasPrefixBytes = 39
+	kiroToolAliasHashHex     = 8
+)
 
 type toolNameAliases struct {
 	toKiro   map[string]string
@@ -158,11 +164,13 @@ func prepareKiroRequest(body []byte, model string, source, target sdktranslator.
 	return normalizeKiroRequestWithAliases(translated, source)
 }
 
+// kiroToolAliasCandidate keeps the start of the name, cut on a UTF-8 boundary,
+// so the model still sees what the tool is; the hash keeps it unique.
 func kiroToolAliasCandidate(name string, attempt int) string {
 	input := name
 	if attempt > 0 {
 		input += "\x00" + strconv.Itoa(attempt)
 	}
 	digest := sha256.Sum256([]byte(input))
-	return "kiro_" + hex.EncodeToString(digest[:])[:58]
+	return truncateUTF8(name, kiroToolAliasPrefixBytes) + "_" + hex.EncodeToString(digest[:])[:kiroToolAliasHashHex]
 }

@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -280,15 +281,61 @@ func TestToolNameAliasRestoresBufferedAndStreamedCalls(t *testing.T) {
 	}
 }
 
+func TestToolNameAliasFormat(t *testing.T) {
+	for _, name := range []string{longMCPToolName, strings.Repeat("a", 65), strings.Repeat("é", 33), strings.Repeat("x", 400)} {
+		alias := kiroToolAliasCandidate(name, 0)
+		if len(alias) > 48 || !utf8.ValidString(alias) {
+			t.Fatalf("alias %q for %q is not a valid name of at most 48 bytes", alias, name)
+		}
+		hashStart := len(alias) - kiroToolAliasHashHex
+		prefix, hash := alias[:hashStart-1], alias[hashStart:]
+		if _, err := hex.DecodeString(hash); err != nil || alias[hashStart-1] != '_' {
+			t.Fatalf("alias %q does not end in _<8 hex>", alias)
+		}
+		if !strings.HasPrefix(name, prefix) || len(prefix) > kiroToolAliasPrefixBytes || len(prefix) < kiroToolAliasPrefixBytes-3 {
+			t.Fatalf("alias %q does not keep the start of %q", alias, name)
+		}
+		if again := kiroToolAliasCandidate(name, 0); again != alias {
+			t.Fatalf("alias is not deterministic: %q then %q", alias, again)
+		}
+	}
+	if got := kiroToolAliasCandidate(longMCPToolName, 0); !strings.HasPrefix(got, "mcp__plugin_chrome-devtools-mcp_chrome-_") {
+		t.Fatalf("alias lost the readable prefix: %q", got)
+	}
+}
+
+func TestToolNameAliasShortNamesAreByteForByteUnchanged(t *testing.T) {
+	body := claudeToolRequest(strings.Repeat("a", 64))
+	normalized, aliases, err := aliasKiroToolNames(body, sdktranslator.FormatClaude)
+	if err != nil || !bytes.Equal(normalized, body) || len(aliases.toKiro) != 0 {
+		t.Fatalf("request without over-limit names changed: err=%v", err)
+	}
+}
+
 func TestToolNameAliasUnknownHistoryIsUnchanged(t *testing.T) {
+	const removed = "mcp__plugin_removed-server_removed-server__a_tool_that_is_no_longer_declared"
 	body := claudeToolRequest(longMCPToolName)
-	body, _ = sjson.SetBytes(body, "messages.1.content.0.name", "another_unavailable_tool_name_over_sixty_four_bytes_0123456789_abcdefgh")
+	body, _ = sjson.SetBytes(body, "messages.1.content.0.name", removed)
 	normalized, _, err := normalizeKiroRequestWithAliases(body, sdktranslator.FormatClaude)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := gjson.GetBytes(normalized, "messages.1.content.0.name").String(); got != "another_unavailable_tool_name_over_sixty_four_bytes_0123456789_abcdefgh" {
+	if got := gjson.GetBytes(normalized, "messages.1.content.0.name").String(); got != removed {
 		t.Fatalf("unknown history name changed: %q", got)
+	}
+	// The payload builder replays unknown history as text, so the long name
+	// never reaches Kiro as a tool name.
+	payload, _ := buildKiroPayloadForFormat(normalized, "claude-opus-5", "", "KIRO_CLI", sdktranslator.FormatClaude, nil)
+	parsed := gjson.ParseBytes(payload)
+	for _, message := range parsed.Get("conversationState.history").Array() {
+		for _, toolUse := range message.Get("assistantResponseMessage.toolUses").Array() {
+			if name := toolUse.Get("name").String(); len(name) > maxKiroToolNameBytes {
+				t.Fatalf("structured history sent an over-limit name: %q", name)
+			}
+		}
+	}
+	if !strings.Contains(string(payload), removed) {
+		t.Fatal("unknown history lost its original name in the text replay")
 	}
 }
 
