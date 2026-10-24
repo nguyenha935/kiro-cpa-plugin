@@ -127,6 +127,11 @@ func handleConnectAPI(req pluginapi.ManagementRequest) ([]byte, error) {
 		token, err = importRefreshToken(context.Background(), values)
 	case "external_idp":
 		token, err = importExternalIDP(context.Background(), []byte(input.CredentialJSON))
+	case socialJSONMethod:
+		// A Kiro Account Manager export carries its own social credential. It is
+		// refreshed and checked against Kiro here so a dead export never reaches
+		// the auth file, and the stored kind stays "social".
+		token, err = importSocialJSON(context.Background(), []byte(input.CredentialJSON))
 	default:
 		err = errors.New("select a supported Kiro authentication method")
 	}

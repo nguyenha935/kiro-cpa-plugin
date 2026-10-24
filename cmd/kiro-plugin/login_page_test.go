@@ -99,13 +99,17 @@ func TestLoginPageOffersEveryConnectMethod(t *testing.T) {
 	for _, match := range regexp.MustCompile(`name="method" value="([a-z_-]+)"`).FindAllStringSubmatch(loginShellBody, -1) {
 		offered = append(offered, match[1])
 	}
-	if strings.Join(offered, ",") != "builder-id,idc,api_key,refresh_token,external_idp" {
+	if strings.Join(offered, ",") != "builder-id,idc,api_key,refresh_token,external_idp,social_json" {
 		t.Fatalf("methods offered = %v", offered)
 	}
 	for _, method := range offered {
 		labels := strings.Count(loginShellText, "'m_"+method+"':") + strings.Count(loginShellText, " m_"+method+":")
 		if labels != 3 {
 			t.Fatalf("method %s has %d labels, want one per language", method, labels)
+		}
+		hints := strings.Count(loginShellText, "'h_"+method+"':") + strings.Count(loginShellText, " h_"+method+":")
+		if hints != 3 {
+			t.Fatalf("method %s has %d hints, want one per language", method, hints)
 		}
 	}
 }

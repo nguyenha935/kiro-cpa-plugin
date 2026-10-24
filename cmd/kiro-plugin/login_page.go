@@ -84,6 +84,7 @@ const loginShellBody = `<main>
       <label class="method"><input type="radio" name="method" value="api_key"><span data-t="m_api_key">API key</span></label>
       <label class="method"><input type="radio" name="method" value="refresh_token"><span data-t="m_refresh_token">Refresh token</span></label>
       <label class="method"><input type="radio" name="method" value="external_idp"><span data-t="m_external_idp">External IDP JSON</span></label>
+      <label class="method"><input type="radio" name="method" value="social_json"><span data-t="m_social_json">Kiro Account Manager JSON</span></label>
     </fieldset>
     <p id="kiro-method-hint" class="method-hint"></p>
     <div class="field" data-for="refresh_token"><label for="f-rtype" data-t="refreshType">Account type</label><select id="f-rtype"><option value="builder-id">AWS Builder ID</option><option value="idc">AWS IAM Identity Center</option></select></div>
@@ -94,6 +95,7 @@ const loginShellBody = `<main>
     <div class="field" data-for="refresh_token"><label for="f-clientid" data-t="clientID">Client ID</label><input id="f-clientid" autocomplete="off" spellcheck="false"></div>
     <div class="field" data-for="refresh_token"><label for="f-clientsecret" data-t="clientSecret">Client secret</label><input id="f-clientsecret" type="password" autocomplete="off" spellcheck="false"></div>
     <div class="field" data-for="external_idp"><label for="f-json" data-t="externalJSON">Authentication JSON</label><textarea id="f-json" rows="9" maxlength="65536" spellcheck="false"></textarea></div>
+    <div class="field" data-for="social_json"><label for="f-social-json" data-t="socialJSON">Kiro Account Manager JSON</label><textarea id="f-social-json" rows="9" maxlength="65536" spellcheck="false"></textarea></div>
     <p class="login-actions"><button id="kiro-submit" class="act go" type="submit"></button></p>
   </form>
   <section id="kiro-result" class="result" aria-live="polite" hidden>
@@ -122,11 +124,13 @@ const loginShellText = `  var TEXT = {
       m_api_key: 'API key',
       m_refresh_token: 'Refresh token',
       m_external_idp: 'External IDP JSON',
+      'm_social_json': 'Kiro Account Manager JSON',
       'h_builder-id': 'Sign in to a personal AWS Builder ID with device authorization.',
       h_idc: 'Sign in to an organization through AWS IAM Identity Center.',
       h_api_key: 'The API key is validated against Kiro’s model catalog before it is saved.',
       h_refresh_token: 'Import AWS OIDC refresh material and its client registration.',
       h_external_idp: 'Import external_idp JSON that uses an allowlisted Microsoft identity provider.',
+      h_social_json: 'Paste a GitHub or Google account exported by Kiro Account Manager. It is refreshed and checked against Kiro before it is saved.',
       startURL: 'Start URL',
       region: 'AWS Region',
       apiKey: 'Kiro API key',
@@ -135,6 +139,7 @@ const loginShellText = `  var TEXT = {
       clientID: 'Client ID',
       clientSecret: 'Client secret',
       externalJSON: 'Authentication JSON',
+      socialJSON: 'Kiro Account Manager JSON',
       authorize: 'Start authorization',
       add: 'Add account',
       working: 'Validating and saving the account…',
@@ -160,11 +165,13 @@ const loginShellText = `  var TEXT = {
       m_api_key: 'API key',
       m_refresh_token: 'Refresh token',
       m_external_idp: 'External IDP JSON',
+      'm_social_json': 'JSON Kiro Account Manager',
       'h_builder-id': 'Đăng nhập tài khoản AWS Builder ID cá nhân bằng mã thiết bị.',
       h_idc: 'Đăng nhập tài khoản doanh nghiệp qua AWS IAM Identity Center.',
       h_api_key: 'API key được kiểm tra với danh sách model Kiro trước khi lưu.',
       h_refresh_token: 'Nhập bộ refresh token và thông tin client đã đăng ký với AWS OIDC.',
       h_external_idp: 'Nhập file xác thực external_idp dùng nhà cung cấp danh tính Microsoft được cho phép.',
+      h_social_json: 'Dán tài khoản GitHub hoặc Google do Kiro Account Manager xuất ra. Tài khoản được làm mới và kiểm tra với Kiro trước khi lưu.',
       startURL: 'Start URL',
       region: 'AWS Region',
       apiKey: 'API key Kiro',
@@ -173,6 +180,7 @@ const loginShellText = `  var TEXT = {
       clientID: 'Client ID',
       clientSecret: 'Client secret',
       externalJSON: 'Nội dung JSON xác thực',
+      socialJSON: 'JSON Kiro Account Manager',
       authorize: 'Bắt đầu ủy quyền',
       add: 'Thêm tài khoản',
       working: 'Đang kiểm tra và lưu tài khoản…',
@@ -198,11 +206,13 @@ const loginShellText = `  var TEXT = {
       m_api_key: 'API key',
       m_refresh_token: 'Refresh token',
       m_external_idp: 'External IDP JSON',
+      'm_social_json': 'Kiro Account Manager JSON',
       'h_builder-id': '使用设备授权登录个人 AWS Builder ID。',
       h_idc: '通过 AWS IAM Identity Center 登录组织账户。',
       h_api_key: '保存前会使用 Kiro 模型目录验证 API key。',
       h_refresh_token: '导入 AWS OIDC refresh token 及客户端注册信息。',
       h_external_idp: '导入使用允许的 Microsoft 身份提供商的 external_idp JSON。',
+      h_social_json: '粘贴 Kiro Account Manager 导出的 GitHub 或 Google 账号 JSON。保存前会先刷新并到 Kiro 校验。',
       startURL: 'Start URL',
       region: 'AWS Region',
       apiKey: 'Kiro API key',
@@ -211,6 +221,7 @@ const loginShellText = `  var TEXT = {
       clientID: 'Client ID',
       clientSecret: 'Client secret',
       externalJSON: '认证 JSON',
+      socialJSON: 'Kiro Account Manager JSON',
       authorize: '开始授权',
       add: '添加账户',
       working: '正在验证并保存账户…',
@@ -325,6 +336,8 @@ const loginShellLogic = `  // The sign-in state CPA issued travels in the fragme
         }
       } else if (current === 'external_idp') {
         body.credential_json = value('f-json');
+      } else if (current === 'social_json') {
+        body.credential_json = value('f-social-json');
       }
       return body;
     }

@@ -4,7 +4,7 @@ Standalone native cross-platform plugin that connects CLIProxyAPI to Kiro accoun
 
 The plugin:
 
-- supports AWS Builder ID, IAM Identity Center, API-key credentials, refresh-token import, and CLIProxyAPI `external_idp` import;
+- supports AWS Builder ID, IAM Identity Center, API-key credentials, refresh-token import, CLIProxyAPI `external_idp` import, and Kiro Account Manager GitHub/Google social JSON import;
 - discovers the Kiro profile with the access token of each account;
 - keeps Identity Center registrations isolated;
 - loads only the models available to the authenticated account;
@@ -66,6 +66,8 @@ Open the OAuth page of the Management Center, press `Start Kiro Login`, then `Op
 The page submits the method to the authenticated `POST /v0/management/plugins/kiro/connect` route, so API keys, refresh tokens and imported JSON only travel through CPA's Management API. The sign-in page is a static shell like the Usage page: it reads the key the Management Center keeps when it signs in with “Remember password” ticked, or asks for it and holds it in memory only. The sign-in state that `StartLogin` issues travels in the URL fragment, which the browser never sends to the server.
 
 Builder ID and IAM Identity Center use Kiro CLI's remote device flow, so they also work in containers and on hosts without a browser. The sign-in page displays only the real AWS verification URL and device code. The plugin identifies itself as the pinned Kiro CLI version and reports the real operating system and architecture; it does not fabricate a machine identifier or depend on Windows `MachineGuid`.
+
+`Kiro Account Manager JSON` imports one GitHub or Google account exported by Kiro Account Manager. The export must carry `authMethod: "social"`, `provider` of `Github` or `Google`, and a `refreshToken`; `accessToken`, `email`, `expiresAt`, `expiresIn`, `profileArn`, `region` and `machineId` are read when present, in camelCase or snake_case. Unknown fields are ignored rather than stored. A single account object, a one-element array and an `{"accounts": [...]}` wrapper are accepted; a file with several accounts is refused instead of picking one. The credential is then rotated through the Kiro desktop auth service and must list models before it is written, so a rejected export never reaches an auth file, and the stored credential keeps `auth_method: social` with the exported provider, email, profile ARN and region. A token prefix is never treated as proof of anything, and the export's `machineId` is not adopted.
 
 ### Clients
 
