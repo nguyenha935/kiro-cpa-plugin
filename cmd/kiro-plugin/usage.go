@@ -1229,10 +1229,17 @@ func rememberUsageIdentity(name string, token *kiroauth.KiroTokenData) {
 }
 
 func applyUsageIdentity(name string, token *kiroauth.KiroTokenData) {
+	key := filepath.Base(name)
 	usageState.Lock()
-	identity, ok := usageState.identities[filepath.Base(name)]
+	identity, ok := usageState.identities[key]
+	delete(usageState.identities, key)
 	usageState.Unlock()
 	if !ok {
+		return
+	}
+	// Replacing a credential file can keep its name while changing accounts.
+	// Discard a stale entry before it changes any of the replacement's fields.
+	if token.AWSUserID != "" && identity.userID != "" && token.AWSUserID != identity.userID {
 		return
 	}
 	if looksLikeEmail(identity.email) && !looksLikeEmail(token.Email) {

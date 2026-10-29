@@ -1958,3 +1958,44 @@ func TestDisableCoolingKeepsExplicitFalse(t *testing.T) {
 		}
 	}
 }
+
+func TestRefreshConsumesCachedIdentityAndSkipsReplacedAccounts(t *testing.T) {
+	for _, userID := range []string{"", "d-1.old", "d-1.replacement"} {
+		t.Run("current user="+userID, func(t *testing.T) {
+			original := authRefreshCredential
+			t.Cleanup(func() { authRefreshCredential = original; resetUsageState() })
+			resetUsageState()
+			rememberUsageIdentity("kiro.json", &kiroauth.KiroTokenData{Email: "old@example.com", AWSUserID: "d-1.old", ProfileName: "old-profile", SubscriptionTitle: "old-plan"})
+			authRefreshCredential = func(_ context.Context, token *kiroauth.KiroTokenData) (*kiroauth.KiroTokenData, error) {
+				refreshed := *token
+				refreshed.AccessToken, refreshed.RefreshToken = "renewed-access", "renewed-refresh"
+				return &refreshed, nil
+			}
+			stubCatalog(t, func(*http.Request) (*http.Response, error) {
+				return catalogResponse(http.StatusOK, builderIDCatalog), nil
+			})
+			stored, _ := json.Marshal(&kiroauth.KiroTokenData{AuthMethod: "builder-id", AccessToken: "access", RefreshToken: "refresh", AWSUserID: userID, ProfileName: "current-profile", SubscriptionTitle: "current-plan", ExpiresAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339)})
+			refreshed, err := decodeKiroCredential(refreshAuth(t, stored).Auth.StorageJSON)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if userID == "d-1.replacement" {
+				if refreshed.AWSUserID != userID || refreshed.ProfileName != "current-profile" || refreshed.SubscriptionTitle != "current-plan" || refreshed.Email != "" {
+					t.Errorf("cached identity overwrote replacement account: user=%q profile=%q plan=%q email=%q", refreshed.AWSUserID, refreshed.ProfileName, refreshed.SubscriptionTitle, refreshed.Email)
+				}
+			} else if refreshed.AWSUserID != "d-1.old" || refreshed.ProfileName != "old-profile" || refreshed.SubscriptionTitle != "old-plan" || refreshed.Email != "old@example.com" {
+				t.Error("matching cached identity was not applied")
+			}
+			if refreshed.AccessToken != "renewed-access" || refreshed.RefreshToken != "renewed-refresh" {
+				t.Fatal("cached identity changed refreshed tokens")
+			}
+			next, err := decodeKiroCredential(refreshAuth(t, credential(t, "access", time.Now().Add(time.Hour), true)).Auth.StorageJSON)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if next.AWSUserID != "" || next.ProfileName != "" || next.SubscriptionTitle != "" || next.Email != "" {
+				t.Errorf("cached identity survived its first refresh: user=%q profile=%q plan=%q email=%q", next.AWSUserID, next.ProfileName, next.SubscriptionTitle, next.Email)
+			}
+		})
+	}
+}

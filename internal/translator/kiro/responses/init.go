@@ -44,10 +44,11 @@ func convertClaudeStreamToResponses(ctx context.Context, model string, originalR
 	if len(dataFrame) == 0 {
 		return [][]byte{}
 	}
-	if *param == nil {
-		*param = &responsesStreamState{request: slimResponsesRequest(originalRequest)}
+	state, ok := (*param).(*responsesStreamState)
+	if !ok || state == nil {
+		state = &responsesStreamState{request: slimResponsesRequest(originalRequest)}
+		*param = state
 	}
-	state := (*param).(*responsesStreamState)
 	return registry.TranslateStream(
 		ctx,
 		sdktranslator.FormatClaude,

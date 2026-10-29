@@ -129,3 +129,26 @@ func TestResponsesStreamMatchesHostWithFullRequest(t *testing.T) {
 		t.Fatalf("plugin stream differs from host stream on the full request\nplugin:\n%s\nhost:\n%s", viaPlugin.String(), viaHost.String())
 	}
 }
+
+func TestResponsesStreamReinitializesUnexpectedState(t *testing.T) {
+	for name, initial := range map[string]any{"nil": nil, "foreign state": map[string]any{"other": true}, "typed nil": (*responsesStreamState)(nil)} {
+		t.Run(name, func(t *testing.T) {
+			original := []byte(`{"model":"claude-opus-5","stream":true,"input":[{"role":"user","content":"hi"}]}`)
+			frames := []string{
+				`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5","content":[],"usage":{"input_tokens":10,"output_tokens":0}}}`,
+				`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+				`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}`,
+			}
+			param := initial
+			var out bytes.Buffer
+			for _, frame := range frames {
+				for _, chunk := range convertClaudeStreamToResponses(context.Background(), "claude-opus-5", original, nil, []byte(frame), &param) {
+					out.Write(chunk)
+				}
+			}
+			if !strings.Contains(out.String(), `"type":"response.output_text.delta"`) || !strings.Contains(out.String(), `"delta":"hello"`) {
+				t.Fatalf("stream did not preserve text with %s: %s", name, out.String())
+			}
+		})
+	}
+}

@@ -84,10 +84,14 @@ func isRetryableError(err error) bool {
 		return false
 	}
 	var netErr net.Error
-	if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
+	if errors.As(err, &netErr) && netErr.Timeout() {
 		return true
 	}
-	for _, cause := range []error{syscall.ECONNRESET, syscall.ECONNREFUSED, syscall.EPIPE, syscall.ETIMEDOUT, syscall.ENETUNREACH, syscall.EHOSTUNREACH, io.EOF, io.ErrUnexpectedEOF} {
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) && dnsErr.IsTemporary {
+		return true
+	}
+	for _, cause := range []error{syscall.EINTR, syscall.EMFILE, syscall.ENFILE, syscall.ECONNRESET, syscall.ECONNREFUSED, syscall.EPIPE, syscall.ETIMEDOUT, syscall.ENETUNREACH, syscall.EHOSTUNREACH, io.EOF, io.ErrUnexpectedEOF} {
 		if errors.Is(err, cause) {
 			return true
 		}

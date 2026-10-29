@@ -24,3 +24,15 @@ func TestRetryableTransportErrorsUseValues(t *testing.T) {
 		}
 	}
 }
+
+func TestRetryableTransportErrorsKeepTransientDNSAndSyscalls(t *testing.T) {
+	for _, cause := range []error{&net.DNSError{Err: "temporary resolver failure", Name: "example.com", IsTemporary: true}, syscall.EINTR, syscall.EMFILE, syscall.ENFILE} {
+		err := &net.OpError{Op: "dial", Net: "tcp", Err: cause}
+		if !isRetryableError(err) {
+			t.Errorf("transient transport error %v lost retry classification", cause)
+		}
+	}
+	if isRetryableError(&net.DNSError{Err: "host not found", Name: "example.com", IsNotFound: true}) {
+		t.Fatal("permanent DNS failure became retryable")
+	}
+}
