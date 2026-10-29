@@ -141,3 +141,65 @@ func TestBuildKiroPayloadKeepsHistoryForDeclaredTool(t *testing.T) {
 		t.Fatalf("declared tool results = %d, want 1", got)
 	}
 }
+
+func TestBuildKiroPayloadFlattensOnlyUndeclaredToolPairs(t *testing.T) {
+	request := []byte(`{
+		"messages":[
+			{"role":"user","content":"go"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"a","type":"function","function":{"name":"Read","arguments":"{\"p\":\"x\"}"}}]},
+			{"role":"tool","tool_call_id":"a","content":"x-body"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"b","type":"function","function":{"name":"mcp__gone__tool","arguments":"{}"}}]},
+			{"role":"tool","tool_call_id":"b","content":"gone-body"},
+			{"role":"assistant","content":"both","tool_calls":[
+				{"id":"c","type":"function","function":{"name":"Read","arguments":"{\"p\":\"y\"}"}},
+				{"id":"d","type":"function","function":{"name":"mcp__gone__tool","arguments":"{}"}}
+			]},
+			{"role":"tool","tool_call_id":"c","content":"y-body"},
+			{"role":"tool","tool_call_id":"d","content":"d-body"}
+		],
+		"tools":[{"type":"function","function":{"name":"Read","description":"Read","parameters":{"type":"object"}}}]
+	}`)
+	raw, _ := BuildKiroPayloadFromOpenAI(request, "claude-opus-5", "profile", "AI_EDITOR", modelcapabilities.Capability{}, "")
+	var payload KiroPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("invalid payload: %v", err)
+	}
+	h := payload.ConversationState.History
+	current := payload.ConversationState.CurrentMessage.UserInputMessage
+	toolUseIDs := func(m *KiroAssistantResponseMessage) string {
+		ids := make([]string, 0, len(m.ToolUses))
+		for _, toolUse := range m.ToolUses {
+			ids = append(ids, toolUse.ToolUseID)
+		}
+		return strings.Join(ids, ",")
+	}
+	toolResultIDs := func(m *KiroUserInputMessage) string {
+		if m.UserInputMessageContext == nil {
+			return ""
+		}
+		ids := make([]string, 0, len(m.UserInputMessageContext.ToolResults))
+		for _, result := range m.UserInputMessageContext.ToolResults {
+			ids = append(ids, result.ToolUseID)
+		}
+		return strings.Join(ids, ",")
+	}
+
+	if got := toolUseIDs(h[1].AssistantResponseMessage); got != "a" {
+		t.Errorf("history[1] tool uses = %q, want a", got)
+	}
+	if got := toolResultIDs(h[2].UserInputMessage); got != "a" {
+		t.Errorf("history[2] tool results = %q, want a", got)
+	}
+	if got := toolUseIDs(h[3].AssistantResponseMessage); got != "" || !strings.Contains(h[3].AssistantResponseMessage.Content, `<tool_use id="b" name="mcp__gone__tool">`) {
+		t.Errorf("history[3] tool uses = %q content = %q, want b flattened", got, h[3].AssistantResponseMessage.Content)
+	}
+	if got := toolResultIDs(h[4].UserInputMessage); got != "" || !strings.Contains(h[4].UserInputMessage.Content, `<tool_result id="b" status="success">`) {
+		t.Errorf("history[4] tool results = %q content = %q, want b flattened", got, h[4].UserInputMessage.Content)
+	}
+	if got := toolUseIDs(h[5].AssistantResponseMessage); got != "c" || !strings.Contains(h[5].AssistantResponseMessage.Content, `<tool_use id="d"`) {
+		t.Errorf("history[5] tool uses = %q content = %q, want c kept and d flattened", got, h[5].AssistantResponseMessage.Content)
+	}
+	if got := toolResultIDs(&current); got != "c" || !strings.Contains(current.Content, `<tool_result id="d"`) || strings.Contains(current.Content, `id="c"`) {
+		t.Errorf("current tool results = %q content = %q, want c kept and d flattened", got, current.Content)
+	}
+}

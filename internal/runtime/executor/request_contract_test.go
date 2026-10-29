@@ -57,6 +57,25 @@ func TestFilterUnsupportedNativeToolsKeepsAnthropicFunctionTools(t *testing.T) {
 	}
 }
 
+func TestFilterUnsupportedNativeToolsKeepsAnthropicCustomTypeTools(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"x"}],"tools":[
+		{"type":"custom","name":"Read","description":"Read","input_schema":{"type":"object"}},
+		{"name":"Bash","description":"Bash","input_schema":{"type":"object"}},
+		{"type":"web_search_20250305","name":"web_search"}
+	]}`)
+	out, err := normalizeKiroRequest(body, sdktranslator.FormatClaude)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, tool := range gjson.GetBytes(out, "tools").Array() {
+		names = append(names, tool.Get("name").String())
+	}
+	if strings.Join(names, ",") != "Read,Bash" {
+		t.Fatalf("kept tools = %v, want [Read Bash]", names)
+	}
+}
+
 func TestFilterUnsupportedNativeToolsRemovesToolsFieldWhenNoneRemain(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"user","content":"search"}],"tools":[{"type":"web_search_20250305","name":"web_search"}]}`)
 
@@ -266,5 +285,33 @@ func TestValidateKiroRequestRejectsInvalidImageData(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"user","content":[{"type":"image","source":{"media_type":"image/png","data":"not-base64"}}]}]}`)
 	if err := validateKiroRequest(body, body, sdktranslator.FormatClaude); err == nil {
 		t.Fatal("invalid image data was accepted")
+	}
+}
+
+func TestValidateKiroRequestRejectsInvalidToolResultImageData(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"shot"},{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"screenshot","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"image","source":{"media_type":"image/png","data":"not-base64"}}]}]}]}`)
+	if err := validateKiroRequest(body, body, sdktranslator.FormatClaude); err == nil {
+		t.Fatal("invalid tool_result image data was accepted")
+	}
+}
+
+func TestBillingHeaderStrippedThroughExecutorWithoutInlineSystemPR(t *testing.T) {
+	for _, system := range []string{
+		`"x-anthropic-billing-header: cch=example;\nbase"`,
+		`[{"type":"text","text":"x-anthropic-billing-header: cch=example;"},{"type":"text","text":"base"}]`,
+		`[{"type":"text","text":"x-anthropic-billing-header: cch=example;\nbase"}]`,
+	} {
+		for _, inline := range []string{"", `,{"role":"system","content":"later"}`} {
+			body := []byte(`{"system":` + system + `,"messages":[{"role":"user","content":"hi"}` + inline + `]}`)
+			normalized, err := normalizeKiroRequest(body, sdktranslator.FormatClaude)
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload, _ := buildKiroPayloadForFormat(normalized, "claude-opus-5", "", "AI_EDITOR", sdktranslator.FormatClaude, nil)
+			content := gjson.GetBytes(payload, "conversationState.currentMessage.userInputMessage.content").String()
+			if strings.Contains(content, "x-anthropic-billing-header") || !strings.Contains(content, "base") || (inline != "" && !strings.Contains(content, "later")) {
+				t.Errorf("system %s, inline=%q yielded %q", system, inline, content)
+			}
+		}
 	}
 }

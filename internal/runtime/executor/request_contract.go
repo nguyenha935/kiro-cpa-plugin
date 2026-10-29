@@ -100,7 +100,9 @@ func normalizeKiroTools(body []byte, source sdktranslator.Format) ([]byte, error
 	changed := false
 	for _, tool := range tools.Array() {
 		toolType := strings.TrimSpace(tool.Get("type").String())
-		supported := toolType == ""
+		// Anthropic client tools may omit type or spell it "custom"; any other
+		// type names a server tool.
+		supported := toolType == "" || toolType == "custom"
 		if openAIChat {
 			supported = toolType == "function"
 		}
@@ -230,10 +232,10 @@ func claudeSystemTextParts(content gjson.Result) ([]string, error) {
 		return nil, nil
 	}
 	if content.Type == gjson.String {
-		if content.String() == "" {
+		if kirocommon.StripClaudeBillingHeader(content.String()) == "" {
 			return nil, nil
 		}
-		return []string{content.String()}, nil
+		return []string{kirocommon.StripClaudeBillingHeader(content.String())}, nil
 	}
 	if !content.IsArray() {
 		return nil, fmt.Errorf("Kiro supports only text in Anthropic system messages")
@@ -241,16 +243,16 @@ func claudeSystemTextParts(content gjson.Result) ([]string, error) {
 	parts := make([]string, 0, len(content.Array()))
 	for _, block := range content.Array() {
 		if block.Type == gjson.String {
-			if block.String() != "" {
-				parts = append(parts, block.String())
+			if kirocommon.StripClaudeBillingHeader(block.String()) != "" {
+				parts = append(parts, kirocommon.StripClaudeBillingHeader(block.String()))
 			}
 			continue
 		}
 		if block.Get("type").String() != "text" {
 			return nil, fmt.Errorf("Kiro supports only text in Anthropic system messages")
 		}
-		if block.Get("text").String() != "" {
-			parts = append(parts, block.Get("text").String())
+		if kirocommon.StripClaudeBillingHeader(block.Get("text").String()) != "" {
+			parts = append(parts, kirocommon.StripClaudeBillingHeader(block.Get("text").String()))
 		}
 	}
 	return parts, nil
@@ -376,6 +378,16 @@ func validateClaudeConversation(body []byte, source string) error {
 			if _, expected := pendingToolUses[id]; !expected {
 				return requestValidationErr{msg: fmt.Sprintf("Anthropic tool_result %q does not match a preceding tool_use", id)}
 			}
+			// Images inside a tool result are forwarded on the user message, so
+			// they meet the same contract as top-level image blocks.
+			for _, item := range block.Get("content").Array() {
+				if item.Get("type").String() != "image" {
+					continue
+				}
+				if err := validateKiroImageBlock(item); err != nil {
+					return requestValidationErr{msg: err.Error()}
+				}
+			}
 			resolved[id] = struct{}{}
 			delete(pendingToolUses, id)
 		}
@@ -460,17 +472,8 @@ func validateKiroContentBlocks(content gjson.Result, source string) error {
 		case "document":
 			return fmt.Errorf("Kiro does not support document content blocks")
 		case "image":
-			mediaType := strings.ToLower(strings.TrimSpace(block.Get("source.media_type").String()))
-			data := strings.TrimSpace(block.Get("source.data").String())
-			if mediaType == "" || data == "" {
-				return fmt.Errorf("Kiro image blocks require media_type and base64 data")
-			}
-			if !strings.HasPrefix(mediaType, "image/") {
-				return fmt.Errorf("Kiro supports only image MIME types")
-			}
-			decoded, err := base64.StdEncoding.DecodeString(data)
-			if err != nil || len(decoded) == 0 || len(decoded) > maxKiroImageBytes {
-				return fmt.Errorf("Kiro image data must be valid base64 and no larger than 10 MiB")
+			if err := validateKiroImageBlock(block); err != nil {
+				return err
 			}
 		case "image_url", "input_image":
 			value := block.Get("image_url.url").String()
@@ -489,6 +492,22 @@ func validateKiroContentBlocks(content gjson.Result, source string) error {
 				return fmt.Errorf("Kiro image data must be valid base64 and no larger than 10 MiB")
 			}
 		}
+	}
+	return nil
+}
+
+func validateKiroImageBlock(block gjson.Result) error {
+	mediaType := strings.ToLower(strings.TrimSpace(block.Get("source.media_type").String()))
+	data := strings.TrimSpace(block.Get("source.data").String())
+	if mediaType == "" || data == "" {
+		return fmt.Errorf("Kiro image blocks require media_type and base64 data")
+	}
+	if !strings.HasPrefix(mediaType, "image/") {
+		return fmt.Errorf("Kiro supports only image MIME types")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(data)
+	if err != nil || len(decoded) == 0 || len(decoded) > maxKiroImageBytes {
+		return fmt.Errorf("Kiro image data must be valid base64 and no larger than 10 MiB")
 	}
 	return nil
 }

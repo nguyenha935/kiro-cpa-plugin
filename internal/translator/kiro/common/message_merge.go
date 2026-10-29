@@ -119,21 +119,43 @@ func blockToMap(block gjson.Result) map[string]interface{} {
 		if value.IsObject() {
 			result[key.String()] = blockToMap(value)
 		} else if value.IsArray() {
-			var arr []interface{}
+			// Keep the merger's existing empty-array rendering for cached history.
+			var items []interface{}
 			for _, item := range value.Array() {
 				if item.IsObject() {
-					arr = append(arr, blockToMap(item))
+					items = append(items, blockToMap(item))
 				} else {
-					arr = append(arr, item.Value())
+					items = append(items, mergeJSONValue(item))
 				}
 			}
-			result[key.String()] = arr
+			result[key.String()] = items
 		} else {
-			result[key.String()] = value.Value()
+			result[key.String()] = mergeJSONValue(value)
 		}
 		return true
 	})
 	return result
+}
+
+// mergeJSONValue preserves numbers at every depth while retaining the existing
+// map encoding for key order and string escaping.
+func mergeJSONValue(value gjson.Result) interface{} {
+	if value.IsObject() {
+		fields := make(map[string]interface{})
+		value.ForEach(func(key, item gjson.Result) bool { fields[key.String()] = mergeJSONValue(item); return true })
+		return fields
+	}
+	if value.IsArray() {
+		items := make([]interface{}, 0, len(value.Array()))
+		for _, item := range value.Array() {
+			items = append(items, mergeJSONValue(item))
+		}
+		return items
+	}
+	if value.Type == gjson.Number {
+		return json.Number(value.Raw)
+	}
+	return value.Value()
 }
 
 func createMergedMessageFrom(original gjson.Result, role, content string, toolCalls []interface{}) string {
@@ -155,7 +177,7 @@ func createMergedMessageFrom(original gjson.Result, role, content string, toolCa
 func appendToolCalls(merged []interface{}, toolCalls gjson.Result) []interface{} {
 	if toolCalls.IsArray() {
 		for _, tc := range toolCalls.Array() {
-			merged = append(merged, tc.Value())
+			merged = append(merged, mergeJSONValue(tc))
 		}
 	}
 	return merged

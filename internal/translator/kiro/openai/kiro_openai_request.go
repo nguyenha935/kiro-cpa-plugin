@@ -201,13 +201,14 @@ func BuildKiroPayloadFromOpenAI(openaiBody []byte, modelID, profileArn, origin s
 	return result, thinkingEnabled
 }
 
-// normalizeUnknownToolHistory keeps structured tool replay only when every
-// historical tool is still declared by the current request. Kiro validates
-// history against the current tool catalogue and rejects an otherwise valid
-// conversation with REQUEST_BODY_INVALID when a client (notably Claude Code
-// during compaction) drops or renames a tool definition. In that case all
-// historical tool pairs are preserved as plain text so their meaning remains
-// available without sending an invalid structured replay.
+// normalizeUnknownToolHistory keeps structured tool replay for every tool the
+// current request still declares. Kiro validates history against the current
+// tool catalogue and rejects an otherwise valid conversation with
+// REQUEST_BODY_INVALID when a client (notably Claude Code during compaction)
+// drops or renames a tool definition. Only the tool uses of undeclared tools,
+// and the results answering them, are preserved as plain text, so their meaning
+// remains available without sending an invalid structured replay and without
+// rewriting the rest of the history.
 //
 // This mirrors the claude translator's function of the same name; see the note
 // there. Any change here must be made in both packages until the shared Kiro
@@ -217,43 +218,67 @@ func normalizeUnknownToolHistory(history []KiroHistoryMessage, current *KiroUser
 	for _, tool := range tools {
 		toolNames[tool.ToolSpecification.Name] = struct{}{}
 	}
-
-	hasUnknownTool := false
-	for _, message := range history {
-		if message.AssistantResponseMessage == nil {
+	// A tool result answers the assistant turn just before it, so the ids
+	// flattened in one assistant turn are flattened in the next user turn.
+	var flattened map[string]struct{}
+	for i := range history {
+		if assistant := history[i].AssistantResponseMessage; assistant != nil {
+			flattened = nil
+			var kept, unknown []KiroToolUse
+			for _, toolUse := range assistant.ToolUses {
+				if _, ok := toolNames[toolUse.Name]; ok {
+					kept = append(kept, toolUse)
+					continue
+				}
+				unknown = append(unknown, toolUse)
+				if flattened == nil {
+					flattened = make(map[string]struct{})
+				}
+				flattened[toolUse.ToolUseID] = struct{}{}
+			}
+			if len(unknown) > 0 {
+				assistant.Content = appendOpenAIHistoryText(assistant.Content, formatOpenAIToolUses(unknown))
+				assistant.ToolUses = kept
+			}
 			continue
 		}
-		for _, toolUse := range message.AssistantResponseMessage.ToolUses {
-			if _, ok := toolNames[toolUse.Name]; !ok {
-				hasUnknownTool = true
-				break
+		if user := history[i].UserInputMessage; user != nil && user.UserInputMessageContext != nil && len(flattened) > 0 {
+			var text string
+			user.UserInputMessageContext.ToolResults, text = splitFlattenedToolResults(user.UserInputMessageContext.ToolResults, flattened)
+			if text != "" {
+				user.Content = appendOpenAIHistoryText(user.Content, text)
 			}
-		}
-		if hasUnknownTool {
-			break
-		}
-	}
-	if !hasUnknownTool {
-		return history, currentResults
-	}
-
-	for i := range history {
-		if assistant := history[i].AssistantResponseMessage; assistant != nil && len(assistant.ToolUses) > 0 {
-			assistant.Content = appendOpenAIHistoryText(assistant.Content, formatOpenAIToolUses(assistant.ToolUses))
-			assistant.ToolUses = nil
-		}
-		if user := history[i].UserInputMessage; user != nil && user.UserInputMessageContext != nil && len(user.UserInputMessageContext.ToolResults) > 0 {
-			user.Content = appendOpenAIHistoryText(user.Content, formatOpenAIToolResults(user.UserInputMessageContext.ToolResults))
-			user.UserInputMessageContext.ToolResults = nil
-			if len(user.UserInputMessageContext.Tools) == 0 {
+			if len(user.UserInputMessageContext.ToolResults) == 0 && len(user.UserInputMessageContext.Tools) == 0 {
 				user.UserInputMessageContext = nil
 			}
 		}
+		flattened = nil
 	}
-	if current != nil && len(currentResults) > 0 {
-		current.Content = appendOpenAIHistoryText(current.Content, formatOpenAIToolResults(currentResults))
+	if current != nil && len(flattened) > 0 {
+		var text string
+		currentResults, text = splitFlattenedToolResults(currentResults, flattened)
+		if text != "" {
+			current.Content = appendOpenAIHistoryText(current.Content, text)
+		}
 	}
-	return history, nil
+	return history, currentResults
+}
+
+// splitFlattenedToolResults keeps the results whose tool use stayed
+// structured and renders the others as text.
+func splitFlattenedToolResults(results []KiroToolResult, flattened map[string]struct{}) ([]KiroToolResult, string) {
+	var kept, unknown []KiroToolResult
+	for _, result := range results {
+		if _, ok := flattened[result.ToolUseID]; ok {
+			unknown = append(unknown, result)
+		} else {
+			kept = append(kept, result)
+		}
+	}
+	if len(unknown) == 0 {
+		return results, ""
+	}
+	return kept, formatOpenAIToolResults(unknown)
 }
 
 func formatOpenAIToolUses(toolUses []KiroToolUse) string {
@@ -690,12 +715,12 @@ func buildAssistantMessageFromOpenAI(msg gjson.Result) KiroAssistantResponseMess
 				toolName := part.Get("name").String()
 				inputData := part.Get("input")
 
-				inputMap := make(map[string]interface{})
+				var inputMap map[string]interface{}
 				if inputData.Exists() && inputData.IsObject() {
-					inputData.ForEach(func(key, value gjson.Result) bool {
-						inputMap[key.String()] = value.Value()
-						return true
-					})
+					inputMap, _ = kirocommon.DecodeToolInput(inputData.Raw)
+				}
+				if inputMap == nil {
+					inputMap = make(map[string]interface{})
 				}
 
 				toolUses = append(toolUses, KiroToolUse{
@@ -723,8 +748,8 @@ func buildAssistantMessageFromOpenAI(msg gjson.Result) KiroAssistantResponseMess
 			// Kiro's input is an object; a missing, empty or truncated argument
 			// string (a client replaying an interrupted stream) must replay as {}
 			// rather than null.
-			inputMap := make(map[string]interface{})
-			if err := json.Unmarshal([]byte(toolArgs), &inputMap); err != nil || inputMap == nil {
+			inputMap, err := kirocommon.DecodeToolInput(toolArgs)
+			if err != nil || inputMap == nil {
 				if err != nil {
 					log.Warnf("kiro-openai: tool call %s carried undecodable arguments; replaying with empty input", toolName)
 				}
