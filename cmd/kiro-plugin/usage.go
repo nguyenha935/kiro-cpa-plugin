@@ -1295,7 +1295,7 @@ func publicUsageError(err error) string {
 	if errors.As(err, &httpError) {
 		switch httpError.StatusCode {
 		case http.StatusUnauthorized, http.StatusForbidden:
-			return "Kiro rejected this session. Sign in again from OAuth Login."
+			return "Kiro rejected this session. Sign in again."
 		case http.StatusTooManyRequests:
 			return "Kiro rate-limited the usage request. Try again later."
 		default:

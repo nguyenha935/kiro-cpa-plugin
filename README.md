@@ -14,7 +14,7 @@ The plugin:
 - supports streaming, tool calls, token refresh, multiple accounts, and failover;
 - forwards client-executed function tools, bounds their descriptions to Kiro's upstream limit, and omits server-side tools that Kiro cannot execute;
 - preserves system and developer instructions exactly once as user text, because the upstream `systemPrompt` field is feature-gated;
-- provides a read-only `Kiro Usage` page for subscription usage, with per-account reload.
+- provides a `Kiro Usage` page for subscription usage, with per-account reload and an Add account dialog.
 
 `Kiro` is the name shown in the CLIProxyAPI interface. The provider ID stays `kiro`; the plugin ID, library filename, and `plugins.configs` key are `kiro-ha` (see [Build](#build)).
 
@@ -61,7 +61,7 @@ Restart CLIProxyAPI. Every sign-in method is stored as a standard CPA Authentica
 
 ### Sign in
 
-Open the OAuth page of the Management Center, press `Start Kiro Login`, then `Open Link`. The link opens the plugin's sign-in page (`/v0/resource/plugins/kiro-ha/login`) in a new tab. Choose a method there; the Kiro card on the OAuth page finishes on its own. Nothing needs to be pasted into the card's Callback URL field.
+There are two ways in. The quickest is `Add account` on the [Kiro Usage](#kiro-usage) page, which signs in without leaving the page. The other is the OAuth page of the Management Center: press `Start Kiro Login`, then `Open Link`. The link opens the plugin's sign-in page (`/v0/resource/plugins/kiro-ha/login`) in a new tab. Choose a method there; the Kiro card on the OAuth page finishes on its own. Nothing needs to be pasted into the card's Callback URL field.
 
 The page submits the method to the authenticated `POST /v0/management/plugins/kiro/connect` route, so API keys, refresh tokens and imported JSON only travel through CPA's Management API. The sign-in page is a static shell like the Usage page: it reads the key the Management Center keeps when it signs in with “Remember password” ticked, or asks for it and holds it in memory only. The sign-in state that `StartLogin` issues travels in the URL fragment, which the browser never sends to the server.
 
@@ -107,7 +107,9 @@ The Management API route `GET /v0/management/plugins/kiro/capabilities` (managem
 
 ## Kiro Usage
 
-Open `Kiro Usage` from the plugin menu in the Management Center. The page shows one row group per connected Kiro account with the plan, credit pools, balance, renewal date, and overage information returned by Kiro, plus fleet totals.
+Open `Kiro Usage` from the plugin menu in the Management Center. The page shows one row group per connected Kiro account with the plan, credit pools, balance, renewal date, and overage information returned by Kiro, plus fleet totals. Accounts can be filtered by state, searched by file, note, email or plan, and sorted by share used, remaining credit or reset date.
+
+`Add account`, and `Sign in again` on an account Kiro rejected, open the sign-in form in a dialog on the page. The dialog opens a sign-in session through CPA (`GET /v8/management/oauth/auth-url?provider=kiro`), submits the method to the plugin's `connect` route, and polls `GET /v8/management/oauth/status` until CPA has saved the credential, then reloads the list. Closing the dialog cancels the session. These are the routes the Management Center's own OAuth card uses, so the account is stored exactly as it would be from there.
 
 CLIProxyAPI serves plugin resource routes without the management key, so the page is split accordingly:
 
@@ -115,12 +117,13 @@ CLIProxyAPI serves plugin resource routes without the management key, so the pag
 | --- | --- | --- |
 | `GET /v0/resource/plugins/kiro-ha/usage` | none | Static shell: layout and one script, identical bytes on every request, no account data. |
 | `GET /v0/management/plugins/kiro/usage/view?lang=&refresh=` | management key | The account table as an HTML fragment. `refresh` names one credential file or `all`. |
+| `POST /v0/management/plugins/kiro/connect` | management key | The Add account dialog's sign-in, shared with the sign-in page. |
 
-The Usage and sign-in pages are available in English, Vietnamese and Simplified Chinese, following the Management Center's language. The sign-in page is drawn like the Management Center's own OAuth dialog, in the panel's light, white and dark themes.
+The Usage and sign-in pages are available in English, Vietnamese and Simplified Chinese, following the Management Center's language. Both are drawn in the Management Center's style and its light, white and dark themes; the sign-in page and the Add account dialog are its OAuth dialog.
 
 The shell reads the key the Management Center keeps when it signs in with “Remember password” ticked; otherwise it asks for the key and holds it in memory only. Its Content-Security-Policy admits only its own script by hash and allows network requests to the same origin only, so the injected fragment cannot run code. Results remain in memory for 60 seconds, and a manual reload is limited to one upstream call per account every 10 seconds.
 
-The page is read-only: it never writes quota data or credential settings. To disable or enable a credential, use the Auth Files page of the Management Center. If Kiro changes or rejects its private usage endpoint, the affected account displays an error instead of an estimated value.
+Apart from adding an account, the page is read-only: it never writes quota data or credential settings. To disable or enable a credential, use the Auth Files page of the Management Center. If Kiro changes or rejects its private usage endpoint, the affected account displays an error instead of an estimated value.
 
 ## Architecture
 
