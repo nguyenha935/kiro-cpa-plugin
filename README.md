@@ -116,7 +116,7 @@ CLIProxyAPI serves plugin resource routes without the management key, so the pag
 | `GET /v0/resource/plugins/kiro-ha/usage` | none | Static shell: layout and one script, identical bytes on every request, no account data. |
 | `GET /v0/management/plugins/kiro/usage/view?lang=&refresh=` | management key | The account table as an HTML fragment. `refresh` names one credential file or `all`. |
 
-The Usage and sign-in pages are available in English, Vietnamese and Simplified Chinese, following the Management Center's language.
+The Usage and sign-in pages are available in English, Vietnamese and Simplified Chinese, following the Management Center's language. The sign-in page is drawn like the Management Center's own OAuth dialog, in the panel's light, white and dark themes.
 
 The shell reads the key the Management Center keeps when it signs in with “Remember password” ticked; otherwise it asks for the key and holds it in memory only. Its Content-Security-Policy admits only its own script by hash and allows network requests to the same origin only, so the injected fragment cannot run code. Results remain in memory for 60 seconds, and a manual reload is limited to one upstream call per account every 10 seconds.
 

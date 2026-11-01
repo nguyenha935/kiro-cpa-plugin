@@ -15,7 +15,7 @@ var usagePageTemplate = template.Must(
 // to the credential route. The shell's CSP admits exactly its own script by
 // hash, so the fragment it injects can never run one.
 var (
-	usageShell       = newShellPage("Kiro Usage", usageShellCSS, usageShellScript, usageShellBody)
+	usageShell       = newShellPage("Kiro Usage", shellBaseCSS+usageShellCSS, usageShellScript, usageShellBody, false)
 	usageShellPage   = usageShell.Body
 	usageShellPolicy = usageShell.Policy
 	usageShellCSP    = usageShell.Header

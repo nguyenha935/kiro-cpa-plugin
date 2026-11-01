@@ -21,9 +21,16 @@ type shellPage struct {
 	Header string
 }
 
-func newShellPage(title, css, script, body string) shellPage {
+// newShellPage builds a page from its whole stylesheet. dataImages admits
+// data: images, which is how the sign-in page shows the plugin's logo; no page
+// loads an image from anywhere else.
+func newShellPage(title, css, script, body string, dataImages bool) shellPage {
 	sum := sha256.Sum256([]byte(script))
-	policy := "default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) +
+	images := ""
+	if dataImages {
+		images = "img-src data:; "
+	}
+	policy := "default-src 'none'; " + images + "style-src 'unsafe-inline'; script-src 'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) +
 		"'; connect-src 'self'; base-uri 'none'; form-action 'none'"
 	page := `<!doctype html>
 <html lang="en" data-theme="dark">
@@ -34,7 +41,7 @@ func newShellPage(title, css, script, body string) shellPage {
 <meta name="referrer" content="no-referrer">
 <title>` + title + `</title>
 <style>
-` + shellBaseCSS + css + `</style>
+` + css + `</style>
 <script>` + script + `</script>
 </head>
 <body>
@@ -64,7 +71,7 @@ func shellResponse(page shellPage) ([]byte, error) {
 	})
 }
 
-// shellBaseCSS is the theme, type scale and controls both pages share.
+// shellBaseCSS is the theme, type scale and controls of the Usage page.
 const shellBaseCSS = `html[data-theme="dark"]{
   color-scheme:dark;
   --page:#141118;--surface:#1c1922;--surface-2:#232029;--text:#f3f0f6;
@@ -179,27 +186,29 @@ const shellCommonScript = `  var COMMON_TEXT = {
     }
   }
 
-  function systemTheme() {
-    return window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
-  }
-
-  function pickTheme() {
-    var asked = params.get('theme');
-    if (asked) {
-      return asked.toLowerCase() === 'light' ? 'light' : 'dark';
+  // pickPanelTheme returns the theme the panel applies: "light" (its default,
+  // no attribute), "white" or "dark". The panel resolves its "auto" to dark
+  // or white by the system setting (src/stores/useThemeStore.ts).
+  function pickPanelTheme() {
+    var asked = (params.get('theme') || '').toLowerCase();
+    if (asked === 'light' || asked === 'white' || asked === 'dark') {
+      return asked;
     }
     var panel = panelRoot();
     if (panel) {
-      return panel.getAttribute('data-theme') === 'dark' ? 'dark' : 'light';
+      var applied = panel.getAttribute('data-theme');
+      return applied === 'dark' || applied === 'white' ? applied : 'light';
     }
     var stored = panelSetting(STORAGE_THEME, 'theme');
-    if (stored === 'dark') {
-      return 'dark';
+    if (stored === 'light' || stored === 'white' || stored === 'dark') {
+      return stored;
     }
-    if (stored === 'light' || stored === 'white') {
-      return 'light';
-    }
-    return systemTheme();
+    return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'white';
+  }
+
+  // pickTheme folds the panel theme into the light and dark of shellBaseCSS.
+  function pickTheme() {
+    return pickPanelTheme() === 'dark' ? 'dark' : 'light';
   }
 
   function pickLang() {
@@ -218,6 +227,7 @@ const shellCommonScript = `  var COMMON_TEXT = {
     return own !== undefined ? own : (COMMON_TEXT[lang] || COMMON_TEXT.en)[key];
   }
   root.setAttribute('data-theme', pickTheme());
+  root.setAttribute('data-panel-theme', pickPanelTheme());
   root.setAttribute('lang', lang);
 
   // storedKey reads the key the panel keeps when "Remember password" is
