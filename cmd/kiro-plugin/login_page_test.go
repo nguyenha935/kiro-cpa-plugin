@@ -124,7 +124,7 @@ func TestLoginPageStringsExistInEveryLanguage(t *testing.T) {
 	}
 	table := loginShellText + shellCommonScript
 	for key := range keys {
-		defined := len(regexp.MustCompile(`(?m)^\s+'?` + regexp.QuoteMeta(key) + `'?: `).FindAllStringIndex(table, -1))
+		defined := len(regexp.MustCompile(`(?m)^\s+'?`+regexp.QuoteMeta(key)+`'?: `).FindAllStringIndex(table, -1))
 		if defined != 3 {
 			t.Errorf("string %q is defined %d times, want once per language", key, defined)
 		}
