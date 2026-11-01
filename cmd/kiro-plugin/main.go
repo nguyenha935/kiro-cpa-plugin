@@ -612,6 +612,12 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 	if err = normalizeAndValidateKiroToken(token); err != nil {
 		return nil, fmt.Errorf("parse Kiro credential: %w", err)
 	}
+	// The host resolves its configured upstream proxy once per parse and hands it
+	// over here. A per-credential value already in the file wins, so a credential
+	// pinned to its own proxy is not rewritten by a later global change.
+	if token.ProxyURL == "" {
+		token.ProxyURL = strings.TrimSpace(req.Host.ProxyURL)
+	}
 	// Only credential kinds that can actually own a profile are put through
 	// discovery. Using a hand-rolled "not an API key and not Builder ID" test
 	// here included social credentials, which listAvailableProfiles refuses, so
@@ -829,6 +835,7 @@ func authData(token *kiroauth.KiroTokenData, fileName string) pluginapi.AuthData
 		ID:               fileName,
 		FileName:         fileName,
 		Label:            label,
+		ProxyURL:         strings.TrimSpace(token.ProxyURL),
 		StorageJSON:      storage,
 		Metadata:         authMetadata(token),
 		Attributes:       authAttributes(token),
@@ -1852,7 +1859,19 @@ func buildCoreAuth(req pluginapi.ExecutorRequest) (*coreauth.Auth, error) {
 	if fileName == "" {
 		fileName = strings.TrimSpace(req.AuthID)
 	}
-	return &coreauth.Auth{ID: req.AuthID, Provider: providerName, Label: "Kiro", FileName: fileName, Storage: &kiroAuthStorage{raw: append([]byte(nil), req.StorageJSON...)}, Metadata: metadata, Attributes: attributes}, nil
+	return &coreauth.Auth{
+		ID:       req.AuthID,
+		Provider: providerName,
+		Label:    "Kiro",
+		FileName: fileName,
+		// The executor reads auth.ProxyURL before it looks at the plugin config, so
+		// rebuilding the auth without it dropped the proxy the host had resolved for
+		// this credential and sent generation straight out.
+		ProxyURL:   strings.TrimSpace(token.ProxyURL),
+		Storage:    &kiroAuthStorage{raw: append([]byte(nil), req.StorageJSON...)},
+		Metadata:   metadata,
+		Attributes: attributes,
+	}, nil
 }
 
 // kiroAuthStorage keeps the original credential schema while allowing CPA's

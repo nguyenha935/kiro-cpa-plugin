@@ -86,6 +86,12 @@ type KiroTokenData struct {
 	DisableCooling    *bool  `json:"disable_cooling,omitempty"`
 	RequestRetry      int    `json:"request_retry,omitempty"`
 	PreferredEndpoint string `json:"preferred_endpoint,omitempty"`
+	// ProxyURL is the upstream proxy resolved for this credential. CPA reports it
+	// as HostConfigSummary.ProxyURL and the executor gives auth.ProxyURL priority
+	// over the environment, so persisting it keeps an explicitly configured proxy
+	// in force even where no HTTP(S)_PROXY is exported. The tag matches
+	// coreauth.Auth.ProxyURL so both sides of the auth file agree on the name.
+	ProxyURL string `json:"proxy_url,omitempty"`
 	// ModelCatalog is the credential's last model listing, persisted so model
 	// registration is answered without a network call.
 	ModelCatalog json.RawMessage            `json:"kiro_model_catalog,omitempty"`

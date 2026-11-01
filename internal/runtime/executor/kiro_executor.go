@@ -128,6 +128,16 @@ var (
 func getKiroPooledHTTPClient() *http.Client {
 	kiroHTTPClientPoolOnce.Do(func() {
 		transport := &http.Transport{
+			// A transport built by hand has no Proxy function, so the pooled client
+			// dialled straight out and ignored the HTTP(S)_PROXY CPA exports for
+			// every provider it drives. Model listing and quota reads go through
+			// http.DefaultTransport and honoured it, so the two halves of the same
+			// credential egressed differently: metadata through the proxy the
+			// operator configured, conversations around it.
+			// An explicit proxy still wins - auth.ProxyURL first, then cfg.ProxyURL -
+			// because newKiroHTTPClientWithPooling resolves those before it falls
+			// back to this client.
+			Proxy: http.ProxyFromEnvironment,
 			// Connection pool settings
 			MaxIdleConns:        100,              // Max idle connections across all hosts
 			MaxIdleConnsPerHost: 20,               // Max idle connections per host
