@@ -60,19 +60,19 @@ func TestShellPagePoliciesPinTheirScripts(t *testing.T) {
 	}
 }
 
-// The page builds the /connect body by hand; every field it sends must be one
+// The form builds the /connect body by hand; every field it sends must be one
 // connectAPIRequest decodes, because the route rejects unknown fields.
-func TestLoginPageSendsOnlyConnectFields(t *testing.T) {
+func TestSignInFormSendsOnlyConnectFields(t *testing.T) {
 	accepted := map[string]bool{}
 	kind := reflect.TypeOf(connectAPIRequest{})
 	for index := 0; index < kind.NumField(); index++ {
 		accepted[strings.Split(kind.Field(index).Tag.Get("json"), ",")[0]] = true
 	}
 	sent := map[string]bool{}
-	for _, match := range regexp.MustCompile(`body\.([a-z_]+) =`).FindAllStringSubmatch(loginShellLogic, -1) {
+	for _, match := range regexp.MustCompile(`body\.([a-z_]+) =`).FindAllStringSubmatch(signInScript, -1) {
 		sent[match[1]] = true
 	}
-	initial := regexp.MustCompile(`var body = \{([^}]*)\}`).FindStringSubmatch(loginShellLogic)
+	initial := regexp.MustCompile(`var body = \{([^}]*)\}`).FindStringSubmatch(signInScript)
 	if initial == nil {
 		t.Fatal("the request body literal is missing")
 	}
@@ -92,58 +92,67 @@ func TestLoginPageSendsOnlyConnectFields(t *testing.T) {
 	}
 }
 
-// Every method /connect accepts has a choice on the page, and a label in each
+// Every method /connect accepts has a choice in the form, and a label in each
 // language.
-func TestLoginPageOffersEveryConnectMethod(t *testing.T) {
+func TestSignInFormOffersEveryConnectMethod(t *testing.T) {
 	var offered []string
-	for _, match := range regexp.MustCompile(`name="method" value="([a-z_-]+)"`).FindAllStringSubmatch(loginShellBody, -1) {
+	for _, match := range regexp.MustCompile(`name="method" value="([a-z_-]+)"`).FindAllStringSubmatch(signInFormBody, -1) {
 		offered = append(offered, match[1])
 	}
 	if strings.Join(offered, ",") != "builder-id,idc,api_key,refresh_token,external_idp" {
 		t.Fatalf("methods offered = %v", offered)
 	}
 	for _, method := range offered {
-		labels := strings.Count(loginShellText, "'m_"+method+"':") + strings.Count(loginShellText, " m_"+method+":")
+		labels := strings.Count(signInText, "'m_"+method+"':") + strings.Count(signInText, " m_"+method+":")
 		if labels != 3 {
 			t.Fatalf("method %s has %d labels, want one per language", method, labels)
 		}
 	}
 }
 
-// Every string the sign-in page asks for exists in each language, either in
-// its own table or in the common one.
-func TestLoginPageStringsExistInEveryLanguage(t *testing.T) {
-	keys := map[string]bool{}
-	for _, pattern := range []string{`data-t="([A-Za-z_-]+)"`, `\bt\('([A-Za-z_-]+)'\)`, `setStatus\('[a-z]+', '([A-Za-z_]+)'\)`} {
-		for _, match := range regexp.MustCompile(pattern).FindAllStringSubmatch(loginShellBody+loginShellLogic, -1) {
-			keys[match[1]] = true
+// Every string a page asks for exists in each language, in exactly one of
+// the tables t() reads: the page's own, the sign-in form's or the common one.
+func TestShellPageStringsExistInEveryLanguage(t *testing.T) {
+	pages := map[string][3]string{
+		"login": {loginShellBody, loginShellLogic, loginShellText},
+		"usage": {usageShellBody, usageShellLogic, usageShellText},
+	}
+	for name, page := range pages {
+		keys := map[string]bool{}
+		source := page[0] + page[1] + signInFormBody + signInScript
+		for _, pattern := range []string{`data-t="([A-Za-z_-]+)"`, `\bt\('([A-Za-z_-]+)'\)`, `setStatus\('[a-z]+', '([A-Za-z_]+)'\)`} {
+			for _, match := range regexp.MustCompile(pattern).FindAllStringSubmatch(source, -1) {
+				keys[match[1]] = true
+			}
 		}
-	}
-	for _, key := range []string{"h_builder-id", "h_idc", "h_api_key", "h_refresh_token", "h_external_idp", "authorize", "add", "copied", "copyFailed", "hide", "show"} {
-		keys[key] = true
-	}
-	table := loginShellText + shellCommonScript
-	for key := range keys {
-		defined := len(regexp.MustCompile(`(?m)^\s+'?`+regexp.QuoteMeta(key)+`'?: `).FindAllStringIndex(table, -1))
-		if defined != 3 {
-			t.Errorf("string %q is defined %d times, want once per language", key, defined)
+		for _, key := range []string{"h_builder-id", "h_idc", "h_api_key", "h_refresh_token", "h_external_idp", "authorize", "add", "copied", "copyFailed", "hide", "show", "working"} {
+			keys[key] = true
+		}
+		table := page[2] + signInText + shellCommonScript
+		for key := range keys {
+			defined := len(regexp.MustCompile(`(?m)^\s+'?`+regexp.QuoteMeta(key)+`'?: `).FindAllStringIndex(table, -1))
+			if defined != 3 {
+				t.Errorf("%s: string %q is defined %d times, want once per language", name, key, defined)
+			}
 		}
 	}
 }
 
-// The sign-in page shows the plugin's logo as a data: image and loads nothing
-// from anywhere; the Usage page admits no image at all.
-func TestLoginPageLoadsNothingButItsLogo(t *testing.T) {
-	if !strings.Contains(loginShell.Policy, "default-src 'none'; img-src data:; ") || strings.Contains(usageShell.Policy, "img-src") {
-		t.Fatalf("image policies: login %q, usage %q", loginShell.Policy, usageShell.Policy)
-	}
-	html := string(loginShell.Body)
-	if strings.Contains(html, "{{") || !strings.Contains(html, `<img src="data:image/png;base64,`) {
-		t.Fatal("the logo or an icon slot was not filled")
-	}
-	for _, banned := range []string{"<link", "@import", "url(", "src=\"http", "src=\"/"} {
-		if strings.Contains(html, banned) {
-			t.Fatalf("the page loads something: %s", banned)
+// Both pages show the plugin's logo in their dialog as a data: image and load
+// nothing from anywhere.
+func TestShellPagesLoadNothingButTheLogo(t *testing.T) {
+	for name, page := range map[string]shellPage{"login": loginShell, "usage": usageShell} {
+		if !strings.Contains(page.Policy, "default-src 'none'; img-src data:; ") {
+			t.Fatalf("%s image policy: %q", name, page.Policy)
+		}
+		html := string(page.Body)
+		if strings.Contains(html, "{{") || !strings.Contains(html, `<img src="data:image/png;base64,`) {
+			t.Fatalf("%s: the logo, an icon or the form slot was not filled", name)
+		}
+		for _, banned := range []string{"<link", "@import", "url(", "src=\"http", "src=\"/"} {
+			if strings.Contains(html, banned) {
+				t.Fatalf("%s loads something: %s", name, banned)
+			}
 		}
 	}
 }

@@ -21,19 +21,15 @@ type shellPage struct {
 	Header string
 }
 
-// newShellPage builds a page from its whole stylesheet. dataImages admits
-// data: images, which is how the sign-in page shows the plugin's logo; no page
-// loads an image from anywhere else.
-func newShellPage(title, css, script, body string, dataImages bool) shellPage {
+// newShellPage builds a page from its whole stylesheet. Both pages show the
+// plugin's logo in their sign-in dialog as a data: image; no page loads an
+// image from anywhere else.
+func newShellPage(title, css, script, body string) shellPage {
 	sum := sha256.Sum256([]byte(script))
-	images := ""
-	if dataImages {
-		images = "img-src data:; "
-	}
-	policy := "default-src 'none'; " + images + "style-src 'unsafe-inline'; script-src 'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) +
+	policy := "default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) +
 		"'; connect-src 'self'; base-uri 'none'; form-action 'none'"
 	page := `<!doctype html>
-<html lang="en" data-theme="dark">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -51,10 +47,10 @@ func newShellPage(title, css, script, body string, dataImages bool) shellPage {
 	return shellPage{Body: []byte(page), Policy: policy, Header: policy + "; frame-ancestors 'self'"}
 }
 
-// shellScript wraps a page's strings and logic around shellCommonScript in one
-// closure. TEXT must come first: the common helpers read it through t().
+// shellScript wraps a page's strings and logic around the common helpers and
+// the sign-in form in one closure. The string tables come first: t() reads them.
 func shellScript(text, logic string) string {
-	return "\n(function () {\n  'use strict';\n" + text + shellCommonScript + "\n" + logic + "})();\n"
+	return "\n(function () {\n  'use strict';\n" + text + signInText + shellCommonScript + "\n" + signInScript + "\n" + logic + "})();\n"
 }
 
 func shellResponse(page shellPage) ([]byte, error) {
@@ -71,63 +67,87 @@ func shellResponse(page shellPage) ([]byte, error) {
 	})
 }
 
-// shellBaseCSS is the theme, type scale and controls of the Usage page.
-const shellBaseCSS = `html[data-theme="dark"]{
-  color-scheme:dark;
-  --page:#141118;--surface:#1c1922;--surface-2:#232029;--text:#f3f0f6;
-  --text-2:#c8c2d2;--muted:#9d96a8;--border:#302b39;--border-2:#3c3646;
-  --accent:#9b7bf7;
-  --ok:#7fd6a9;--ok-bg:#182a22;
-  --warn:#f4c37d;--warn-bg:#2c2418;--warn-line:#5d4a20;
-  --bad:#ffa8bf;--bad-bg:#2c1c24;--bad-line:#60364a;
-  --track:#2a2632;--zebra:#1a1721;--shadow:0 1px 0 rgba(0,0,0,.4),0 18px 46px rgba(0,0,0,.3);
-}
-html[data-theme="light"]{
+// panelBaseCSS is the Management Center's look, shared by both pages: its
+// three themes (src/styles/themes.scss: the default warm paper, white and
+// dark), its type, its pill buttons and its fields. The panel's own default
+// carries no data-theme attribute, so it is the :root block here.
+const panelBaseCSS = `:root{
   color-scheme:light;
-  --page:#f6f4f9;--surface:#ffffff;--surface-2:#f7f5fa;--text:#1a1720;
-  --text-2:#3f3949;--muted:#6b6478;--border:#e4e0ea;--border-2:#d2ccdb;
-  --accent:#6d47e0;
-  --ok:#136b45;--ok-bg:#eaf7f1;
-  --warn:#8a5804;--warn-bg:#fdf4e6;--warn-line:#efdcb6;
-  --bad:#9c1e3b;--bad-bg:#fdeef2;--bad-line:#f1c4d1;
-  --track:#e9e5f0;--zebra:#fbfafd;--shadow:0 1px 0 rgba(26,23,32,.04),0 14px 34px rgba(26,23,32,.07);
+  --bg-secondary:#faf9f5;--bg-primary:#f0eee8;--bg-tertiary:#e9e6df;
+  --text-primary:#2d2a26;--text-secondary:#6d6760;--text-tertiary:#a29c95;
+  --border-color:#e3e1db;--border-primary:#d5d2cb;--border-hover:#cecac4;
+  --primary-color:#8b8680;--ring:rgba(139,134,128,.18);
+  --viz-success:#10b981;--viz-failure:#c65746;
+  --amber:#d97706;--amber-text:#92400e;--failure-text:#c65746;
+  --shadow:0 1px 2px 0 rgb(0 0 0 / .08);--shadow-lg:0 10px 18px -3px rgb(0 0 0 / .1);
+  --font-mono:ui-monospace,"SF Mono","Cascadia Mono","JetBrains Mono","Fira Code",Menlo,Consolas,"Liberation Mono",monospace;
+  --ease:cubic-bezier(.23,1,.32,1);
+}
+html[data-panel-theme="white"]{
+  --bg-secondary:#ffffff;--bg-primary:#ffffff;--bg-tertiary:#f6f6f6;
+  --border-color:#e5e5e5;--border-primary:#d9d9d9;--border-hover:#cccccc;
+}
+html[data-panel-theme="dark"]{
+  color-scheme:dark;
+  --bg-secondary:#151412;--bg-primary:#1d1b18;--bg-tertiary:#262320;
+  --text-primary:#f6f4f1;--text-secondary:#c9c3bb;--text-tertiary:#9c958d;
+  --border-color:#3a3530;--border-primary:#4a453f;--border-hover:#5a544d;
+  --viz-success:#0fae78;--viz-failure:#cf4b3a;
+  --amber:#f59e0b;--amber-text:#fcd34d;--failure-text:#f1b0a6;
+  --shadow:0 1px 3px 0 rgb(0 0 0 / .3);--shadow-lg:0 10px 15px -3px rgb(0 0 0 / .3);
 }
 *{box-sizing:border-box}
-body{
-  margin:0;background:var(--page);color:var(--text);
-  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,Helvetica,Arial,sans-serif;
-  font-size:13px;line-height:1.5;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
-}
 [hidden]{display:none!important}
-h1{margin:0;font-size:17px;line-height:1.3;font-weight:600;letter-spacing:-.01em}
-.intro{margin:2px 0 0;color:var(--muted);font-size:12px}
-.act{
-  display:inline-flex;align-items:center;min-height:26px;padding:0 10px;
-  border:1px solid var(--border-2);border-radius:999px;background:var(--surface);
-  color:var(--text-2);font-size:12px;font-weight:500;text-decoration:none;white-space:nowrap;
+body{
+  margin:0;background:var(--bg-secondary);color:var(--text-primary);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Oxygen,Ubuntu,Cantarell,"Fira Sans","Droid Sans","Helvetica Neue",sans-serif;
+  font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
 }
-.act:hover{border-color:var(--accent);color:var(--text)}
-.act:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
-.act.primary{border-color:var(--bad-line);background:var(--bad-bg);color:var(--bad)}
-button.act{font-family:inherit;line-height:1.5;cursor:pointer}
-button.act:disabled{cursor:progress;opacity:.6}
-.notice{
-  margin:0;padding:8px 11px;border:1px solid var(--bad-line);border-radius:8px;
-  background:var(--bad-bg);color:var(--bad);font-size:12px;
+.i{width:16px;height:16px;flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.alert{
+  margin:0;padding:10px 12px;border:1px solid color-mix(in srgb,var(--viz-failure) 28%,transparent);border-radius:10px;
+  background:color-mix(in srgb,var(--viz-failure) 8%,transparent);color:color-mix(in srgb,var(--viz-failure) 82%,var(--text-primary));
+  font-size:13px;line-height:1.55;overflow-wrap:anywhere;
 }
-/* Shell states: loading, the key prompt and failures, shown before the
-   authenticated fragment arrives or in place of it. */
-.keyform{display:grid;gap:6px;max-width:460px;margin:14px 0 0}
-.keyform label{color:var(--text-2);font-size:12px;font-weight:500}
-.keyrow{display:flex;gap:8px}
-.keyrow input{
-  flex:1 1 auto;min-width:0;min-height:30px;padding:0 10px;border:1px solid var(--border-2);border-radius:8px;
-  background:var(--surface);color:var(--text);font:inherit;
+.pill{
+  display:inline-flex;align-items:center;justify-content:center;gap:7px;flex-shrink:0;height:38px;padding:0 16px;
+  border:1px solid transparent;border-radius:999px;font:inherit;font-size:13px;font-weight:600;line-height:1;
+  white-space:nowrap;text-decoration:none;cursor:pointer;
+  transition:transform 160ms var(--ease),background-color 200ms var(--ease),border-color 200ms var(--ease),box-shadow 200ms var(--ease);
 }
-.keyrow input:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
-.keyhint{margin:0;color:var(--muted);font-size:12px}
-.flash{margin:12px 0 0}
+.pill:focus{outline:none}
+.pill:focus-visible{outline:2px solid var(--primary-color);outline-offset:2px}
+.pill:active:not(:disabled){transform:scale(.97)}
+.pill:disabled{cursor:progress;opacity:.6}
+.primary{background:var(--text-primary);color:var(--bg-secondary)}
+.secondary{border-color:var(--border-primary);background:var(--bg-secondary);color:var(--text-primary)}
+.wide{width:100%}
+.spinner{display:none;width:14px;height:14px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .8s linear infinite}
+.busy .spinner{display:inline-block}
+@keyframes spin{to{transform:rotate(360deg)}}
+input,select,textarea{
+  width:100%;min-width:0;min-height:40px;padding:9px 12px;
+  border:1px solid var(--border-color);border-radius:8px;background:var(--bg-secondary);color:var(--text-primary);
+  font:inherit;font-size:14px;transition:border-color 150ms ease,box-shadow 150ms ease;
+}
+input::placeholder,textarea::placeholder{color:var(--text-tertiary)}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--primary-color);box-shadow:0 0 0 3px var(--ring)}
+textarea{font-family:var(--font-mono);font-size:12px;line-height:1.55;resize:vertical}
 .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+@media (hover:hover) and (pointer:fine){
+  .primary:hover:not(:disabled){background:color-mix(in srgb,var(--text-primary) 86%,var(--bg-secondary));box-shadow:0 10px 22px -10px color-mix(in srgb,var(--text-primary) 45%,transparent)}
+  .secondary:hover:not(:disabled){border-color:var(--border-hover);background:var(--bg-tertiary)}
+}
+/* Touch: every control is at least 44px, and inputs keep 16px text so iOS
+   does not zoom in on focus. */
+@media (pointer:coarse){
+  input,select{min-height:44px;font-size:16px}
+  .pill{height:44px}
+}
+@media (prefers-reduced-motion:reduce){
+  .spinner{animation:none}
+  .pill:active:not(:disabled){transform:none}
+}
 `
 
 // shellCommonScript reads the panel's theme, language and kept management key,
@@ -159,7 +179,10 @@ const shellCommonScript = `  var COMMON_TEXT = {
   var SALT = 'cli-proxy-api-webui::secure-storage';
   var params = new URLSearchParams(window.location.search);
   var root = document.documentElement;
-  var api = window.location.pathname.split('/v0/resource/')[0] + '/v0/management/plugins/kiro/';
+  // base is where this CPA mounts its routes; the plugin's own Management API
+  // routes sit under api, CPA's OAuth session routes under base.
+  var base = window.location.pathname.split('/v0/resource/')[0];
+  var api = base + '/v0/management/plugins/kiro/';
   var memoryKey = '';
 
   // The Usage page is framed by the Management Center and reads its theme and
@@ -206,11 +229,6 @@ const shellCommonScript = `  var COMMON_TEXT = {
     return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'white';
   }
 
-  // pickTheme folds the panel theme into the light and dark of shellBaseCSS.
-  function pickTheme() {
-    return pickPanelTheme() === 'dark' ? 'dark' : 'light';
-  }
-
   function pickLang() {
     var panel = panelRoot();
     var value = params.get('lang') || (panel && panel.getAttribute('lang')) ||
@@ -222,11 +240,18 @@ const shellCommonScript = `  var COMMON_TEXT = {
   }
 
   var lang = pickLang();
+  // t looks a key up in the page's own strings, then the sign-in form's, then
+  // the key prompt's.
   function t(key) {
-    var own = (TEXT[lang] || TEXT.en)[key];
-    return own !== undefined ? own : (COMMON_TEXT[lang] || COMMON_TEXT.en)[key];
+    var tables = [TEXT, SIGNIN_TEXT, COMMON_TEXT];
+    for (var index = 0; index < tables.length; index += 1) {
+      var found = (tables[index][lang] || tables[index].en)[key];
+      if (found !== undefined) {
+        return found;
+      }
+    }
+    return key;
   }
-  root.setAttribute('data-theme', pickTheme());
   root.setAttribute('data-panel-theme', pickPanelTheme());
   root.setAttribute('lang', lang);
 
@@ -269,8 +294,9 @@ const shellCommonScript = `  var COMMON_TEXT = {
     }
   }
 
-  // request calls a plugin Management API route with the management key. A
-  // 401 forgets a typed key and rejects with needKey, so the page can ask again.
+  // request calls a Management API route with the management key: a relative
+  // path is one of the plugin's routes, an absolute one a CPA route. A 401
+  // forgets a typed key and rejects with needKey, so the page can ask again.
   function request(path, options) {
     var key = currentKey();
     if (!key) {
@@ -280,7 +306,7 @@ const shellCommonScript = `  var COMMON_TEXT = {
     options.headers.Authorization = 'Bearer ' + key;
     options.cache = 'no-store';
     options.credentials = 'omit';
-    return window.fetch(api + path, options).then(function (response) {
+    return window.fetch((path.charAt(0) === '/' ? base : api) + path, options).then(function (response) {
       if (response.status === 401) {
         memoryKey = '';
         throw { needKey: true, rejected: true };

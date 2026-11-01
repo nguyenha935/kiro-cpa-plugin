@@ -36,9 +36,7 @@ func (text usagePageText) get(key string) string {
 
 var usagePageTextPacks = map[string]usagePageText{
 	usageLangEN: {
-		"title":                 "Kiro Usage",
-		"intro":                 "Subscription usage reported by Kiro for each connected account.",
-		"empty":                 "No Kiro accounts are connected. Add one from OAuth Login.",
+		"empty":                 "No Kiro accounts are connected yet.",
 		"col_overage":           "Overage",
 		"col_overage_sub":       "cap · rate · charged",
 		"total_row":             "Total",
@@ -93,6 +91,7 @@ var usagePageTextPacks = map[string]usagePageText{
 		"stat_accounts":         "Accounts",
 		"stat_active":           "Reporting",
 		"stat_attention":        "Needs attention",
+		"stat_disabled":         "Disabled",
 		"stat_generated":        "Generated",
 		"state_active":          "Active",
 		"state_disabled":        "Disabled",
@@ -129,19 +128,17 @@ var usagePageTextPacks = map[string]usagePageText{
 		"err_no_buckets":        "Kiro did not return a usage bucket for this account.",
 		"err_list_failed":       "CLIProxyAPI could not list connected accounts.",
 		"err_unavailable":       "This credential is currently unavailable.",
-		"err_rejected":          "Kiro rejected this session. Sign in again from OAuth Login.",
+		"err_rejected":          "Kiro rejected this session. Sign in again.",
 		"err_expired":           "The access token has expired and CLIProxyAPI has not renewed it yet. Sign in again if this persists.",
 		"err_rate_limited":      "Kiro rate-limited the usage request. Try again later.",
 		"err_upstream":          "Kiro usage is temporarily unavailable.",
 		"err_generic":           "Usage could not be loaded for this account.",
 		"action_refresh":        "Reload quota",
-		"action_refresh_all":    "Reload all quotas",
+		"action_add":            "Add account",
 		"action_relogin":        "Sign in again",
 	},
 	usageLangVI: {
-		"title":                 "Hạn mức Kiro",
-		"intro":                 "Mức sử dụng gói Kiro báo về cho từng tài khoản đã kết nối.",
-		"empty":                 "Chưa có tài khoản Kiro nào được kết nối. Thêm ở trang OAuth Login.",
+		"empty":                 "Chưa có tài khoản Kiro nào được kết nối.",
 		"col_overage":           "Vượt hạn",
 		"col_overage_sub":       "trần · đơn giá · đã tính",
 		"total_row":             "Tổng",
@@ -196,6 +193,7 @@ var usagePageTextPacks = map[string]usagePageText{
 		"stat_accounts":         "Tài khoản",
 		"stat_active":           "Đang báo về",
 		"stat_attention":        "Cần xem lại",
+		"stat_disabled":         "Đã tắt",
 		"stat_generated":        "Kết xuất lúc",
 		"state_active":          "Hoạt động",
 		"state_disabled":        "Đã tắt",
@@ -232,19 +230,17 @@ var usagePageTextPacks = map[string]usagePageText{
 		"err_no_buckets":        "Kiro không trả về hạn mức nào cho tài khoản này.",
 		"err_list_failed":       "CLIProxyAPI không liệt kê được các tài khoản đã kết nối.",
 		"err_unavailable":       "Credential này hiện không khả dụng.",
-		"err_rejected":          "Kiro từ chối phiên này. Đăng nhập lại ở trang OAuth Login.",
+		"err_rejected":          "Kiro từ chối phiên này. Hãy đăng nhập lại.",
 		"err_expired":           "Access token đã hết hạn và CLIProxyAPI chưa làm mới. Nếu lỗi còn lặp lại, hãy đăng nhập lại.",
 		"err_rate_limited":      "Kiro đã chặn vì gọi quá nhiều. Thử lại sau.",
 		"err_upstream":          "Hạn mức Kiro tạm thời không đọc được.",
 		"err_generic":           "Không tải được hạn mức cho tài khoản này.",
 		"action_refresh":        "Tải lại quota",
-		"action_refresh_all":    "Tải lại tất cả",
+		"action_add":            "Thêm tài khoản",
 		"action_relogin":        "Đăng nhập lại",
 	},
 	usageLangZH: {
-		"title":                 "Kiro 用量",
-		"intro":                 "Kiro 为每个已连接账户报告的订阅用量。",
-		"empty":                 "尚未连接 Kiro 账户。请在 OAuth 登录页添加。",
+		"empty":                 "尚未连接 Kiro 账户。",
 		"col_overage":           "超额",
 		"col_overage_sub":       "上限 · 单价 · 已计费",
 		"total_row":             "合计",
@@ -299,6 +295,7 @@ var usagePageTextPacks = map[string]usagePageText{
 		"stat_accounts":         "账户",
 		"stat_active":           "正常报告",
 		"stat_attention":        "需要处理",
+		"stat_disabled":         "已停用",
 		"stat_generated":        "生成于",
 		"state_active":          "正常",
 		"state_disabled":        "已停用",
@@ -335,13 +332,13 @@ var usagePageTextPacks = map[string]usagePageText{
 		"err_no_buckets":        "Kiro 未返回该账户的用量数据。",
 		"err_list_failed":       "CLIProxyAPI 无法列出已连接的账户。",
 		"err_unavailable":       "该凭证当前不可用。",
-		"err_rejected":          "Kiro 拒绝了此会话。请在 OAuth 登录页重新登录。",
+		"err_rejected":          "Kiro 拒绝了此会话。请重新登录。",
 		"err_expired":           "访问令牌已过期，CLIProxyAPI 尚未续期。如持续出现，请重新登录。",
 		"err_rate_limited":      "Kiro 限制了用量请求的频率。请稍后再试。",
 		"err_upstream":          "Kiro 用量暂时无法读取。",
 		"err_generic":           "无法加载该账户的用量。",
 		"action_refresh":        "刷新额度",
-		"action_refresh_all":    "全部刷新",
+		"action_add":            "添加账户",
 		"action_relogin":        "重新登录",
 	},
 }
@@ -380,6 +377,7 @@ type usagePageSummary struct {
 	Accounts  int
 	Reporting int
 	Attention int
+	Disabled  int
 }
 
 // usagePageTotals adds the same-named figure across every account, so the page
@@ -505,6 +503,8 @@ func newUsagePageView(accounts []usageAccountView, options usagePageOptions, gen
 	summary := usagePageSummary{Accounts: len(accounts)}
 	for _, account := range accounts {
 		switch {
+		case account.StateKey == usageStateDisabled:
+			summary.Disabled++
 		case usageNeedsAttention(account):
 			summary.Attention++
 		case len(account.Buckets) > 0:
@@ -611,6 +611,10 @@ func usagePageFuncs(text usagePageText) template.FuncMap {
 			return &account.Buckets[0]
 		},
 		"lower":          strings.ToLower,
+		"accountGroup":   usageAccountGroup,
+		"planBucket":     usagePlanBucket,
+		"searchText":     usageSearchText,
+		"signInMethod":   usageSignInMethod,
 		"displayName":    usageDisplayName,
 		"needsAttention": usageNeedsAttention,
 		// isAddress keeps the account fact to a real address AWS reported; a bare
@@ -645,5 +649,56 @@ func usagePageFuncs(text usagePageText) template.FuncMap {
 			}
 			return account.Error
 		},
+	}
+}
+
+// usageAccountGroup names the toolbar filter an account falls under.
+func usageAccountGroup(account usageAccountView) string {
+	switch {
+	case account.StateKey == usageStateDisabled:
+		return "disabled"
+	case usageNeedsAttention(account):
+		return "attention"
+	default:
+		return "active"
+	}
+}
+
+// usagePlanBucket returns the account's plan pool, the one its share, remaining
+// and reset sort on, or nil when AWS reported none.
+func usagePlanBucket(account usageAccountView) *usageBucketView {
+	for index := range account.Buckets {
+		if account.Buckets[index].Kind == usageKindPlan && account.Buckets[index].HasShare {
+			return &account.Buckets[index]
+		}
+	}
+	return nil
+}
+
+// usageSearchText is what the toolbar's search matches: the names a reader
+// knows an account by. The address is only included when the detail row
+// shows it too.
+func usageSearchText(account usageAccountView) string {
+	candidates := []string{usageDisplayName(account), account.Label, account.Note, account.Plan}
+	if looksLikeEmail(account.Account) {
+		candidates = append(candidates, account.Account)
+	}
+	parts := make([]string, 0, len(candidates))
+	for _, part := range candidates {
+		if part = strings.TrimSpace(part); part != "" {
+			parts = append(parts, part)
+		}
+	}
+	return strings.ToLower(strings.Join(parts, " "))
+}
+
+// usageSignInMethod preselects the dialog's method for "Sign in again". An
+// imported or unknown credential leaves the choice to the reader.
+func usageSignInMethod(method string) string {
+	switch normalized := strings.ToLower(strings.TrimSpace(method)); normalized {
+	case "builder-id", "idc", "api_key", "external_idp":
+		return normalized
+	default:
+		return ""
 	}
 }

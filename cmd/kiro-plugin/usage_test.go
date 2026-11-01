@@ -1811,7 +1811,7 @@ func TestUsagePageRendersEveryCreditPoolAsItsOwnRow(t *testing.T) {
 	if rows := strings.Count(html, `<tr class="row"`); rows != 4 {
 		t.Fatalf("want one row per credit pool, got %d", rows)
 	}
-	if !strings.Contains(html, `rowspan="4"`) || strings.Count(html, "first@example.com") != 1 {
+	if !strings.Contains(html, `rowspan="4"`) || strings.Count(html, `<span class="label">first@example.com</span>`) != 1 {
 		t.Fatalf("the account must be named once, spanning its pools: %s", html)
 	}
 	for _, name := range []string{">Credits<", ">Free trial<", ">Bonus credits<", ">Overage credits<"} {
@@ -1898,12 +1898,10 @@ func TestUsagePageHighlightsTheWholeAccountNotOneRow(t *testing.T) {
 	if strings.Contains(usageShellCSS, "\ntr.row:hover>td{") {
 		t.Fatal("the per-row hover is back")
 	}
-	// The stripe must be declared before the highlight, or an even group would
-	// keep its zebra colour while hovered.
-	zebra := strings.Index(usageShellCSS, "tbody.account:nth-of-type(even)>tr.row>td{background:var(--zebra)}")
-	hover := strings.Index(usageShellCSS, "tbody.account:hover>tr.row>td")
-	if zebra < 0 || hover < 0 || zebra > hover {
-		t.Fatalf("the zebra stripe must be declared before the highlight (zebra=%d hover=%d)", zebra, hover)
+	// No zebra stripe: the toolbar hides groups, and :nth-of-type still counts
+	// a hidden group, so a stripe would alternate wrongly under every filter.
+	if strings.Contains(usageShellCSS, "nth-of-type") {
+		t.Fatal("a positional stripe is back")
 	}
 	// Both rows carry the same target, so a pointer or a keyboard on either one
 	// reports the same expanded state.
