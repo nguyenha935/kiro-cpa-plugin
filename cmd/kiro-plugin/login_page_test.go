@@ -109,3 +109,41 @@ func TestLoginPageOffersEveryConnectMethod(t *testing.T) {
 		}
 	}
 }
+
+// Every string the sign-in page asks for exists in each language, either in
+// its own table or in the common one.
+func TestLoginPageStringsExistInEveryLanguage(t *testing.T) {
+	keys := map[string]bool{}
+	for _, pattern := range []string{`data-t="([A-Za-z_-]+)"`, `\bt\('([A-Za-z_-]+)'\)`, `setStatus\('[a-z]+', '([A-Za-z_]+)'\)`} {
+		for _, match := range regexp.MustCompile(pattern).FindAllStringSubmatch(loginShellBody+loginShellLogic, -1) {
+			keys[match[1]] = true
+		}
+	}
+	for _, key := range []string{"h_builder-id", "h_idc", "h_api_key", "h_refresh_token", "h_external_idp", "authorize", "add", "copied", "copyFailed", "hide", "show"} {
+		keys[key] = true
+	}
+	table := loginShellText + shellCommonScript
+	for key := range keys {
+		defined := len(regexp.MustCompile(`(?m)^\s+'?`+regexp.QuoteMeta(key)+`'?: `).FindAllStringIndex(table, -1))
+		if defined != 3 {
+			t.Errorf("string %q is defined %d times, want once per language", key, defined)
+		}
+	}
+}
+
+// The sign-in page shows the plugin's logo as a data: image and loads nothing
+// from anywhere; the Usage page admits no image at all.
+func TestLoginPageLoadsNothingButItsLogo(t *testing.T) {
+	if !strings.Contains(loginShell.Policy, "default-src 'none'; img-src data:; ") || strings.Contains(usageShell.Policy, "img-src") {
+		t.Fatalf("image policies: login %q, usage %q", loginShell.Policy, usageShell.Policy)
+	}
+	html := string(loginShell.Body)
+	if strings.Contains(html, "{{") || !strings.Contains(html, `<img src="data:image/png;base64,`) {
+		t.Fatal("the logo or an icon slot was not filled")
+	}
+	for _, banned := range []string{"<link", "@import", "url(", "src=\"http", "src=\"/"} {
+		if strings.Contains(html, banned) {
+			t.Fatalf("the page loads something: %s", banned)
+		}
+	}
+}
