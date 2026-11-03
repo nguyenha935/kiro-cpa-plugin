@@ -20,7 +20,7 @@ The plugin:
 
 ## Requirements
 
-- CLIProxyAPI 7.2.151 or later (built against plugin SDK v7.2.151, RPC schema 5; runs in production on 8.0.29)
+- CLIProxyAPI 7.2.151 or later (built against plugin SDK v7.2.151, RPC schema 5; runs in production on 8.0.42)
 - Windows amd64, Linux amd64, Linux arm64, macOS amd64, or macOS arm64
 - Go 1.26
 - A C compiler available to CGO
@@ -45,19 +45,28 @@ The library is named `kiro-ha` because CLIProxyAPI derives the plugin ID from th
 
 ## Install
 
-Stop CLIProxyAPI before replacing the plugin. Back up the existing binary and configuration, then copy `kiro-ha.dll` on Windows or `kiro-ha.so` on Linux to the configured plugin directory. When upgrading from a build named `kiro.so`, move the old file out of the plugin directory first: two libraries registering the same provider are both loaded and the later one silently wins.
+CLIProxyAPI looks for plugins in `<plugins.dir>/<os>/<arch>` (for example `plugins/linux/amd64`), then in `<plugins.dir>` itself, and takes the plugin ID from the file name.
 
-```yaml
-plugins:
-  enabled: true
-  dir: plugins
-  configs:
-    kiro-ha:
-      enabled: true
-      priority: 1
-```
+1. Stop CLIProxyAPI. CPA does not notice a file replaced under the same name while it runs, so a new build takes effect only after a restart.
+2. Back up the existing binary and `config.yaml`.
+3. Check the downloaded archive against the release's `checksums.txt` (`sha256sum -c --ignore-missing checksums.txt`), then copy `kiro-ha.so` on Linux, `kiro-ha.dll` on Windows or `kiro-ha.dylib` on macOS into the plugin directory.
+4. Enable the plugin in `config.yaml`:
 
-Restart CLIProxyAPI. Every sign-in method is stored as a standard CPA Authentication File; API keys are deliberately not stored in `config.yaml`.
+   ```yaml
+   plugins:
+     enabled: true
+     dir: plugins
+     configs:
+       kiro-ha:
+         enabled: true
+         priority: 1
+   ```
+
+5. Start CLIProxyAPI. The log shows `plugin registered plugin_id=kiro-ha plugin_name=Kiro version=<version>`.
+
+When upgrading from a build named `kiro.so`, move the old file out of the plugin directory first: two libraries registering the same provider are both loaded and the later one silently wins. To roll back, put the backed-up binary back under the same name and restart CLIProxyAPI.
+
+Every sign-in method is stored as a standard CPA Authentication File; API keys are deliberately not stored in `config.yaml`.
 
 ### Sign in
 
