@@ -587,6 +587,52 @@ func TestCarryHostOwnedFieldsRestoresARebuiltCredential(t *testing.T) {
 	}
 }
 
+// A proxy_url an operator writes into the credential is a typed field now, so it
+// no longer rides in Extra. decodeKiroCredential takes it out of the unknown-key
+// map and no transport branch returns it, so without a carry the first refresh
+// rebuilds the credential without the operator's proxy and handleRefreshAuth
+// writes that back, erasing it from the file.
+func TestCarryHostOwnedFieldsKeepsAnOperatorSetProxyURL(t *testing.T) {
+	stored, err := decodeToken([]byte(`{"type":"kiro","authMethod":"idc","accessToken":"stored-access","proxy_url":"http://proxy.example:3128"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ProxyURL != "http://proxy.example:3128" {
+		t.Fatalf("proxy_url was not decoded as a field: %q", stored.ProxyURL)
+	}
+	if _, alsoInExtra := stored.Extra["proxy_url"]; alsoInExtra {
+		t.Fatal("a typed proxy_url must not also ride in Extra")
+	}
+
+	// This is the shape a refresh returns: token material only.
+	refreshed := &kiroauth.KiroTokenData{AccessToken: "new", RefreshToken: "new-refresh", AuthMethod: "idc"}
+	carryHostOwnedFields(stored, refreshed)
+	if refreshed.ProxyURL != "http://proxy.example:3128" {
+		t.Fatalf("carry dropped the operator's proxy: %q", refreshed.ProxyURL)
+	}
+
+	// What handleRefreshAuth publishes is AuthData.StorageJSON, so that is where
+	// the erasure showed up.
+	data := authData(refreshed, "kiro-idc-proxy.json")
+	var persisted map[string]any
+	if err := json.Unmarshal(data.StorageJSON, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted["proxy_url"] != "http://proxy.example:3128" {
+		t.Fatalf("refresh erased the operator's proxy from the credential: %#v", persisted)
+	}
+	if data.ProxyURL != "http://proxy.example:3128" {
+		t.Fatalf("AuthData.ProxyURL = %q, want the credential's proxy", data.ProxyURL)
+	}
+
+	// A proxy the refresh itself resolved wins over the stored one.
+	rotated := &kiroauth.KiroTokenData{AccessToken: "newer", ProxyURL: "http://rotated.example:8080"}
+	carryHostOwnedFields(stored, rotated)
+	if rotated.ProxyURL != "http://rotated.example:8080" {
+		t.Fatalf("carry overwrote a value the refresh returned: %q", rotated.ProxyURL)
+	}
+}
+
 // An OIDC refresh returns token material only, so the rebuilt credential has
 // none of the fields AWS reported earlier. The display label is derived from
 // those fields, and losing them on every refresh turned 35 distinct Builder ID

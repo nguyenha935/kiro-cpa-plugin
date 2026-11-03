@@ -7,6 +7,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -247,4 +250,79 @@ func TestDeadHTTP2ConnectionIsNotReused(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The pooled client is the one every Kiro conversation goes through, and its
+// transport is built by hand. A hand-built transport carries no Proxy function,
+// so it never consults HTTP(S)_PROXY: generation egressed straight out while
+// model listing and quota reads, which run on http.DefaultTransport, went
+// through the proxy the operator had set. Same credential, two routes.
+func TestPooledTransportConsultsTheEnvironmentProxy(t *testing.T) {
+	t.Parallel()
+
+	transport, ok := getKiroPooledHTTPClient().Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("pooled transport is %T", getKiroPooledHTTPClient().Transport)
+	}
+	if transport.Proxy == nil {
+		t.Fatal("pooled transport has no Proxy function, so a credential never reaches the HTTP(S)_PROXY the operator set")
+	}
+}
+
+const (
+	proxyProbeEnv    = "KIRO_POOLED_PROXY_PROBE"
+	proxyProbePrefix = "PROXY="
+)
+
+// The check above also passes for a Proxy function that always answers nil, so
+// this one makes the pooled transport resolve a Kiro URL in a fresh process,
+// where net/http has not cached the environment yet. Go reads the proxy
+// variables once per process, so the probe cannot run inside this one.
+func TestPooledTransportResolvesTheEnvironmentProxy(t *testing.T) {
+	if os.Getenv(proxyProbeEnv) == "1" {
+		transport, ok := getKiroPooledHTTPClient().Transport.(*http.Transport)
+		if !ok || transport.Proxy == nil {
+			t.Fatalf("pooled transport has no Proxy function (type %T)", getKiroPooledHTTPClient().Transport)
+		}
+		req, err := http.NewRequest(http.MethodPost,
+			"https://q.us-east-1.amazonaws.com/generateAssistantResponse", nil)
+		if err != nil {
+			t.Fatalf("build probe request: %v", err)
+		}
+		resolved, err := transport.Proxy(req)
+		if err != nil {
+			t.Fatalf("resolve proxy: %v", err)
+		}
+		if resolved == nil {
+			t.Fatal("pooled transport resolved no proxy for a request that HTTPS_PROXY covers")
+		}
+		os.Stdout.WriteString(proxyProbePrefix + resolved.String())
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestPooledTransportResolvesTheEnvironmentProxy$")
+	cmd.Env = append(withoutProxyEnv(os.Environ()), proxyProbeEnv+"=1", "HTTPS_PROXY=http://proxy.example:3128")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("probe process failed: %v\n%s", err, out)
+	}
+	if want := proxyProbePrefix + "http://proxy.example:3128"; !strings.Contains(string(out), want) {
+		t.Fatalf("pooled transport did not resolve HTTPS_PROXY; wanted %q in:\n%s", want, out)
+	}
+}
+
+// withoutProxyEnv drops the proxy variables this process carries so the probe
+// sees only the ones it sets: a leftover NO_PROXY would mask the value under
+// test, and a duplicate key would leave which copy wins to the child's getenv.
+func withoutProxyEnv(env []string) []string {
+	kept := make([]string, 0, len(env))
+	for _, entry := range env {
+		name := strings.ToUpper(strings.SplitN(entry, "=", 2)[0])
+		switch name {
+		case "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY":
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	return kept
 }

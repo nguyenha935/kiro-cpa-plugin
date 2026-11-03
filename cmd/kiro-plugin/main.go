@@ -829,6 +829,7 @@ func authData(token *kiroauth.KiroTokenData, fileName string) pluginapi.AuthData
 		ID:               fileName,
 		FileName:         fileName,
 		Label:            label,
+		ProxyURL:         strings.TrimSpace(token.ProxyURL),
 		StorageJSON:      storage,
 		Metadata:         authMetadata(token),
 		Attributes:       authAttributes(token),
@@ -1852,7 +1853,19 @@ func buildCoreAuth(req pluginapi.ExecutorRequest) (*coreauth.Auth, error) {
 	if fileName == "" {
 		fileName = strings.TrimSpace(req.AuthID)
 	}
-	return &coreauth.Auth{ID: req.AuthID, Provider: providerName, Label: "Kiro", FileName: fileName, Storage: &kiroAuthStorage{raw: append([]byte(nil), req.StorageJSON...)}, Metadata: metadata, Attributes: attributes}, nil
+	return &coreauth.Auth{
+		ID:       req.AuthID,
+		Provider: providerName,
+		Label:    "Kiro",
+		FileName: fileName,
+		// The executor reads auth.ProxyURL before it looks at the plugin config, so
+		// rebuilding the auth without it dropped the proxy the host had resolved for
+		// this credential and sent generation straight out.
+		ProxyURL:   strings.TrimSpace(token.ProxyURL),
+		Storage:    &kiroAuthStorage{raw: append([]byte(nil), req.StorageJSON...)},
+		Metadata:   metadata,
+		Attributes: attributes,
+	}, nil
 }
 
 // kiroAuthStorage keeps the original credential schema while allowing CPA's
