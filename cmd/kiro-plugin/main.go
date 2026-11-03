@@ -612,12 +612,6 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 	if err = normalizeAndValidateKiroToken(token); err != nil {
 		return nil, fmt.Errorf("parse Kiro credential: %w", err)
 	}
-	// The host resolves its configured upstream proxy once per parse and hands it
-	// over here. A per-credential value already in the file wins, so a credential
-	// pinned to its own proxy is not rewritten by a later global change.
-	if token.ProxyURL == "" {
-		token.ProxyURL = strings.TrimSpace(req.Host.ProxyURL)
-	}
 	// Only credential kinds that can actually own a profile are put through
 	// discovery. Using a hand-rolled "not an API key and not Builder ID" test
 	// here included social credentials, which listAvailableProfiles refuses, so
