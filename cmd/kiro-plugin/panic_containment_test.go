@@ -80,7 +80,7 @@ func TestUsageFanOutPanicIsContained(t *testing.T) {
 			}
 			return errorEnvelope("unexpected", method), nil
 		}
-		usageHTTPClient = func() httpDoer {
+		usageHTTPClient = func(string) httpDoer {
 			return httpDoerFunc(func(*http.Request) (*http.Response, error) { panic("defect in usage parsing") })
 		}
 		accounts := collectUsageAccounts(context.Background(), "")

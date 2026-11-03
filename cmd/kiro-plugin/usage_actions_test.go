@@ -66,7 +66,7 @@ func usageFixture(t *testing.T) (*int, map[string]map[string]any) {
 		}
 	}
 	calls := 0
-	usageHTTPClient = func() httpDoer {
+	usageHTTPClient = func(string) httpDoer {
 		return httpDoerFunc(func(*http.Request) (*http.Response, error) {
 			mu.Lock()
 			calls++

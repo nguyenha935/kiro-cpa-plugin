@@ -47,8 +47,8 @@ var (
 		identities  map[string]usageIdentity
 	}{cache: make(map[string]usageCacheEntry), lastRefresh: make(map[string]time.Time), identities: make(map[string]usageIdentity)}
 	usageNow        = func() time.Time { return time.Now().UTC() }
-	usageHTTPClient = func() httpDoer {
-		return &http.Client{Timeout: usageRequestTimeout}
+	usageHTTPClient = func(proxyURL string) httpDoer {
+		return credentialHTTPClient(proxyURL, usageRequestTimeout)
 	}
 	usageHostCall = hostCall
 )
@@ -461,7 +461,7 @@ func refreshKiroCredentialTransport(ctx context.Context, token *kiroauth.KiroTok
 	if err := validateRegion(token.Region); err != nil {
 		return nil, err
 	}
-	client := kiroauth.NewSSOOIDCClient(pluginConfig)
+	client := credentialOIDCClient(token.ProxyURL)
 	refreshed, err := client.RefreshTokenWithRegion(ctx, token.ClientID, token.ClientSecret, token.RefreshToken, token.Region, token.StartURL)
 	if err != nil {
 		status := http.StatusBadGateway
@@ -512,7 +512,7 @@ func isDesktopImportedCredential(token *kiroauth.KiroTokenData) bool {
 // not return. method is fixed by the caller because it is what routes the next
 // refresh back here instead of to AWS SSO OIDC.
 func refreshDesktopCredential(ctx context.Context, token *kiroauth.KiroTokenData, method string) (*kiroauth.KiroTokenData, error) {
-	rotated, err := desktopTokenRefresher(ctx, token.RefreshToken, token.Region)
+	rotated, err := desktopTokenRefresher(ctx, token.ProxyURL, token.RefreshToken, token.Region)
 	if err != nil {
 		return nil, err
 	}
@@ -548,7 +548,7 @@ func refreshExternalIDP(ctx context.Context, token *kiroauth.KiroTokenData) (*ki
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	resp, err := credentialHTTPClient(token.ProxyURL, credentialRequestTimeout).Do(req)
 	if err != nil {
 		return nil, pluginStatusError{status: http.StatusBadGateway, message: "refresh external_idp token: " + err.Error()}
 	}
@@ -832,7 +832,7 @@ func fetchUsageForCredential(ctx context.Context, credential usageCredential) (u
 	if accessTokenExpired(token, usageNow()) {
 		return usageAccountView{Label: label}, errUsageTokenExpired
 	}
-	usage, err := requestUsageLimits(ctx, usageHTTPClient(), token)
+	usage, err := requestUsageLimits(ctx, usageHTTPClient(token.ProxyURL), token)
 	if err != nil {
 		return usageAccountView{Label: label}, err
 	}
@@ -1211,7 +1211,7 @@ func discoverProfileName(ctx context.Context, token *kiroauth.KiroTokenData) str
 	if err != nil {
 		return ""
 	}
-	profiles, err := usageProfileLister(ctx, &http.Client{Timeout: usageRequestTimeout}, endpoint, token.AccessToken)
+	profiles, err := usageProfileLister(ctx, credentialHTTPClient(token.ProxyURL, usageRequestTimeout), endpoint, token.AccessToken)
 	if err != nil {
 		log.Printf("kiro: profile name discovery unavailable: %v", err)
 		return ""

@@ -1477,7 +1477,7 @@ func listAvailableModels(ctx context.Context, token *kiroauth.KiroTokenData) ([]
 		if err != nil {
 			return nil, err
 		}
-		resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+		resp, err := credentialHTTPClient(token.ProxyURL, credentialRequestTimeout).Do(req)
 		if err != nil {
 			return nil, pluginStatusError{status: http.StatusBadGateway, message: "list Kiro models: " + err.Error()}
 		}
@@ -1643,7 +1643,7 @@ func reconcileProfile(ctx context.Context, token *kiroauth.KiroTokenData) error 
 		return errors.New("no Kiro region is available to search for a profile")
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := credentialHTTPClient(token.ProxyURL, credentialRequestTimeout)
 	searched := make([]string, 0, len(regions))
 	var firstErr error
 	for _, region := range regions {
@@ -1724,7 +1724,7 @@ func reconcileIdentityBestEffort(ctx context.Context, token *kiroauth.KiroTokenD
 	if token == nil || strings.TrimSpace(token.AccessToken) == "" {
 		return
 	}
-	if usage, err := requestUsageLimits(ctx, usageHTTPClient(), token); err == nil {
+	if usage, err := requestUsageLimits(ctx, usageHTTPClient(token.ProxyURL), token); err == nil {
 		if email := strings.TrimSpace(usage.UserInfo.Email); looksLikeEmail(email) {
 			token.Email = email
 		}

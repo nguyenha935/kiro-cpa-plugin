@@ -189,7 +189,7 @@ func TestRefreshExternalIDPSendsConfidentialClientSecret(t *testing.T) {
 // credential was stored with must come through untouched.
 func TestRefreshSocialCredentialUsesKiroAuthServiceAndKeepsStoredFields(t *testing.T) {
 	originalRefresher := desktopTokenRefresher
-	desktopTokenRefresher = func(_ context.Context, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
+	desktopTokenRefresher = func(_ context.Context, _, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
 		if refreshToken != "social-refresh" || region != "eu-west-1" {
 			t.Fatalf("desktop refresh input = %q/%q", refreshToken, region)
 		}
@@ -221,7 +221,7 @@ func TestRefreshSocialCredentialUsesKiroAuthServiceAndKeepsStoredFields(t *testi
 
 func TestRefreshImportedDesktopCredentialUsesKiroAuthService(t *testing.T) {
 	originalRefresher := desktopTokenRefresher
-	desktopTokenRefresher = func(_ context.Context, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
+	desktopTokenRefresher = func(_ context.Context, _, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
 		if refreshToken != "aorAAAAAG-imported" || region != "us-east-1" {
 			t.Fatalf("desktop refresh input = %q/%q", refreshToken, region)
 		}
@@ -325,7 +325,7 @@ func TestCollectUsageAccountsIsolatesAccountsAndFailures(t *testing.T) {
 			return errorEnvelope("unexpected", method), nil
 		}
 	}
-	usageHTTPClient = func() httpDoer {
+	usageHTTPClient = func(string) httpDoer {
 		return httpDoerFunc(func(request *http.Request) (*http.Response, error) {
 			if request.URL.Query().Get("profileArn") == "profile-two" {
 				return &http.Response{StatusCode: http.StatusTooManyRequests, Body: io.NopCloser(strings.NewReader(`{"message":"limited"}`)), Header: make(http.Header)}, nil
@@ -392,7 +392,7 @@ func TestCollectUsageAccountsDeduplicatesCredentialIdentity(t *testing.T) {
 	}
 	var requestMu sync.Mutex
 	requestCount := 0
-	usageHTTPClient = func() httpDoer {
+	usageHTTPClient = func(string) httpDoer {
 		return httpDoerFunc(func(request *http.Request) (*http.Response, error) {
 			requestMu.Lock()
 			requestCount++
@@ -443,7 +443,7 @@ func TestUsageLeavesAnExpiredTokenToCPA(t *testing.T) {
 		}
 		return okEnvelope(pluginapi.HostAuthGetResponse{AuthIndex: "a", Name: "a.json", JSON: stored})
 	}
-	usageHTTPClient = func() httpDoer {
+	usageHTTPClient = func(string) httpDoer {
 		return httpDoerFunc(func(*http.Request) (*http.Response, error) {
 			t.Fatal("usage was requested with an expired token")
 			return nil, nil
@@ -480,7 +480,7 @@ func TestConcurrentUsageReadsShareOneRequest(t *testing.T) {
 		}
 		return okEnvelope(pluginapi.HostAuthGetResponse{AuthIndex: "shared", Name: "shared.json", JSON: stored})
 	}
-	usageHTTPClient = func() httpDoer {
+	usageHTTPClient = func(string) httpDoer {
 		return httpDoerFunc(func(request *http.Request) (*http.Response, error) {
 			mu.Lock()
 			requests++
@@ -514,7 +514,7 @@ func resetUsageState() {
 
 func TestDesktopRefreshPreservesHostOwnedFields(t *testing.T) {
 	originalRefresher := desktopTokenRefresher
-	desktopTokenRefresher = func(_ context.Context, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
+	desktopTokenRefresher = func(_ context.Context, _, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
 		// The Kiro auth service answers with token material only.
 		return &kiroauth.KiroTokenData{
 			AccessToken:  "rotated-access",
@@ -702,7 +702,7 @@ func TestRefreshKeepsHostRuntimeStateForAuthData(t *testing.T) {
 	// rebuild the persisted CPA fields. A transport branch that returns a fresh
 	// struct must therefore not drop the runtime host state.
 	originalRefresher := desktopTokenRefresher
-	desktopTokenRefresher = func(_ context.Context, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
+	desktopTokenRefresher = func(_ context.Context, _, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
 		return &kiroauth.KiroTokenData{
 			AccessToken:  "rotated-access",
 			RefreshToken: refreshToken,
@@ -1127,7 +1127,7 @@ func TestUsageReconcileDoesNotRevertConcurrentRefresh(t *testing.T) {
 		}
 		return errorEnvelope("unexpected", method), nil
 	}
-	usageHTTPClient = func() httpDoer {
+	usageHTTPClient = func(string) httpDoer {
 		return httpDoerFunc(func(*http.Request) (*http.Response, error) {
 			body := `{"userInfo":{"userId":"d-1.user"},"subscriptionInfo":{"subscriptionTitle":"KIRO PRO"},"usageBreakdownList":[]}`
 			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
@@ -1292,7 +1292,7 @@ func TestReconcileIdentityBestEffortNamesAFreshCredential(t *testing.T) {
 		usageHTTPClient = previousClient
 		usageProfileLister = previousLister
 	})
-	usageHTTPClient = func() httpDoer {
+	usageHTTPClient = func(string) httpDoer {
 		return httpDoerFunc(func(request *http.Request) (*http.Response, error) {
 			body := `{"userInfo":{"email":null,"userId":"d-90667c527c.9f3a1b2c-4d5e-6f70-8192-a3b4c5d6e7f8"},"subscriptionInfo":{"subscriptionTitle":"KIRO POWER"},"usageBreakdownList":[{"displayNamePlural":"Credits","usageLimitWithPrecision":50}]}`
 			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
@@ -1482,7 +1482,7 @@ func TestRefreshPublishesUsageIdentityWithoutReplacingTokens(t *testing.T) {
 		t.Fatalf("usage called the host: %s", method)
 		return nil, nil
 	}
-	usageHTTPClient = func() httpDoer {
+	usageHTTPClient = func(string) httpDoer {
 		return httpDoerFunc(func(*http.Request) (*http.Response, error) {
 			return catalogResponse(http.StatusOK, `{"userInfo":{"userId":"d-1.abcdef12"},"subscriptionInfo":{"subscriptionTitle":"KIRO FREE"},"usageBreakdownList":[]}`), nil
 		})
