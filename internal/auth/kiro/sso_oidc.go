@@ -77,6 +77,12 @@ func NewSSOOIDCClient(cfg *config.Config) *SSOOIDCClient {
 	return &SSOOIDCClient{httpClient: &http.Client{Transport: transport, Timeout: 30 * time.Second}}
 }
 
+// NewSSOOIDCClientWithHTTPClient sends every request through client, for a
+// refresh made on behalf of a stored credential that names its own proxy.
+func NewSSOOIDCClientWithHTTPClient(client *http.Client) *SSOOIDCClient {
+	return &SSOOIDCClient{httpClient: client}
+}
+
 type RegisterClientResponse struct {
 	ClientID              string `json:"clientId"`
 	ClientSecret          string `json:"clientSecret"`

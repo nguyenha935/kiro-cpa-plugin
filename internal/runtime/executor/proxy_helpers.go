@@ -139,6 +139,20 @@ func proxyAwareTransport(ctx context.Context, proxyURL string) http.RoundTripper
 	return nil
 }
 
+// CredentialProxyTransport returns the transport generation uses for a
+// credential's proxy_url, so the plugin's own requests on behalf of that
+// credential take the same route. It returns nil when proxyURL is empty or
+// unusable; the caller then keeps Go's default transport, which reads
+// HTTP(S)_PROXY from the process environment.
+func CredentialProxyTransport(proxyURL string) *http.Transport {
+	proxyURL = strings.TrimSpace(proxyURL)
+	if proxyURL == "" {
+		return nil
+	}
+	transport, _ := proxyAwareTransport(context.Background(), proxyURL).(*http.Transport)
+	return transport
+}
+
 // buildProxyTransport creates an HTTP transport configured for the given proxy URL.
 // It supports SOCKS5, HTTP, and HTTPS proxy protocols.
 //

@@ -281,7 +281,7 @@ func importRefreshToken(ctx context.Context, values url.Values) (*kiroauth.KiroT
 		if !strings.HasPrefix(refreshToken, "aorAAAAAG") {
 			return nil, errors.New("client ID and client secret are required for AWS refresh tokens")
 		}
-		token, err := desktopTokenRefresher(ctx, refreshToken, region)
+		token, err := desktopTokenRefresher(ctx, "", refreshToken, region)
 		if err != nil {
 			return nil, err
 		}
@@ -316,8 +316,10 @@ func importRefreshToken(ctx context.Context, values url.Values) (*kiroauth.KiroT
 	return token, nil
 }
 
-func refreshDesktopToken(ctx context.Context, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
-	return kiroauth.NewSSOOIDCClient(pluginConfig).RefreshDesktopToken(ctx, refreshToken, region)
+// refreshDesktopToken exchanges a Kiro desktop refresh token. proxyURL is the
+// stored credential's own proxy, empty for a token being imported.
+func refreshDesktopToken(ctx context.Context, proxyURL, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
+	return credentialOIDCClient(proxyURL).RefreshDesktopToken(ctx, refreshToken, region)
 }
 
 type externalIDPJSON struct {

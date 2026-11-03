@@ -128,7 +128,7 @@ func TestImportExternalIDPValidatesModelCatalogBeforePersisting(t *testing.T) {
 
 func TestImportDesktopRefreshTokenDoesNotRequireOIDCClient(t *testing.T) {
 	originalRefresher := desktopTokenRefresher
-	desktopTokenRefresher = func(_ context.Context, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
+	desktopTokenRefresher = func(_ context.Context, _, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
 		if refreshToken != "aorAAAAAG-test" || region != "us-east-1" {
 			t.Fatalf("desktop refresh input = %q/%q", refreshToken, region)
 		}
@@ -195,7 +195,7 @@ func TestConnectAPIRejectsResourceStyleGET(t *testing.T) {
 
 func TestImportDesktopRefreshTokenKeepsSubmittedStartURL(t *testing.T) {
 	originalRefresher := desktopTokenRefresher
-	desktopTokenRefresher = func(_ context.Context, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
+	desktopTokenRefresher = func(_ context.Context, _, refreshToken, region string) (*kiroauth.KiroTokenData, error) {
 		return &kiroauth.KiroTokenData{
 			AccessToken: "access", RefreshToken: refreshToken,
 			ProfileArn: "arn:aws:codewhisperer:us-east-1:1:profile/test",
