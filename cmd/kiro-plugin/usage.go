@@ -418,6 +418,13 @@ func carryHostOwnedFields(from *kiroauth.KiroTokenData, to *kiroauth.KiroTokenDa
 	if to.PreferredEndpoint == "" {
 		to.PreferredEndpoint = from.PreferredEndpoint
 	}
+	// proxy_url is a typed field now, so decodeKiroCredential takes it out of
+	// Extra and no transport branch returns it. Without this carry the first
+	// refresh publishes a credential without the operator's proxy and
+	// handleRefreshAuth writes that back, erasing it from the file.
+	if to.ProxyURL == "" {
+		to.ProxyURL = from.ProxyURL
+	}
 	if len(to.ModelCatalog) == 0 {
 		to.ModelCatalog = from.ModelCatalog
 	}
