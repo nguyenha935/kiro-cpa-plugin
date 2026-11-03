@@ -175,7 +175,8 @@ const shellCommonScript = `  var COMMON_TEXT = {
   var STORAGE_AUTH = 'cli-proxy-auth';
   var STORAGE_THEME = 'cli-proxy-theme';
   var STORAGE_LANGUAGE = 'cli-proxy-language';
-  var OBFUSCATED = 'enc::v1::';
+  var OBFUSCATED = 'enc::v2::';
+  var OBFUSCATED_LEGACY = 'enc::v1::';
   var SALT = 'cli-proxy-api-webui::secure-storage';
   var params = new URLSearchParams(window.location.search);
   var root = document.documentElement;
@@ -256,8 +257,9 @@ const shellCommonScript = `  var COMMON_TEXT = {
   root.setAttribute('lang', lang);
 
   // storedKey reads the key the panel keeps when "Remember password" is
-  // ticked. The panel obfuscates it with a XOR over its host and user agent;
-  // this is the inverse of src/utils/encryption.ts in the panel, not a secret.
+  // ticked. The panel obfuscates it with a XOR over its host; this is the
+  // inverse of src/utils/encryption.ts in the panel, not a secret. Panels
+  // before v1.27.0 wrote enc::v1::, whose XOR also covered the user agent.
   function storedKey() {
     try {
       var raw = window.localStorage.getItem(STORAGE_AUTH);
@@ -265,9 +267,10 @@ const shellCommonScript = `  var COMMON_TEXT = {
         return '';
       }
       var text = raw;
-      if (raw.indexOf(OBFUSCATED) === 0) {
+      var legacy = raw.indexOf(OBFUSCATED_LEGACY) === 0;
+      if (legacy || raw.indexOf(OBFUSCATED) === 0) {
         var binary = window.atob(raw.slice(OBFUSCATED.length));
-        var salt = new TextEncoder().encode(SALT + '|' + window.location.host + '|' + navigator.userAgent);
+        var salt = new TextEncoder().encode(SALT + '|' + window.location.host + (legacy ? '|' + navigator.userAgent : ''));
         var bytes = new Uint8Array(binary.length);
         for (var index = 0; index < binary.length; index += 1) {
           bytes[index] = binary.charCodeAt(index) ^ salt[index % salt.length];
