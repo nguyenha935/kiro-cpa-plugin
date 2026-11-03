@@ -492,6 +492,7 @@ func handleLoginStart(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	noteHostConfig(req.Host)
 	stateBytes := make([]byte, 24)
 	if _, err := rand.Read(stateBytes); err != nil {
 		return nil, err
@@ -510,6 +511,7 @@ func handleLoginPoll(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	noteHostConfig(req.Host)
 	loginFlowsMu.Lock()
 	flow, found := loginFlows[req.State]
 	if !found {
@@ -538,7 +540,7 @@ func handleLoginPoll(raw []byte) ([]byte, error) {
 	flow.Polling = true
 	loginFlows[req.State] = flow
 	loginFlowsMu.Unlock()
-	created, err := kiroauth.NewSSOOIDCClient(pluginConfig).CreateTokenWithRegion(context.Background(), flow.ClientID, flow.ClientSecret, flow.DeviceCode, flow.Region)
+	created, err := credentialOIDCClient("").CreateTokenWithRegion(context.Background(), flow.ClientID, flow.ClientSecret, flow.DeviceCode, flow.Region)
 	if errors.Is(err, kiroauth.ErrAuthorizationPending) || errors.Is(err, kiroauth.ErrSlowDown) {
 		_ = updateLoginFlow(req.State, func(flow *loginFlow) { flow.Polling = false })
 		return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending, Message: "Waiting for AWS IAM Identity Center authorization"})
@@ -591,6 +593,7 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	noteHostConfig(req.Host)
 	if req.Provider != "" && !isKiroProviderLabel(req.Provider) {
 		return okEnvelope(pluginapi.AuthParseResponse{Handled: false})
 	}
@@ -1197,6 +1200,7 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	noteHostConfig(req.Host)
 	token, err := decodeToken(req.StorageJSON)
 	if err != nil {
 		return nil, err
@@ -1220,6 +1224,7 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	noteHostConfig(req.Host)
 	token, err := decodeToken(req.StorageJSON)
 	if err != nil {
 		return nil, err
@@ -1860,8 +1865,9 @@ func buildCoreAuth(req pluginapi.ExecutorRequest) (*coreauth.Auth, error) {
 		FileName: fileName,
 		// The executor reads auth.ProxyURL before it looks at the plugin config, so
 		// rebuilding the auth without it dropped the proxy the host had resolved for
-		// this credential and sent generation straight out.
-		ProxyURL:   strings.TrimSpace(token.ProxyURL),
+		// this credential and sent generation straight out. The global proxy-url
+		// fills it when the credential names none; this auth is never persisted.
+		ProxyURL:   effectiveProxyURL(token.ProxyURL),
 		Storage:    &kiroAuthStorage{raw: append([]byte(nil), req.StorageJSON...)},
 		Metadata:   metadata,
 		Attributes: attributes,
