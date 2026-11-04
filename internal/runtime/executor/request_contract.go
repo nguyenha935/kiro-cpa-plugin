@@ -319,9 +319,6 @@ func validateClaudeConversation(body []byte, source string) error {
 	if len(messages) == 0 {
 		return requestValidationErr{msg: "Kiro requires at least one user message"}
 	}
-	if messages[0].Get("role").String() != "user" {
-		return requestValidationErr{msg: "Kiro conversation history must start with a user message"}
-	}
 	if messages[len(messages)-1].Get("role").String() != "user" {
 		return requestValidationErr{msg: "Kiro requests must end with a user message or tool result"}
 	}
@@ -400,23 +397,17 @@ func validateClaudeConversation(body []byte, source string) error {
 
 func validateOpenAIConversation(body []byte) error {
 	messages := gjson.GetBytes(body, "messages").Array()
-	firstRole := ""
-	foundFirst := false
+	conversation := false
 	for _, message := range messages {
 		if err := validateKiroContentBlocks(message.Get("content"), sdktranslator.FormatOpenAI.String()); err != nil {
 			return requestValidationErr{msg: err.Error()}
 		}
-		role := message.Get("role").String()
-		if !foundFirst && role != "system" && role != "developer" {
-			firstRole = role
-			foundFirst = true
+		if role := message.Get("role").String(); role != "" && role != "system" && role != "developer" {
+			conversation = true
 		}
 	}
-	if firstRole == "" {
+	if !conversation {
 		return requestValidationErr{msg: "Kiro requires at least one user message"}
-	}
-	if firstRole != "user" {
-		return requestValidationErr{msg: "Kiro conversation history must start with a user message"}
 	}
 	lastRole := strings.TrimSpace(messages[len(messages)-1].Get("role").String())
 	if lastRole != "user" && lastRole != "tool" {

@@ -112,6 +112,8 @@ For Anthropic Messages, the top-level `system` text is prepended to the first us
 
 For OpenAI Chat Completions, leading `system` and `developer` messages are prepended to the first user turn. Later `system` and `developer` messages stay at their original position as user text and merge with adjacent user turns.
 
+A history whose oldest turn is the assistant's, as clients that trim a long conversation send, is accepted in every format. Kiro rejects such a history, so the plugin opens it with a user turn holding the instructions, or a single `.` when the request has none.
+
 Image content is validated in every OpenAI Chat message. An unsupported remote image URL or malformed image data URL in a later turn now returns HTTP 400. Previously, validation stopped at the first user message and the translator could silently drop a later image.
 
 Reasoning controls are advertised only when the authenticated account's Kiro model schema declares an `effort` enum. Claude models currently use `additionalModelRequestFields.output_config.effort`; GPT models use `additionalModelRequestFields.reasoning.effort`. The plugin forwards the selected level through that declared path for OpenAI Responses, Chat Completions, and Anthropic Messages.

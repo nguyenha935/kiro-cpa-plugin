@@ -232,10 +232,11 @@ func TestSignedReasoningRoundTripThroughResponsesReachesKiroHistory(t *testing.T
 	claudeResponse := []byte(`{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5","content":[{"type":"thinking","thinking":"internal reasoning","signature":"` + signature + `"},{"type":"text","text":"Answer"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`)
 	response := sdktranslator.TranslateNonStream(context.Background(), sdktranslator.FromString("kiro"), sdktranslator.FormatOpenAIResponse, "claude-opus-5", original, request, claudeResponse, nil)
 
-	input := make([]any, 0)
-	if err := json.Unmarshal([]byte(gjson.GetBytes(response, "output").Raw), &input); err != nil {
+	output := make([]any, 0)
+	if err := json.Unmarshal([]byte(gjson.GetBytes(response, "output").Raw), &output); err != nil {
 		t.Fatal(err)
 	}
+	input := append([]any{map[string]any{"type": "message", "role": "user", "content": "Think"}}, output...)
 	input = append(input, map[string]any{
 		"type":    "message",
 		"role":    "user",
@@ -248,7 +249,7 @@ func TestSignedReasoningRoundTripThroughResponsesReachesKiroHistory(t *testing.T
 	claudeRequest := sdktranslator.TranslateRequest(sdktranslator.FormatOpenAIResponse, sdktranslator.FromString("kiro"), "claude-opus-5", nextRequest, false)
 	kiroPayload, _ := kiroclaude.BuildKiroPayload(claudeRequest, "claude-opus-5", "profile", "AI_EDITOR", modelcapabilities.Capability{}, "medium")
 
-	replayed := gjson.GetBytes(kiroPayload, "conversationState.history.0.assistantResponseMessage.reasoningContent.reasoningText")
+	replayed := gjson.GetBytes(kiroPayload, "conversationState.history.1.assistantResponseMessage.reasoningContent.reasoningText")
 	if replayed.Get("text").String() != "internal reasoning" {
 		t.Fatalf("replayed reasoning text = %q; payload=%s", replayed.Get("text").String(), kiroPayload)
 	}

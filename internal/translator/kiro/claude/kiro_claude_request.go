@@ -168,6 +168,7 @@ func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, cap
 	// Process messages and build history
 	history, currentUserMsg, currentToolResults := processMessages(messages, modelID, origin)
 	history, currentToolResults = normalizeUnknownToolHistory(history, currentUserMsg, currentToolResults, kiroTools)
+	history = openHistoryWithUserTurn(history, systemPrompt, modelID, origin)
 	attachInstructionsToFirstUserMessage(history, currentUserMsg, systemPrompt)
 
 	// Build the current user content. Reasoning configuration remains a
@@ -324,6 +325,28 @@ func formatToolResults(results []KiroToolResult) string {
 		parts = append(parts, fmt.Sprintf("<tool_result id=%q status=%q>\n%s\n</tool_result>", result.ToolUseID, result.Status, strings.Join(texts, "\n")))
 	}
 	return strings.Join(parts, "\n\n")
+}
+
+// historyPlaceholder is the opening user turn of an assistant-first history
+// that has no instructions to carry.
+const historyPlaceholder = "."
+
+// openHistoryWithUserTurn gives an assistant-first history the user turn Kiro
+// needs before it. Clients that trim a long conversation can send history whose
+// oldest turn is the assistant's; OpenAI and Anthropic accept that, Kiro answers
+// "Improperly formed request". The opening turn is left empty for
+// attachInstructionsToFirstUserMessage to fill with the instructions, which
+// belong to the first user turn anyway, and holds historyPlaceholder only when
+// there are none, because Kiro refuses an empty user message.
+func openHistoryWithUserTurn(history []KiroHistoryMessage, instructions, modelID, origin string) []KiroHistoryMessage {
+	if len(history) == 0 || history[0].AssistantResponseMessage == nil {
+		return history
+	}
+	opening := &KiroUserInputMessage{ModelID: modelID, Origin: origin}
+	if instructions == "" {
+		opening.Content = historyPlaceholder
+	}
+	return append([]KiroHistoryMessage{{UserInputMessage: opening}}, history...)
 }
 
 // attachInstructionsToFirstUserMessage preserves system instructions exactly
