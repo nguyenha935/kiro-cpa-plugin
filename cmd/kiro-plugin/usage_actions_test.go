@@ -15,7 +15,8 @@ import (
 )
 
 // usageFixture stubs the host and the usage endpoint for three Kiro
-// credentials: two working (a, b) and one CPA reports unavailable (z). It
+// credentials: two working (a, b) and one CPA reports unavailable as
+// unauthorized (z), which Kiro's usage endpoint rejects with 401 as well. It
 // returns the number of usage calls made and the documents saved.
 func usageFixture(t *testing.T) (*int, map[string]map[string]any) {
 	t.Helper()
@@ -67,10 +68,13 @@ func usageFixture(t *testing.T) (*int, map[string]map[string]any) {
 	}
 	calls := 0
 	usageHTTPClient = func(string) httpDoer {
-		return httpDoerFunc(func(*http.Request) (*http.Response, error) {
+		return httpDoerFunc(func(request *http.Request) (*http.Response, error) {
 			mu.Lock()
 			calls++
 			mu.Unlock()
+			if request.Header.Get("Authorization") == "Bearer z-token" {
+				return &http.Response{StatusCode: http.StatusUnauthorized, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"message":"The bearer token included in the request is invalid."}`))}, nil
+			}
 			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(
 				`{"subscriptionInfo":{"subscriptionTitle":"KIRO FREE"},"usageBreakdownList":[{"displayNamePlural":"Credits","currentUsageWithPrecision":1,"usageLimitWithPrecision":50}]}`))}, nil
 		})
@@ -103,28 +107,31 @@ func TestUsageAccountsPutAttentionFirstAndCarryTheNote(t *testing.T) {
 	if accounts[0].StatusMessage != "unauthorized" {
 		t.Fatalf("CPA's status for the broken credential was lost: %+v", accounts[0])
 	}
+	if accounts[0].StateKey != usageStateUnavailable {
+		t.Fatalf("an unavailable credential whose usage read fails reads %q, want it unavailable", accounts[0].StateKey)
+	}
 }
 
 // Opening the page reads the cache; ?refresh=<file> asks AWS for that one
-// credential and ?refresh=all for every working one.
+// credential and ?refresh=all for every enabled one.
 func TestUsageRefreshSelectorForcesOnlyTheNamedCredential(t *testing.T) {
 	calls, _ := usageFixture(t)
 	collectUsageAccounts(context.Background(), "")
-	if *calls != 2 {
-		t.Fatalf("first load made %d usage calls, want 2 (the unavailable credential is not queried)", *calls)
+	if *calls != 3 {
+		t.Fatalf("first load made %d usage calls, want 3 (an unavailable credential is read too)", *calls)
 	}
 	collectUsageAccounts(context.Background(), "")
-	if *calls != 2 {
-		t.Fatalf("reopening the page made %d usage calls, want it served from cache", *calls-2)
+	if *calls != 3 {
+		t.Fatalf("reopening the page made %d usage calls, want it served from cache", *calls-3)
 	}
 	collectUsageAccounts(context.Background(), "kiro-a.json")
-	if *calls != 3 {
-		t.Fatalf("refreshing one credential made %d usage calls, want 1", *calls-2)
+	if *calls != 4 {
+		t.Fatalf("refreshing one credential made %d usage calls, want 1", *calls-3)
 	}
 	usageNow = func() time.Time { return time.Date(2026, 9, 25, 12, 0, 30, 0, time.UTC) }
 	collectUsageAccounts(context.Background(), usageRefreshAll)
-	if *calls != 5 {
-		t.Fatalf("refreshing all made %d usage calls, want 2", *calls-3)
+	if *calls != 7 {
+		t.Fatalf("refreshing all made %d usage calls, want 3", *calls-4)
 	}
 }
 

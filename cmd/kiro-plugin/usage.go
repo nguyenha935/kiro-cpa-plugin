@@ -59,6 +59,7 @@ const (
 	usageStateActive      = "active"
 	usageStateDisabled    = "disabled"
 	usageStateUnavailable = "unavailable"
+	usageStateCooling     = "cooling"
 )
 
 type httpDoer interface {
@@ -757,8 +758,24 @@ func usageEntryRank(entry pluginapi.HostAuthFileEntry) int {
 // disabled and failed accounts.
 func loadUsageCredential(ctx context.Context, credential usageCredential, force bool) usageAccountView {
 	account := loadUsageCredentialView(ctx, credential, force)
+	markCooling(&account, credential.entry)
 	decorateUsageAccount(&account, credential, nil)
 	return account
+}
+
+// markCooling shows a credential CPA reports unavailable, with usage read
+// fine, as cooling down. CPA sets Unavailable while it backs a credential off
+// after a 429 from generation; usage is another Kiro endpoint, and the quota
+// is what the operator needs to see then. The state comes from the current host
+// entry, never from the cache, so it clears with the cooldown. A credential
+// whose usage read fails stays an error that needs attention.
+func markCooling(account *usageAccountView, entry pluginapi.HostAuthFileEntry) {
+	if !entry.Unavailable || entry.Disabled || usageNeedsAttention(*account) {
+		return
+	}
+	account.State = "Cooling down"
+	account.StateKey = usageStateCooling
+	account.StateClass = "muted"
 }
 
 func loadUsageCredentialView(ctx context.Context, credential usageCredential, force bool) usageAccountView {
@@ -772,12 +789,6 @@ func loadUsageCredentialView(ctx context.Context, credential usageCredential, fo
 	}
 	if entry.Disabled {
 		return usageAccountView{Label: label, State: "Disabled", StateKey: usageStateDisabled, StateClass: "muted"}
-	}
-	if entry.Unavailable {
-		return usageAccountView{
-			Label: label, State: "Unavailable", StateKey: usageStateUnavailable, StateClass: "error",
-			Error: "This credential is currently unavailable.", ErrorKey: "err_unavailable",
-		}
 	}
 	forceRefresh := false
 	if force {

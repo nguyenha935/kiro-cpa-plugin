@@ -1201,7 +1201,7 @@ const usageViewHTML = `<div class="kiro-view" lang="{{.Options.Lang}}" data-text
   <span class="who">
     <span class="label">{{displayName $account}}</span>
     {{if $account.Note}}<span class="note">{{$account.Note}}</span>{{end}}
-    {{if and (needsAttention $account) $account.StatusMessage}}<span class="status-line">{{$account.StatusMessage}}</span>{{end}}
+    {{if and (or (needsAttention $account) (eq $account.StateKey "cooling")) $account.StatusMessage}}<span class="status-line">{{$account.StatusMessage}}</span>{{end}}
   </span>
   <span class="sr">{{text "label_state"}}: {{stateLabel $account.StateKey}}. {{text "row_hint"}}</span>
 </span>
