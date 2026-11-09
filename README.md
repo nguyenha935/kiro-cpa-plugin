@@ -32,7 +32,7 @@ The plugin:
 go test ./...
 go vet ./...
 CGO_ENABLED=1 go build -trimpath -buildmode=c-shared \
-  -ldflags "-X github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro.clientVersion=2.32.0 -X main.pluginVersion=<version>" \
+  -ldflags "-X github.com/nguyenha935/kiro-cpa-plugin/internal/auth/kiro.clientVersion=3.1.0 -X main.pluginVersion=<version>" \
   -o package/kiro-ha.so ./cmd/kiro-plugin
 sha256sum package/kiro-ha.so > package/kiro-ha.so.sha256
 ```
