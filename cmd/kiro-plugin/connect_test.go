@@ -69,6 +69,7 @@ func TestValidateAWSAuthorizationURL(t *testing.T) {
 	for _, value := range []string{
 		"https://view.awsapps.com/start/#/device",
 		"https://device.sso.us-east-1.amazonaws.com/",
+		"https://us-east-1.signin.aws/platform/authorize?request_uri=x",
 	} {
 		if err := validateAWSAuthorizationURL(value); err != nil {
 			t.Errorf("valid AWS authorization URL rejected: %s: %v", value, err)
@@ -78,6 +79,8 @@ func TestValidateAWSAuthorizationURL(t *testing.T) {
 		"javascript:alert(1)",
 		"http://view.awsapps.com/start",
 		"https://view.awsapps.com.evil.test/start",
+		"https://evilsignin.aws/start",
+		"https://us-east-1.signin.aws.evil.test/start",
 	} {
 		if err := validateAWSAuthorizationURL(value); err == nil {
 			t.Errorf("unsafe AWS authorization URL accepted: %s", value)

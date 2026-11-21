@@ -507,7 +507,7 @@ func validateAWSAuthorizationURL(raw string) error {
 		return errors.New("Kiro returned an invalid AWS authorization URL")
 	}
 	host := strings.ToLower(parsed.Hostname())
-	if !strings.HasSuffix(host, ".amazonaws.com") && !strings.HasSuffix(host, ".awsapps.com") {
+	if !strings.HasSuffix(host, ".amazonaws.com") && !strings.HasSuffix(host, ".awsapps.com") && !strings.HasSuffix(host, ".signin.aws") {
 		return errors.New("Kiro returned an untrusted AWS authorization URL")
 	}
 	return nil
